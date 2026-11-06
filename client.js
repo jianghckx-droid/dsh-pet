@@ -958,7 +958,7 @@ window.__ModuleLoader__.load({
 
     const CSS = [
       '.dsh-pet{display:flex;flex-direction:column;gap:6px;padding:8px;color:#dbe7f0;font-size:11px;',
-      'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;height:100%;box-sizing:border-box}',
+      'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;height:100%;box-sizing:border-box;overflow-y:auto}',
       '.dsh-pet-top{display:flex;align-items:center;gap:6px}',
       '.dsh-pet-floor{font-weight:700;color:#ffd166;letter-spacing:.04em}',
       '.dsh-pet-muted{color:#7f93a3}',
