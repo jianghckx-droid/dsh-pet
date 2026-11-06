@@ -53,9 +53,12 @@ export const FLOORS = Object.freeze([
   Object.freeze({ floor: 7, enemies: 10, locks: Object.freeze(['carapace']) }),
   Object.freeze({ floor: 8, enemies: 11, locks: Object.freeze(['carapace']) }),
   Object.freeze({ floor: 9, enemies: 10, locks: Object.freeze(['split']) }),
-  Object.freeze({ floor: 10, enemies: 11, locks: Object.freeze(['split']) }),
-  Object.freeze({ floor: 11, enemies: 12, locks: Object.freeze(['carapace', 'split']) }),
-  Object.freeze({ floor: 12, enemies: 12, locks: Object.freeze(['carapace', 'split']) }),
+  Object.freeze({ floor: 10, enemies: 11, locks: Object.freeze(['anchor']) }),
+  Object.freeze({ floor: 11, enemies: 11, locks: Object.freeze(['cleanse']) }),
+  Object.freeze({ floor: 12, enemies: 12, locks: Object.freeze(['phase']) }),
+  Object.freeze({ floor: 13, enemies: 12, locks: Object.freeze(['devour']) }),
+  Object.freeze({ floor: 14, enemies: 12, locks: Object.freeze(['generator']) }),
+  Object.freeze({ floor: 15, enemies: 13, locks: Object.freeze(['reflect']) }),
 ]);
 
 /** MVP 只做到第 8 层（第 6 层是墙，第 8 层是切片上限）。 */

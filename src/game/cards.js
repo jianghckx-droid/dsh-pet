@@ -510,7 +510,6 @@ export const ENV_PACK = Object.freeze(['flame_trap', 'frost_trap', 'fire_trail',
 
 /** P4 风险包。 */
 export const RISK_PACK = Object.freeze(['desperate', 'shield_burst', 'blood_debt', 'overdraft']);
-
 /** P3 时间包。 */
 export const TIME_PACK = Object.freeze(['time_stop', 'rewind', 'delay', 'chain']);
 
@@ -533,6 +532,16 @@ export const GRAVITY_PACK = Object.freeze([
   'vortex',
   'rule_pin',
   'rule_wall_slam',
+]);
+
+/** 实验包：P0–P5 全部新机制，进游戏用的入口。 */
+export const LAB_PACK = Object.freeze([
+  ...GRAVITY_PACK,
+  ...MARK_PACK,
+  ...SUMMON_PACK,
+  ...TIME_PACK,
+  ...RISK_PACK,
+  ...ENV_PACK,
 ]);
 
 /** 灼烧包的抽卡池：已拥有铁弹 + 三件套时，从这 8 张里出三选一。 */

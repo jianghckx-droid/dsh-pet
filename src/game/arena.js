@@ -393,6 +393,7 @@ function spawnTick(battle) {
       invuln: 0,
       shield: 0,
       genCd: 3,
+      reflectCd: 0,
       flash: 0,
     });
     battle.spawned += 1;
@@ -743,7 +744,8 @@ function bulletsTick(battle, dt) {
     const travel = BULLET_SPEED * dt;
     if (d <= travel + BULLET_HIT_RADIUS) {
       hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn, mark: bullet.mark });
-      if (target.locks.includes('reflect')) {
+      if (target.locks.includes('reflect') && (target.reflectCd ?? 0) <= 0) {
+        target.reflectCd = 1;
         battle.player.cells -= 1;
         battle.events.push({ type: 'reflect', x: battle.player.x, y: battle.player.y });
       }
@@ -840,6 +842,7 @@ function enemiesTick(battle, dt) {
     if (e.cells <= 0) continue;
     e.flash = Math.max(0, e.flash - dt);
     if (e.wallCd > 0) e.wallCd = Math.max(0, e.wallCd - dt);
+    if ((e.reflectCd ?? 0) > 0) e.reflectCd = Math.max(0, e.reflectCd - dt);
     if (e.freeze > 0) {
       e.freeze = Math.max(0, e.freeze - dt);
       continue;

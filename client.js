@@ -209,6 +209,8 @@ window.__ModuleLoader__.load({
         id: 'summon_fire',
         name: '火灵',
         carrier: 'summon',
+        mode: 'turret',
+        hp: 4,
         effect: 'fire',
         cells: 1,
         cd: 1.2,
@@ -355,7 +357,330 @@ window.__ModuleLoader__.load({
         solves: Object.freeze(['carapace']),
         desc: '被位移撞到墙的敌人受 2 格（每只每秒一次）',
       }),
+      // ---- P1 标记家族 ----
+      mark_hunter: Object.freeze({
+        id: 'mark_hunter',
+        name: '猎标',
+        carrier: 'rule',
+        effect: 'mind',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'mark']),
+        solves: Object.freeze(['split']),
+        desc: '攻击叠 1 层标记（上限 3）；带标记者优先被瞄准',
+      }),
+      fuse: Object.freeze({
+        id: 'fuse',
+        name: '引信',
+        carrier: 'rule',
+        effect: 'fire',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'mark']),
+        solves: Object.freeze(['split', 'summon']),
+        desc: '带标记的敌人死亡时爆炸，伤害 = 层数',
+      }),
+      spread: Object.freeze({
+        id: 'spread',
+        name: '传导',
+        carrier: 'rule',
+        effect: 'mind',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'mark']),
+        solves: Object.freeze(['summon']),
+        desc: '带标记的敌人死亡时，标记传给 2 个最近的敌人',
+      }),
+      execute_mark: Object.freeze({
+        id: 'execute_mark',
+        name: '处决',
+        carrier: 'rule',
+        effect: 'mind',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'mark']),
+        solves: Object.freeze(['carapace', 'split']),
+        desc: '3 层标记且 ≤4 格的目标直接移除',
+      }),
+      mark_bolt: Object.freeze({
+        id: 'mark_bolt',
+        name: '标记弹',
+        carrier: 'orb',
+        effect: 'mind',
+        cells: 0,
+        cd: 1.0,
+        burn: 0,
+        aoe: 0,
+        mark: 2,
+        tags: Object.freeze(['mark', 'single']),
+        solves: Object.freeze(['split']),
+        desc: '不造成伤害，叠 2 层标记',
+      }),
+      // ---- P2 召唤家族 ----
+      bomber: Object.freeze({
+        id: 'bomber',
+        name: '自爆傀儡',
+        carrier: 'summon',
+        mode: 'charge',
+        hp: 3,
+        blast: 3,
+        radius: 18,
+        cells: 0,
+        cd: 8,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['summon', 'blast']),
+        solves: Object.freeze(['split', 'summon']),
+        desc: '冲向最近敌人，接触后 18 格范围爆炸 3 格',
+      }),
+      link: Object.freeze({
+        id: 'link',
+        name: '连结',
+        carrier: 'rule',
+        effect: 'life',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'summon']),
+        solves: Object.freeze(['reflect']),
+        desc: '你受到的伤害 50% 转移给最近的召唤物',
+      }),
+      merge: Object.freeze({
+        id: 'merge',
+        name: '合体',
+        carrier: 'rule',
+        effect: 'life',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'summon']),
+        solves: Object.freeze(['summon']),
+        desc: '两个召唤物靠近时合并：生命相加，攻击变范围',
+      }),
+      sacrifice: Object.freeze({
+        id: 'sacrifice',
+        name: '献祭',
+        carrier: 'rule',
+        effect: 'time',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'summon']),
+        solves: Object.freeze(['summon']),
+        desc: '召唤物死亡时，刷新一个随机冷却',
+      }),
+      totem: Object.freeze({
+        id: 'totem',
+        name: '图腾',
+        carrier: 'summon',
+        mode: 'totem',
+        hp: 6,
+        cells: 0,
+        cd: 2,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['summon', 'heal']),
+        solves: Object.freeze(['regen']),
+        desc: '不动，每 2 秒给周围召唤物回 1 格',
+      }),
+      // ---- P3 时间家族 ----
+      time_stop: Object.freeze({
+        id: 'time_stop',
+        name: '时停',
+        carrier: 'rule',
+        effect: 'time',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'time']),
+        solves: Object.freeze(['bomb']),
+        desc: '每 12 秒冻结全场 1.5 秒',
+      }),
+      rewind: Object.freeze({
+        id: 'rewind',
+        name: '回溯',
+        carrier: 'rule',
+        effect: 'time',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'time']),
+        solves: Object.freeze(['carapace']),
+        desc: '生命低于 50% 时，回到 3 秒前的位置与生命（每层 1 次）',
+      }),
+      delay: Object.freeze({
+        id: 'delay',
+        name: '延迟',
+        carrier: 'rule',
+        effect: 'time',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'time']),
+        solves: Object.freeze(['reflect']),
+        desc: '受到的伤害延迟 2 秒结算；期间击杀来源则取消',
+      }),
+      chain: Object.freeze({
+        id: 'chain',
+        name: '连锁',
+        carrier: 'rule',
+        effect: 'time',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'time']),
+        solves: Object.freeze(['carapace', 'summon']),
+        desc: '击杀后，下次攻击额外发射 1 发（最多叠 3）',
+      }),
+      // ---- P4 风险家族 ----
+      desperate: Object.freeze({
+        id: 'desperate',
+        name: '破釜',
+        carrier: 'rule',
+        effect: 'life',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'risk']),
+        solves: Object.freeze(['carapace']),
+        desc: '生命低于 30% 时，所有冷却减半',
+      }),
+      shield_burst: Object.freeze({
+        id: 'shield_burst',
+        name: '护盾爆',
+        carrier: 'rule',
+        effect: 'life',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'risk']),
+        solves: Object.freeze(['bomb']),
+        desc: '每 6 秒获得 2 格护盾；护盾破碎时对周围造成 3 格',
+      }),
+      blood_debt: Object.freeze({
+        id: 'blood_debt',
+        name: '血偿',
+        carrier: 'rule',
+        effect: 'life',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'risk']),
+        solves: Object.freeze(['carapace']),
+        desc: '每次受伤，下一次攻击 +1 格（最多 +3）',
+      }),
+      overdraft: Object.freeze({
+        id: 'overdraft',
+        name: '透支',
+        carrier: 'rule',
+        effect: 'life',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'risk']),
+        solves: Object.freeze(['summon']),
+        desc: '每层开始扣 3 格生命，立刻刷新一次所有冷却',
+      }),
+      // ---- P5 环境家族 ----
+      flame_trap: Object.freeze({
+        id: 'flame_trap',
+        name: '火焰陷阱',
+        carrier: 'trap',
+        kind: 'flame',
+        radius: 12,
+        cells: 2,
+        burn: 2,
+        cd: 5,
+        ttl: 8,
+        aoe: 0,
+        tags: Object.freeze(['trap', 'fire']),
+        solves: Object.freeze(['summon']),
+        desc: '在脚下放置陷阱：触发时 12 格范围 2 格 + 2 层灼烧',
+      }),
+      frost_trap: Object.freeze({
+        id: 'frost_trap',
+        name: '冰霜陷阱',
+        carrier: 'trap',
+        kind: 'frost',
+        radius: 12,
+        cells: 1,
+        freeze: 1.5,
+        cd: 7,
+        ttl: 8,
+        aoe: 0,
+        tags: Object.freeze(['trap', 'ice']),
+        solves: Object.freeze(['bomb']),
+        desc: '触发时冻结范围内敌人 1.5 秒',
+      }),
+      fire_trail: Object.freeze({
+        id: 'fire_trail',
+        name: '火痕',
+        carrier: 'trail',
+        kind: 'fire',
+        radius: 7,
+        cells: 1,
+        burn: 1,
+        cd: 0.5,
+        ttl: 2,
+        aoe: 0,
+        tags: Object.freeze(['trail', 'fire']),
+        solves: Object.freeze(['carapace']),
+        desc: '移动时留下火焰，持续 2 秒，每 0.5 秒 1 格',
+      }),
+      shock_trail: Object.freeze({
+        id: 'shock_trail',
+        name: '电痕',
+        carrier: 'trail',
+        kind: 'shock',
+        radius: 7,
+        cells: 1,
+        cd: 0.5,
+        ttl: 2,
+        aoe: 0,
+        tags: Object.freeze(['trail', 'thunder']),
+        solves: Object.freeze(['summon']),
+        desc: '移动轨迹带电，经过的敌人每 0.5 秒 1 格',
+      }),
     });
+
+    /** P5 环境包。 */
+    const ENV_PACK = Object.freeze(['flame_trap', 'frost_trap', 'fire_trail', 'shock_trail']);
+
+    /** P4 风险包。 */
+    const RISK_PACK = Object.freeze(['desperate', 'shield_burst', 'blood_debt', 'overdraft']);
+    /** P3 时间包。 */
+    const TIME_PACK = Object.freeze(['time_stop', 'rewind', 'delay', 'chain']);
+
+    /** P2 召唤包。 */
+    const SUMMON_PACK = Object.freeze(['bomber', 'link', 'merge', 'sacrifice', 'totem']);
+
+    /** P1 标记包。 */
+    const MARK_PACK = Object.freeze([
+      'mark_hunter',
+      'fuse',
+      'spread',
+      'execute_mark',
+      'mark_bolt',
+    ]);
 
     /** P0 位移包：先只放这一族，便于单独验证。 */
     const GRAVITY_PACK = Object.freeze([
@@ -364,6 +689,16 @@ window.__ModuleLoader__.load({
       'vortex',
       'rule_pin',
       'rule_wall_slam',
+    ]);
+
+    /** 实验包：P0–P5 全部新机制，进游戏用的入口。 */
+    const LAB_PACK = Object.freeze([
+      ...GRAVITY_PACK,
+      ...MARK_PACK,
+      ...SUMMON_PACK,
+      ...TIME_PACK,
+      ...RISK_PACK,
+      ...ENV_PACK,
     ]);
 
     /** 灼烧包的抽卡池：已拥有铁弹 + 三件套时，从这 8 张里出三选一。 */
@@ -561,9 +896,12 @@ window.__ModuleLoader__.load({
       Object.freeze({ floor: 7, enemies: 10, locks: Object.freeze(['carapace']) }),
       Object.freeze({ floor: 8, enemies: 11, locks: Object.freeze(['carapace']) }),
       Object.freeze({ floor: 9, enemies: 10, locks: Object.freeze(['split']) }),
-      Object.freeze({ floor: 10, enemies: 11, locks: Object.freeze(['split']) }),
-      Object.freeze({ floor: 11, enemies: 12, locks: Object.freeze(['carapace', 'split']) }),
-      Object.freeze({ floor: 12, enemies: 12, locks: Object.freeze(['carapace', 'split']) }),
+      Object.freeze({ floor: 10, enemies: 11, locks: Object.freeze(['anchor']) }),
+      Object.freeze({ floor: 11, enemies: 11, locks: Object.freeze(['cleanse']) }),
+      Object.freeze({ floor: 12, enemies: 12, locks: Object.freeze(['phase']) }),
+      Object.freeze({ floor: 13, enemies: 12, locks: Object.freeze(['devour']) }),
+      Object.freeze({ floor: 14, enemies: 12, locks: Object.freeze(['generator']) }),
+      Object.freeze({ floor: 15, enemies: 13, locks: Object.freeze(['reflect']) }),
     ]);
 
     /** MVP 只做到第 8 层（第 6 层是墙，第 8 层是切片上限）。 */
@@ -650,10 +988,62 @@ window.__ModuleLoader__.load({
 
     const hasRule = (battle, id) => battle.rules.some((rule) => rule.id === id);
     const hasCore = (battle, id) => battle.cards.some((card) => card.id === id);
+
+    /** 破釜：残血时冷却减半。所有出手机制都要走这里。 */
+    function cardCooldown(battle, cd) {
+      let value = cooldown(cd, battle.attrs);
+      if (hasRule(battle, 'desperate') && battle.player.cells < battle.player.maxCells * 0.3) {
+        value *= 0.5;
+      }
+      return value;
+    }
     const orbRange = (battle) => ORB_RANGE * visionScale(battle.attrs);
     const fieldRadius = (battle) => FIELD_RADIUS * visionScale(battle.attrs);
     const selfRadius = (battle) => SELF_RADIUS * visionScale(battle.attrs);
     const summonRange = (battle) => SUMMON_RANGE * visionScale(battle.attrs);
+
+    function makeSummon(battle, card) {
+      const hp = card.hp ?? 4;
+      return {
+        id: battle.nextId++,
+        card,
+        x: battle.player.x - 8,
+        y: battle.player.y - 8,
+        cells: hp,
+        maxCells: hp,
+        mode: card.mode ?? 'turret',
+        timer: cardCooldown(battle, card.cd) * 0.5,
+      };
+    }
+
+    function nearestSummon(battle, from, range = Infinity) {
+      let best = null;
+      let bestD = range;
+      for (const s of battle.summons) {
+        const d = dist(from, s);
+        if (d < bestD) {
+          best = s;
+          bestD = d;
+        }
+      }
+      return best;
+    }
+
+    function refreshOneCooldown(battle) {
+      const pool = [...battle.sources, ...battle.selfs];
+      if (pool.length === 0) return;
+      const pick = pool[Math.floor(battle.rng() * pool.length)];
+      pick.timer = 0;
+    }
+
+    function killSummon(battle, summon) {
+      const index = battle.summons.indexOf(summon);
+      if (index < 0) return;
+      battle.summons.splice(index, 1);
+      if (hasRule(battle, 'sacrifice')) refreshOneCooldown(battle);
+      battle.respawns.push({ card: summon.card, at: battle.time + 8 });
+      battle.events.push({ type: 'summonDown', x: summon.x, y: summon.y });
+    }
 
     /** 把一张卡加进当前战斗。开局 build 与抽卡都走这里。 */
     function addCard(battle, id) {
@@ -670,21 +1060,23 @@ window.__ModuleLoader__.load({
         battle.verbs.push({ card, timer: card.cd * 0.5 });
         return card;
       }
+      if (card.carrier === 'trap') {
+        battle.trapSources.push({ card, timer: card.cd * 0.5 });
+        return card;
+      }
+      if (card.carrier === 'trail') {
+        battle.trailSources.push({ card, timer: 0 });
+        return card;
+      }
       if (card.carrier === 'self') {
-        battle.selfs.push({ card, timer: cooldown(card.cd, battle.attrs) });
+        battle.selfs.push({ card, timer: cardCooldown(battle, card.cd) });
         return card;
       }
       if (card.carrier === 'summon') {
-        battle.summons.push({
-          id: battle.nextId++,
-          card,
-          x: battle.player.x - 8,
-          y: battle.player.y - 8,
-          timer: cooldown(card.cd, battle.attrs) * 0.5,
-        });
+        battle.summons.push(makeSummon(battle, card));
         return card;
       }
-      battle.sources.push({ card, timer: cooldown(card.cd, battle.attrs) * 0.5 });
+      battle.sources.push({ card, timer: cardCooldown(battle, card.cd) * 0.5 });
       return card;
     }
 
@@ -758,6 +1150,11 @@ window.__ModuleLoader__.load({
         verbs: [],
         sources: [],
         summons: [],
+        respawns: [],
+        traps: [],
+        trails: [],
+        trapSources: [],
+        trailSources: [],
         enemies: [],
         bullets: [],
         rng: mulberry32(seed),
@@ -769,6 +1166,7 @@ window.__ModuleLoader__.load({
           cells: maxCells,
           maxCells,
           speed: PLAYER_SPEED,
+          shield: 0,
         },
         level,
         xp,
@@ -782,6 +1180,15 @@ window.__ModuleLoader__.load({
         hitCount: 0,
         anchorTimer: 0,
         pinCd: 0,
+        timeStopTimer: 0,
+        delayQueue: [],
+        snapshots: [],
+        snapshotTimer: 0,
+        rewindCd: 0,
+        rewindUsed: false,
+        chainStacks: 0,
+        shieldTimer: 6,
+        bloodStacks: 0,
         spawned: 0,
         kills: 0,
         events: [],
@@ -792,6 +1199,10 @@ window.__ModuleLoader__.load({
       for (const id of cores) addCard(battle, id);
       battle.burnCap = hasCore(battle, 'core_ember') ? BURN.cap + 2 : BURN.cap;
       battle.emberSpread = hasCore(battle, 'core_ember') ? 3 : 1;
+      if (hasRule(battle, 'overdraft')) {
+        battle.player.cells = Math.max(1, battle.player.cells - 3);
+        refreshCooldowns(battle);
+      }
       return battle;
     }
 
@@ -809,8 +1220,24 @@ window.__ModuleLoader__.load({
       return best;
     }
 
-    /** 猎手核心：优先打格数最低的，而不是最近的。 */
+    /** 猎手核心：优先打格数最低的；标记规则：优先打带标记的。 */
     function pickTarget(battle, from, range, excludeId = -1) {
+      if (hasRule(battle, 'mark_hunter')) {
+        let marked = null;
+        let bestMark = 0;
+        let bestD = Infinity;
+        for (const e of battle.enemies) {
+          if (e.cells <= 0 || e.id === excludeId || (e.mark ?? 0) <= 0) continue;
+          const d = dist(from, e);
+          if (d > range) continue;
+          if (e.mark > bestMark || (e.mark === bestMark && d < bestD)) {
+            marked = e;
+            bestMark = e.mark;
+            bestD = d;
+          }
+        }
+        if (marked !== null) return marked;
+      }
       if (!hasCore(battle, 'core_hunter')) return nearestEnemy(battle, from, range, excludeId);
       let best = null;
       let bestCells = Infinity;
@@ -858,6 +1285,15 @@ window.__ModuleLoader__.load({
           root: 0,
           vortex: 0,
           wallCd: 0,
+          mark: 0,
+          markLeft: 0,
+          cleanseCd: 3,
+          devourCd: 6,
+          phaseCd: 4,
+          invuln: 0,
+          shield: 0,
+          genCd: 3,
+          reflectCd: 0,
           flash: 0,
         });
         battle.spawned += 1;
@@ -900,17 +1336,46 @@ window.__ModuleLoader__.load({
       p.y = clamp(p.y + (vy / len) * p.speed * dt, 6, ARENA.h - 6);
     }
 
+    /** 敌方护盾先吸收，再扣格。所有伤害都走这里。 */
+    function applyDamage(enemy, amount) {
+      let left = amount;
+      if ((enemy.shield ?? 0) > 0) {
+        const absorbed = Math.min(enemy.shield, left);
+        enemy.shield -= absorbed;
+        left -= absorbed;
+      }
+      enemy.cells -= left;
+      return left;
+    }
+
     function rawHit(battle, enemy, cells, burn = 0) {
+      if ((enemy.invuln ?? 0) > 0) {
+        battle.events.push({ type: 'phase', x: enemy.x, y: enemy.y });
+        return 0;
+      }
       const dealt = resolveHit(enemy, cells, { main: true });
-      enemy.cells -= dealt;
+      applyDamage(enemy, dealt);
       enemy.flash = 0.12;
       if (burn) applyBurn(enemy.status, burn, battle.burnCap);
       battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
       return dealt;
     }
 
+    function addMark(enemy, stacks) {
+      enemy.mark = Math.min(3, (enemy.mark ?? 0) + stacks);
+      enemy.markLeft = 6;
+    }
+
     function hitEnemy(battle, enemy, card) {
-      rawHit(battle, enemy, attackCells(card, battle.attrs), card.burn ?? 0);
+      let cells = attackCells(card, battle.attrs);
+      if (hasRule(battle, 'blood_debt') && battle.bloodStacks > 0) {
+        cells += battle.bloodStacks;
+        battle.bloodStacks = 0;
+      }
+      rawHit(battle, enemy, cells, card.burn ?? 0);
+
+      if (card.mark) addMark(enemy, card.mark);
+      if (hasRule(battle, 'mark_hunter')) addMark(enemy, 1);
 
       if (hasRule(battle, 'rule_pin') && battle.pinCd <= 0) {
         enemy.root = Math.max(enemy.root, 1);
@@ -918,6 +1383,16 @@ window.__ModuleLoader__.load({
       }
 
       if (hasRule(battle, 'rule_execute') && enemy.cells > 0 && enemy.cells <= EXECUTE_THRESHOLD) {
+        enemy.cells = 0;
+        battle.events.push({ type: 'execute', x: enemy.x, y: enemy.y });
+      }
+
+      if (
+        hasRule(battle, 'execute_mark') &&
+        (enemy.mark ?? 0) >= 3 &&
+        enemy.cells > 0 &&
+        enemy.cells <= 4
+      ) {
         enemy.cells = 0;
         battle.events.push({ type: 'execute', x: enemy.x, y: enemy.y });
       }
@@ -940,6 +1415,7 @@ window.__ModuleLoader__.load({
         // 存基础格数：命中时 hitEnemy 会再走一次 attackCells，否则锋锐会被加成两次
         cells: card.cells ?? 1,
         burn: card.burn ?? 0,
+        mark: card.mark ?? 0,
         pierce: hasCore(battle, 'core_pierce') ? 1 : 0,
         life: 1.2,
       });
@@ -960,25 +1436,84 @@ window.__ModuleLoader__.load({
       for (const source of battle.sources) {
         source.timer -= dt;
         if (source.timer > 0) continue;
-        source.timer += cooldown(source.card.cd, battle.attrs);
+        source.timer += cardCooldown(battle, source.card.cd);
         if (source.card.carrier === 'field') {
           pulse(battle, source.card);
           continue;
         }
-        const target = pickTarget(battle, battle.player, orbRange(battle));
-        if (target) fireBullet(battle, battle.player, source.card, target);
+        const extra = hasRule(battle, 'chain') ? battle.chainStacks : 0;
+        if (extra > 0) battle.chainStacks = 0;
+        for (let shot = 0; shot < 1 + extra; shot += 1) {
+          const target = pickTarget(battle, battle.player, orbRange(battle));
+          if (target === null) break;
+          fireBullet(battle, battle.player, source.card, target);
+        }
       }
 
-      for (const summon of battle.summons) {
-        const tx = battle.player.x - 10;
-        const ty = battle.player.y - 10;
+    }
+
+    function summonsTick(battle, dt) {
+      const p = battle.player;
+
+      if (hasRule(battle, 'merge')) {
+        for (let i = 0; i < battle.summons.length; i += 1) {
+          for (let j = i + 1; j < battle.summons.length; j += 1) {
+            const a = battle.summons[i];
+            const b = battle.summons[j];
+            if (dist(a, b) > 10) continue;
+            a.cells += b.cells;
+            a.maxCells += b.maxCells;
+            a.merged = true;
+            battle.summons.splice(j, 1);
+            j -= 1;
+            battle.events.push({ type: 'merge', x: a.x, y: a.y });
+          }
+        }
+      }
+
+      for (let i = battle.summons.length - 1; i >= 0; i -= 1) {
+        const summon = battle.summons[i];
+
+        if (summon.mode === 'totem') {
+          summon.timer -= dt;
+          if (summon.timer > 0) continue;
+          summon.timer += cardCooldown(battle, summon.card.cd);
+          for (const other of battle.summons) {
+            if (other === summon) continue;
+            if (dist(summon, other) > 30) continue;
+            other.cells = Math.min(other.maxCells, other.cells + 1);
+          }
+          continue;
+        }
+
+        if (summon.mode === 'charge') {
+          const target = nearestEnemy(battle, summon, 220);
+          if (target === null) continue;
+          const d = dist(summon, target) || 1;
+          if (d <= target.r + 4) {
+            for (const e of battle.enemies) {
+              if (e.cells <= 0) continue;
+              if (dist(e, summon) > (summon.card.radius ?? 18)) continue;
+              rawHit(battle, e, summon.card.blast ?? 3);
+            }
+            battle.events.push({ type: 'blast', x: summon.x, y: summon.y });
+            killSummon(battle, summon);
+            continue;
+          }
+          summon.x += ((target.x - summon.x) / d) * 60 * dt;
+          summon.y += ((target.y - summon.y) / d) * 60 * dt;
+          continue;
+        }
+
+        const tx = p.x - 10;
+        const ty = p.y - 10;
         summon.x += (tx - summon.x) * Math.min(1, dt * 3);
         summon.y += (ty - summon.y) * Math.min(1, dt * 3);
         summon.timer -= dt;
         if (summon.timer > 0) continue;
-        summon.timer += cooldown(summon.card.cd, battle.attrs);
+        summon.timer += cardCooldown(battle, summon.card.cd);
         const target = pickTarget(battle, summon, summonRange(battle));
-        if (target) fireBullet(battle, summon, summon.card, target);
+        if (target !== null) fireBullet(battle, summon, summon.card, target);
       }
     }
 
@@ -986,7 +1521,7 @@ window.__ModuleLoader__.load({
       for (const self of battle.selfs) {
         self.timer -= dt;
         if (self.timer > 0) continue;
-        self.timer += cooldown(self.card.cd, battle.attrs);
+        self.timer += cardCooldown(battle, self.card.cd);
         const targets = battle.enemies.filter(
           (e) => e.cells > 0 && dist(battle.player, e) <= selfRadius(battle) + e.r,
         );
@@ -997,15 +1532,101 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function rulesTick(battle, dt) {
-      if (!hasRule(battle, 'rule_anchor')) return;
-      battle.anchorTimer += dt;
-      if (battle.anchorTimer < ANCHOR_SECONDS) return;
-      battle.anchorTimer -= ANCHOR_SECONDS;
+    function freezeAll(battle, seconds) {
       for (const e of battle.enemies) {
-        if (e.cells > 0) e.freeze = Math.max(e.freeze, FREEZE_SECONDS);
+        if (e.cells > 0) e.freeze = Math.max(e.freeze, seconds);
       }
       battle.events.push({ type: 'freeze' });
+    }
+
+    function rulesTick(battle, dt) {
+      if (hasRule(battle, 'rule_anchor')) {
+        battle.anchorTimer += dt;
+        if (battle.anchorTimer >= ANCHOR_SECONDS) {
+          battle.anchorTimer -= ANCHOR_SECONDS;
+          freezeAll(battle, FREEZE_SECONDS);
+        }
+      }
+      if (hasRule(battle, 'time_stop')) {
+        battle.timeStopTimer += dt;
+        if (battle.timeStopTimer >= 12) {
+          battle.timeStopTimer -= 12;
+          freezeAll(battle, 1.5);
+        }
+      }
+    }
+
+    function burstShield(battle) {
+      for (const e of battle.enemies) {
+        if (e.cells <= 0) continue;
+        if (dist(battle.player, e) > 24) continue;
+        rawHit(battle, e, 3);
+      }
+      battle.events.push({ type: 'burst', x: battle.player.x, y: battle.player.y });
+    }
+
+    function riskTick(battle, dt) {
+      if (!hasRule(battle, 'shield_burst')) return;
+      battle.shieldTimer -= dt;
+      if (battle.shieldTimer > 0) return;
+      battle.shieldTimer += 6;
+      battle.player.shield = Math.min(4, battle.player.shield + 2);
+      battle.events.push({ type: 'shield', x: battle.player.x, y: battle.player.y });
+    }
+
+    function trapTick(battle, dt) {
+      const p = battle.player;
+
+      for (const source of battle.trapSources) {
+        source.timer -= dt;
+        if (source.timer > 0) continue;
+        source.timer += cardCooldown(battle, source.card.cd);
+        battle.traps.push({ card: source.card, x: p.x, y: p.y, ttl: source.card.ttl });
+      }
+
+      for (let i = battle.traps.length - 1; i >= 0; i -= 1) {
+        const trap = battle.traps[i];
+        trap.ttl -= dt;
+        const triggered = battle.enemies.some(
+          (e) => e.cells > 0 && dist(trap, e) <= trap.card.radius + e.r,
+        );
+        if (triggered) {
+          for (const e of battle.enemies) {
+            if (e.cells <= 0) continue;
+            if (dist(trap, e) > trap.card.radius + e.r) continue;
+            if (trap.card.cells) rawHit(battle, e, trap.card.cells);
+            if (trap.card.burn) applyBurn(e.status, trap.card.burn, battle.burnCap);
+            if (trap.card.freeze) e.freeze = Math.max(e.freeze, trap.card.freeze);
+          }
+          battle.events.push({ type: 'trap', x: trap.x, y: trap.y });
+          battle.traps.splice(i, 1);
+          continue;
+        }
+        if (trap.ttl <= 0) battle.traps.splice(i, 1);
+      }
+
+      for (const source of battle.trailSources) {
+        source.timer -= dt;
+        if (source.timer > 0) continue;
+        source.timer += source.card.cd;
+        battle.trails.push({ card: source.card, x: p.x, y: p.y, ttl: source.card.ttl, tick: 0 });
+      }
+
+      for (let i = battle.trails.length - 1; i >= 0; i -= 1) {
+        const trail = battle.trails[i];
+        trail.ttl -= dt;
+        trail.tick -= dt;
+        if (trail.tick <= 0) {
+          trail.tick += 0.5;
+          for (const e of battle.enemies) {
+            if (e.cells <= 0) continue;
+            if (dist(trail, e) > trail.card.radius + e.r) continue;
+            rawHit(battle, e, trail.card.cells);
+            if (trail.card.burn) applyBurn(e.status, trail.card.burn, battle.burnCap);
+          }
+        }
+        if (trail.ttl <= 0) battle.trails.splice(i, 1);
+      }
     }
 
     function bulletsTick(battle, dt) {
@@ -1022,7 +1643,12 @@ window.__ModuleLoader__.load({
         const d = Math.hypot(dx, dy) || 1;
         const travel = BULLET_SPEED * dt;
         if (d <= travel + BULLET_HIT_RADIUS) {
-          hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn });
+          hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn, mark: bullet.mark });
+          if (target.locks.includes('reflect') && (target.reflectCd ?? 0) <= 0) {
+            target.reflectCd = 1;
+            battle.player.cells -= 1;
+            battle.events.push({ type: 'reflect', x: battle.player.x, y: battle.player.y });
+          }
           if (bullet.pierce > 0) {
             const next = pickTarget(battle, bullet, orbRange(battle), target.id);
             if (next !== null) {
@@ -1054,7 +1680,7 @@ window.__ModuleLoader__.load({
       if (!hasRule(battle, 'rule_wall_slam')) return;
       if (enemy.wallCd > 0) return;
       enemy.wallCd = 1;
-      enemy.cells -= 2;
+      applyDamage(enemy, 2);
       battle.events.push({ type: 'wall', x: enemy.x, y: enemy.y });
     }
 
@@ -1116,6 +1742,7 @@ window.__ModuleLoader__.load({
         if (e.cells <= 0) continue;
         e.flash = Math.max(0, e.flash - dt);
         if (e.wallCd > 0) e.wallCd = Math.max(0, e.wallCd - dt);
+        if ((e.reflectCd ?? 0) > 0) e.reflectCd = Math.max(0, e.reflectCd - dt);
         if (e.freeze > 0) {
           e.freeze = Math.max(0, e.freeze - dt);
           continue;
@@ -1137,6 +1764,17 @@ window.__ModuleLoader__.load({
           if (hit) wallSlam(battle, e);
           continue;
         }
+        if (e.locks.includes('devour')) {
+          e.devourCd = (e.devourCd ?? 6) - dt;
+          if (e.devourCd <= 0) {
+            e.devourCd += 6;
+            const prey = nearestSummon(battle, e, 12);
+            if (prey !== null) {
+              e.cells = Math.min(e.maxCells, e.cells + 3);
+              killSummon(battle, prey);
+            }
+          }
+        }
         const dx = p.x - e.x;
         const dy = p.y - e.y;
         const d = Math.hypot(dx, dy) || 1;
@@ -1151,9 +1789,33 @@ window.__ModuleLoader__.load({
         e.attackTimer -= dt;
         if (e.attackTimer > 0) continue;
         e.attackTimer += ENEMY_ATTACK_INTERVAL;
-        const dmg = damageTaken(e.damage, battle.attrs);
-        p.cells -= dmg;
-        battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
+        let dmg = damageTaken(e.damage, battle.attrs);
+        if (hasRule(battle, 'link')) {
+          const linked = nearestSummon(battle, p, 40);
+          if (linked !== null) {
+            const transfer = dmg * 0.5;
+            linked.cells -= transfer;
+            dmg -= transfer;
+            if (linked.cells <= 0) killSummon(battle, linked);
+          }
+        }
+        if (battle.player.shield > 0 && dmg > 0) {
+          const absorbed = Math.min(battle.player.shield, dmg);
+          battle.player.shield -= absorbed;
+          dmg -= absorbed;
+          if (battle.player.shield <= 0 && hasRule(battle, 'shield_burst')) burstShield(battle);
+        }
+        if (dmg <= 0) continue;
+        if (hasRule(battle, 'delay')) {
+          battle.delayQueue.push({ due: battle.time + 2, amount: dmg, sourceId: e.id });
+          battle.events.push({ type: 'delay', x: p.x, y: p.y, cells: dmg });
+        } else {
+          p.cells -= dmg;
+          if (hasRule(battle, 'blood_debt')) {
+            battle.bloodStacks = Math.min(3, battle.bloodStacks + 1);
+          }
+          battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
+        }
         if (p.cells <= 0) {
           p.cells = 0;
           battle.state = 'dead';
@@ -1165,10 +1827,44 @@ window.__ModuleLoader__.load({
     function statusTick(battle, dt) {
       for (const e of battle.enemies) {
         if (e.cells <= 0) continue;
+        if ((e.mark ?? 0) > 0) {
+          e.markLeft = (e.markLeft ?? 0) - dt;
+          if (e.markLeft <= 0) e.mark = 0;
+        }
+        if (e.locks.includes('generator')) {
+          e.genCd = (e.genCd ?? 3) - dt;
+          if (e.genCd <= 0) {
+            e.genCd += 3;
+            for (const ally of battle.enemies) {
+              if (ally === e || ally.cells <= 0) continue;
+              if (dist(e, ally) > 20) continue;
+              ally.shield = Math.min(4, (ally.shield ?? 0) + 2);
+            }
+          }
+        }
+        if (e.locks.includes('cleanse')) {
+          e.cleanseCd = (e.cleanseCd ?? 3) - dt;
+          if (e.cleanseCd <= 0) {
+            e.cleanseCd += 3;
+            e.status.burn = 0;
+            e.mark = 0;
+          }
+        }
+        if (e.locks.includes('phase')) {
+          e.phaseCd = (e.phaseCd ?? 4) - dt;
+          if (e.phaseCd <= 0) {
+            e.phaseCd += 4;
+            e.invuln = 1.5;
+          }
+          if (e.invuln > 0) {
+            e.invuln = Math.max(0, e.invuln - dt);
+            continue;
+          }
+        }
         const burn = advanceStatus(e.status, dt);
         if (burn <= 0) continue;
         const dealt = resolveHit(e, burn, { main: false });
-        e.cells -= dealt;
+        applyDamage(e, dealt);
         battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: dealt });
       }
     }
@@ -1183,6 +1879,7 @@ window.__ModuleLoader__.load({
       const alive = [];
       const booms = [];
       const embers = [];
+      const marks = [];
       for (const e of battle.enemies) {
         if (e.cells > 0) {
           alive.push(e);
@@ -1197,9 +1894,16 @@ window.__ModuleLoader__.load({
             battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + 1);
           }
           if (e.status.burn > 0) embers.push({ x: e.x, y: e.y, burn: e.status.burn });
+          if ((e.mark ?? 0) > 0) marks.push({ x: e.x, y: e.y, stacks: e.mark });
           if (hasCore(battle, 'core_echo')) {
             battle.echoKills += 1;
             if (battle.echoKills % 8 === 0) refreshCooldowns(battle);
+          }
+          if (hasRule(battle, 'chain')) {
+            battle.chainStacks = Math.min(3, battle.chainStacks + 1);
+          }
+          if (battle.delayQueue.length > 0) {
+            battle.delayQueue = battle.delayQueue.filter((item) => item.sourceId !== e.id);
           }
         }
         if (e.canSplit && e.primary) {
@@ -1235,12 +1939,34 @@ window.__ModuleLoader__.load({
         for (const target of targets) applyBurn(target.status, ember.burn, battle.burnCap);
       }
 
+      // 引信：带标记的敌人死亡时按层数爆炸；传导：标记扩散给最近的两个
+      for (const mark of marks) {
+        if (hasRule(battle, 'fuse')) {
+          for (const other of alive) {
+            if (other.cells <= 0) continue;
+            if (Math.hypot(other.x - mark.x, other.y - mark.y) > 18) continue;
+            applyDamage(other, mark.stacks);
+            battle.events.push({ type: 'burn', x: other.x, y: other.y, cells: mark.stacks });
+          }
+        }
+        if (hasRule(battle, 'spread')) {
+          const targets = alive
+            .filter((other) => other.cells > 0)
+            .sort(
+              (a, b) =>
+                Math.hypot(a.x - mark.x, a.y - mark.y) - Math.hypot(b.x - mark.x, b.y - mark.y),
+            )
+            .slice(0, 2);
+          for (const target of targets) addMark(target, mark.stacks);
+        }
+      }
+
       for (const at of booms) {
         for (const e of alive) {
           if (e.cells <= 0) continue;
           if (dist(e, at) > BOOM_RADIUS) continue;
-          e.cells -= 1;
-          e.cells -= 1;
+          applyDamage(e, 1);
+          applyDamage(e, 1);
           e.flash = 0.1;
           battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: 2 });
         }
@@ -1296,12 +2022,20 @@ window.__ModuleLoader__.load({
       battle.events = [];
       battle.time += dt;
       spawnTick(battle);
+      for (let i = battle.respawns.length - 1; i >= 0; i -= 1) {
+        if (battle.time < battle.respawns[i].at) continue;
+        const dead = battle.respawns.splice(i, 1)[0];
+        if (battle.summons.length < 6) battle.summons.push(makeSummon(battle, dead.card));
+      }
       playerMove(battle, dt);
       attackTick(battle, dt);
+      summonsTick(battle, dt);
       displacementTick(battle, dt);
       if (battle.pinCd > 0) battle.pinCd -= dt;
       selfTick(battle, dt);
       rulesTick(battle, dt);
+      riskTick(battle, dt);
+      trapTick(battle, dt);
       bulletsTick(battle, dt);
       enemiesTick(battle, dt);
       statusTick(battle, dt);
@@ -1309,6 +2043,46 @@ window.__ModuleLoader__.load({
       if (regen > 0 && battle.player.cells > 0 && battle.player.cells < battle.player.maxCells) {
         battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + regen * dt);
       }
+
+      for (let i = battle.delayQueue.length - 1; i >= 0; i -= 1) {
+        const item = battle.delayQueue[i];
+        if (battle.time < item.due) continue;
+        battle.delayQueue.splice(i, 1);
+        battle.player.cells -= item.amount;
+        battle.events.push({ type: 'hurt', x: battle.player.x, y: battle.player.y, cells: item.amount });
+      }
+
+      battle.snapshotTimer -= dt;
+      if (battle.snapshotTimer <= 0) {
+        battle.snapshotTimer += 0.25;
+        battle.snapshots.push({
+          t: battle.time,
+          x: battle.player.x,
+          y: battle.player.y,
+          cells: battle.player.cells,
+        });
+        if (battle.snapshots.length > 16) battle.snapshots.shift();
+      }
+      if (hasRule(battle, 'rewind')) {
+        battle.rewindCd -= dt;
+        const half = battle.player.maxCells * 0.5;
+        if (
+          !battle.rewindUsed &&
+          battle.rewindCd <= 0 &&
+          battle.player.cells > 0 &&
+          battle.player.cells < half
+        ) {
+          const target = battle.snapshots.find((snap) => snap.t <= battle.time - 3);
+          if (target !== undefined) {
+            battle.player.x = target.x;
+            battle.player.y = target.y;
+            battle.player.cells = Math.max(battle.player.cells, target.cells);
+            battle.rewindUsed = true;
+            battle.events.push({ type: 'rewind', x: target.x, y: target.y });
+          }
+        }
+      }
+
       resolveDeaths(battle);
       checkEnd(battle);
       return battle.events;
@@ -1329,7 +2103,7 @@ window.__ModuleLoader__.load({
     const POLL_MS = 800
     const CLEAR_PAUSE = 1.1
     const FAIL_PAUSE = 3.4
-    const MAX_FLOOR = 8
+    const MAX_FLOOR = 15
     const TOKENS_PER_ENEMY = 500
     const TYPE_ID = 'dsh-pet'
     const KIND = 'pet'
@@ -1347,7 +2121,15 @@ window.__ModuleLoader__.load({
         cards: ['orb_phys'],
         pool: [],
       },
+      lab: {
+        id: 'lab',
+        label: '实验',
+        cards: ['orb_phys', 'orb_fire', 'field_fire'],
+        pool: [...LAB_PACK],
+      },
     }
+
+    const BUILD_ORDER = ['fire', 'pure', 'lab']
 
     const COLORS = {
       bg: '#0a0d12',
@@ -1712,6 +2494,8 @@ window.__ModuleLoader__.load({
           ? COLORS.split
           : COLORS.enemy
       const lit = e.flash > 0
+      const phased = (e.invuln ?? 0) > 0
+      if (phased) c.globalAlpha = 0.45
       c.fillStyle = lit ? '#ffffff' : style.rim
       c.fillRect(x, y, size, size)
       c.fillStyle = lit ? '#ffffff' : style.body
@@ -1735,6 +2519,18 @@ window.__ModuleLoader__.load({
         c.fillStyle = COLORS.burn
         c.fillRect(x + size + 1, y, 1, 1)
         if (e.status.burn >= 3) c.fillRect(x + size + 1, y + 2, 1, 1)
+      }
+      if ((e.mark ?? 0) > 0) {
+        c.fillStyle = '#ff6b6b'
+        c.fillRect(x + Math.floor(size / 2), y - 6, 1, 1)
+      }
+      if (phased) c.globalAlpha = 1
+      if ((e.shield ?? 0) > 0) {
+        c.fillStyle = '#9fd8ff'
+        c.fillRect(x - 1, y - 1, size + 2, 1)
+        c.fillRect(x - 1, y + size, size + 2, 1)
+        c.fillRect(x - 1, y - 1, 1, size + 2)
+        c.fillRect(x + size, y - 1, 1, size + 2)
       }
     }
 
@@ -1784,11 +2580,35 @@ window.__ModuleLoader__.load({
         }
       }
 
+      for (const trail of battle.trails) {
+        c.globalAlpha = Math.max(0.15, Math.min(1, trail.ttl / 2))
+        c.fillStyle = trail.card.kind === 'shock' ? '#9fd8ff' : '#ff9f45'
+        c.fillRect(Math.round(trail.x) - 2, Math.round(trail.y) - 2, 4, 4)
+      }
+      c.globalAlpha = 1
+      for (const trap of battle.traps) {
+        c.fillStyle = trap.card.kind === 'frost' ? '#9fd8ff' : '#e35d5d'
+        c.fillRect(Math.round(trap.x) - 1, Math.round(trap.y) - 1, 3, 3)
+      }
+
       for (const e of battle.enemies) drawEnemy(c, e)
       for (const s of battle.summons) drawSummon(c, s)
       c.fillStyle = COLORS.bullet
       for (const b of battle.bullets) c.fillRect(Math.round(b.x), Math.round(b.y), 1, 1)
       drawPlayer(c, battle.player)
+
+      if (battle.player.shield > 0) {
+        c.fillStyle = '#9fd8ff'
+        for (let i = 0; i < 8; i += 1) {
+          const a = (i / 8) * Math.PI * 2
+          c.fillRect(
+            Math.round(battle.player.x + Math.cos(a) * 7),
+            Math.round(battle.player.y + Math.sin(a) * 7),
+            1,
+            1,
+          )
+        }
+      }
     }
 
     // ---- 诊断 ----
@@ -1948,7 +2768,8 @@ window.__ModuleLoader__.load({
             onClick: () => {
               const e = entryRef.current
               if (e === null) return
-              e.buildId = e.buildId === 'fire' ? 'pure' : 'fire'
+              const next = BUILD_ORDER[(BUILD_ORDER.indexOf(e.buildId) + 1) % BUILD_ORDER.length]
+              e.buildId = next
               resetRun(e, 1)
               bump()
             },
@@ -2041,6 +2862,9 @@ window.__ModuleLoader__.load({
           h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
           h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
           h('span', null, '压力 +' + (battle === null ? 0 : battle.extra)),
+          battle !== null && battle.player.shield > 0
+            ? h('span', null, '盾 ' + Math.ceil(battle.player.shield))
+            : null,
           h('span', { className: 'dsh-pet-spacer' }),
           h('span', null, formatTokens(entry.consumed) + ' token'),
         ),
