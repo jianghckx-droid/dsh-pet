@@ -30,12 +30,58 @@ window.__ModuleLoader__.load({
       pointsPerEdgeCell: 2, // 锋锐：每 2 点 +1 格
     });
 
+    const ATTR_MAX = 10;
+
+    const ATTRIBUTES = Object.freeze([
+      Object.freeze({ id: 'edge', label: '锋锐', max: ATTR_MAX, desc: '每 2 点 +1 格' }),
+      Object.freeze({ id: 'swift', label: '迅捷', max: ATTR_MAX, desc: '冷却 −4%/点' }),
+      Object.freeze({ id: 'body', label: '体魄', max: ATTR_MAX, desc: '生命 +2 格/点' }),
+      Object.freeze({ id: 'tough', label: '坚韧', max: ATTR_MAX, desc: '受伤 −3%/点' }),
+      Object.freeze({ id: 'recover', label: '复原', max: ATTR_MAX, desc: '每秒 +0.2 格' }),
+      Object.freeze({ id: 'vision', label: '视野', max: ATTR_MAX, desc: '射程 +6%/点' }),
+    ]);
+
+    const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number.isFinite(v) ? v : lo)));
+
+    function normalizeAttrs(attrs = {}) {
+      const out = {};
+      for (const attr of ATTRIBUTES) out[attr.id] = clampInt(attrs[attr.id] ?? 0, 0, attr.max);
+      return out;
+    }
+
+    function attrsSpent(attrs = {}) {
+      let n = 0;
+      for (const attr of ATTRIBUTES) n += attrs[attr.id] ?? 0;
+      return n;
+    }
+
     function playerCells(attrs = {}) {
       return PLAYER.baseCells + (attrs.body ?? 0) * PLAYER.cellsPerBody;
     }
 
     function edgeCells(attrs = {}) {
       return Math.floor((attrs.edge ?? 0) / PLAYER.pointsPerEdgeCell);
+    }
+
+    /** 坚韧：受伤 −3%/点，至少还是掉 1 格以下（不取整，格数允许小数）。 */
+    function damageTaken(cells, attrs = {}) {
+      const cut = (attrs.tough ?? 0) * 0.03;
+      return Math.max(0.1, cells * (1 - cut));
+    }
+
+    /** 迅捷：冷却 −4%/点。 */
+    function cooldown(cd, attrs = {}) {
+      return cd * (1 - (attrs.swift ?? 0) * 0.04);
+    }
+
+    /** 复原：每秒 +0.2 格。 */
+    function regenPerSecond(attrs = {}) {
+      return (attrs.recover ?? 0) * 0.2;
+    }
+
+    /** 视野：射程 / 领域半径 +6%/点。 */
+    function visionScale(attrs = {}) {
+      return 1 + (attrs.vision ?? 0) * 0.06;
     }
 
     /** 主攻击的格数：卡面基础格 + 锋锐。衍生效果不要调这个函数。 */
@@ -397,9 +443,11 @@ window.__ModuleLoader__.load({
       return { x: -6, y: rng() * ARENA.h };
     }
 
-    function hasRule(battle, id) {
-      return battle.rules.some((rule) => rule.id === id);
-    }
+    const hasRule = (battle, id) => battle.rules.some((rule) => rule.id === id);
+    const orbRange = (battle) => ORB_RANGE * visionScale(battle.attrs);
+    const fieldRadius = (battle) => FIELD_RADIUS * visionScale(battle.attrs);
+    const selfRadius = (battle) => SELF_RADIUS * visionScale(battle.attrs);
+    const summonRange = (battle) => SUMMON_RANGE * visionScale(battle.attrs);
 
     /** 把一张卡加进当前战斗。开局 build 与抽卡都走这里。 */
     function addCard(battle, id) {
@@ -410,7 +458,7 @@ window.__ModuleLoader__.load({
         return card;
       }
       if (card.carrier === 'self') {
-        battle.selfs.push({ card, timer: card.cd });
+        battle.selfs.push({ card, timer: cooldown(card.cd, battle.attrs) });
         return card;
       }
       if (card.carrier === 'summon') {
@@ -419,11 +467,11 @@ window.__ModuleLoader__.load({
           card,
           x: battle.player.x - 8,
           y: battle.player.y - 8,
-          timer: card.cd * 0.5,
+          timer: cooldown(card.cd, battle.attrs) * 0.5,
         });
         return card;
       }
-      battle.sources.push({ card, timer: card.cd * 0.5 });
+      battle.sources.push({ card, timer: cooldown(card.cd, battle.attrs) * 0.5 });
       return card;
     }
 
@@ -447,6 +495,7 @@ window.__ModuleLoader__.load({
         battle.xp -= battle.xpNext;
         battle.level += 1;
         battle.xpNext = 6 + battle.level * 2;
+        battle.points += 1;
         if (battle.level % 2 === 0) battle.pending += 1;
       }
       rollOffer(battle);
@@ -465,13 +514,15 @@ window.__ModuleLoader__.load({
       return true;
     }
 
-    function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], drafted = [] }) {
+    function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], drafted = [], points = 0 }) {
       const def = floorDef(floor);
-      const maxCells = playerCells(attrs);
+      const normalized = normalizeAttrs(attrs);
+      const maxCells = playerCells(normalized);
       const battle = {
         def,
         floor,
-        attrs,
+        attrs: normalized,
+        points,
         pool: [...pool],
         slots: [...drafted],
         cards: [],
@@ -493,7 +544,7 @@ window.__ModuleLoader__.load({
         },
         level: 1,
         xp: 0,
-        xpNext: 8,
+        xpNext: 6,
         pending: 0,
         offer: null,
         hitCount: 0,
@@ -604,7 +655,7 @@ window.__ModuleLoader__.load({
       if (hasRule(battle, 'rule_combo')) {
         battle.hitCount += 1;
         if (battle.hitCount % COMBO_EVERY === 0) {
-          const extra = nearestEnemy(battle, battle.player, ORB_RANGE);
+          const extra = nearestEnemy(battle, battle.player, orbRange(battle));
           if (extra && extra !== enemy && extra.cells > 0) rawHit(battle, extra, 1);
         }
       }
@@ -625,7 +676,7 @@ window.__ModuleLoader__.load({
 
     function pulse(battle, card) {
       const targets = battle.enemies
-        .filter((e) => e.cells > 0 && dist(battle.player, e) <= FIELD_RADIUS + e.r)
+        .filter((e) => e.cells > 0 && dist(battle.player, e) <= fieldRadius(battle) + e.r)
         .slice(0, card.aoe || 1);
       for (const e of targets) hitEnemy(battle, e, card);
       if (targets.length > 0) {
@@ -637,12 +688,12 @@ window.__ModuleLoader__.load({
       for (const source of battle.sources) {
         source.timer -= dt;
         if (source.timer > 0) continue;
-        source.timer += source.card.cd;
+        source.timer += cooldown(source.card.cd, battle.attrs);
         if (source.card.carrier === 'field') {
           pulse(battle, source.card);
           continue;
         }
-        const target = nearestEnemy(battle, battle.player, ORB_RANGE);
+        const target = nearestEnemy(battle, battle.player, orbRange(battle));
         if (target) fireBullet(battle, battle.player, source.card, target);
       }
 
@@ -653,8 +704,8 @@ window.__ModuleLoader__.load({
         summon.y += (ty - summon.y) * Math.min(1, dt * 3);
         summon.timer -= dt;
         if (summon.timer > 0) continue;
-        summon.timer += summon.card.cd;
-        const target = nearestEnemy(battle, summon, SUMMON_RANGE);
+        summon.timer += cooldown(summon.card.cd, battle.attrs);
+        const target = nearestEnemy(battle, summon, summonRange(battle));
         if (target) fireBullet(battle, summon, summon.card, target);
       }
     }
@@ -663,9 +714,9 @@ window.__ModuleLoader__.load({
       for (const self of battle.selfs) {
         self.timer -= dt;
         if (self.timer > 0) continue;
-        self.timer += self.card.cd;
+        self.timer += cooldown(self.card.cd, battle.attrs);
         const targets = battle.enemies.filter(
-          (e) => e.cells > 0 && dist(battle.player, e) <= SELF_RADIUS + e.r,
+          (e) => e.cells > 0 && dist(battle.player, e) <= selfRadius(battle) + e.r,
         );
         for (const e of targets) hitEnemy(battle, e, self.card);
         if (targets.length > 0) {
@@ -732,8 +783,9 @@ window.__ModuleLoader__.load({
         e.attackTimer -= dt;
         if (e.attackTimer > 0) continue;
         e.attackTimer += ENEMY_ATTACK_INTERVAL;
-        p.cells -= e.damage;
-        battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: e.damage });
+        const dmg = damageTaken(e.damage, battle.attrs);
+        p.cells -= dmg;
+        battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
         if (p.cells <= 0) {
           p.cells = 0;
           battle.state = 'dead';
@@ -815,6 +867,24 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 花 1 点属性。体魄当场提高上限并补回等量生命。 */
+    function spendPoint(battle, id) {
+      const attr = ATTRIBUTES.find((a) => a.id === id);
+      if (attr === undefined) return false;
+      if (battle.points <= 0) return false;
+      if ((battle.attrs[id] ?? 0) >= attr.max) return false;
+      const before = playerCells(battle.attrs);
+      battle.attrs[id] += 1;
+      battle.points -= 1;
+      const after = playerCells(battle.attrs);
+      if (after !== before) {
+        battle.player.maxCells = after;
+        battle.player.cells = Math.min(after, battle.player.cells + (after - before));
+      }
+      battle.events.push({ type: 'spend', id });
+      return true;
+    }
+
     /** 推进一帧，返回这一帧产生的事件。 */
     function step(battle, dt) {
       if (battle.state !== 'fighting') return [];
@@ -828,6 +898,10 @@ window.__ModuleLoader__.load({
       bulletsTick(battle, dt);
       enemiesTick(battle, dt);
       statusTick(battle, dt);
+      const regen = regenPerSecond(battle.attrs);
+      if (regen > 0 && battle.player.cells > 0 && battle.player.cells < battle.player.maxCells) {
+        battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + regen * dt);
+      }
       resolveDeaths(battle);
       checkEnd(battle);
       return battle.events;
@@ -858,14 +932,12 @@ window.__ModuleLoader__.load({
         label: '灼烧',
         cards: [...FIRE_BUILD],
         pool: [...FIRE_PACK],
-        attrs: { edge: 0, body: 10 },
       },
       pure: {
         id: 'pure',
         label: '纯数值',
         cards: ['orb_phys'],
         pool: [],
-        attrs: { edge: 10, body: 0 },
       },
     }
 
@@ -915,13 +987,62 @@ window.__ModuleLoader__.load({
       '.dsh-pet-card:hover{background:#16222e;border-color:#3a5470}',
       '.dsh-pet-card-name{color:#ffd166;font-weight:700}',
       '.dsh-pet-card-desc{color:#8fa4b5;font-size:9px}',
+      '.dsh-pet-attrs{display:flex;flex-direction:column;gap:3px}',
+      '.dsh-pet-attrs-head{display:flex;justify-content:space-between;font-size:10px;color:#7f93a3}',
+      '.dsh-pet-points{color:#ffd166}',
+      '.dsh-pet-attr-grid{display:grid;grid-template-columns:1fr 1fr;gap:3px}',
+      '.dsh-pet-attr{display:flex;justify-content:space-between;font:inherit;font-size:10px;color:#cfe3ef;',
+      'background:#111a24;border:1px solid #1f2a36;border-radius:4px;padding:2px 5px;cursor:pointer}',
+      '.dsh-pet-attr:hover:not(:disabled){background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-attr:disabled{opacity:.45;cursor:default}',
+      '.dsh-pet-attr-val{color:#8fa4b5}',
     ].join('')
 
     // ---- 进度 ----
 
+    const SAVE_PREFIX = 'dsh.pet.v3.'
+
+    function loadAccount(key) {
+      try {
+        const store = window.localStorage
+        if (store === undefined || store === null) return { attrs: {}, points: 0 }
+        const raw = store.getItem(SAVE_PREFIX + key)
+        if (raw === null) return { attrs: {}, points: 0 }
+        const parsed = JSON.parse(raw)
+        return {
+          attrs: normalizeAttrs(parsed !== null && typeof parsed === 'object' ? parsed.attrs : {}),
+          points: Math.max(0, Math.floor(Number(parsed.points) || 0)),
+        }
+      } catch {
+        return { attrs: {}, points: 0 }
+      }
+    }
+
+    function saveAccount(entry) {
+      try {
+        const store = window.localStorage
+        if (store === undefined || store === null) return
+        store.setItem(
+          SAVE_PREFIX + entry.key,
+          JSON.stringify({ attrs: entry.attrs, points: entry.points }),
+        )
+      } catch {
+        // 存档失败不能打断战斗
+      }
+    }
+
     const ENTRIES = new Map()
 
+    function syncAccount(entry) {
+      const battle = entry.battle
+      if (battle === null) return
+      entry.points = battle.points
+      entry.attrs = { ...battle.attrs }
+      saveAccount(entry)
+    }
+
     function startFloor(entry, floor) {
+      syncAccount(entry)
       const build = BUILDS[entry.buildId]
       entry.floor = floor
       entry.phase = 'fight'
@@ -930,7 +1051,8 @@ window.__ModuleLoader__.load({
       entry.battle = createBattle({
         floor,
         build: [...build.cards, ...entry.drafted],
-        attrs: build.attrs,
+        attrs: entry.attrs,
+        points: entry.points,
         seed: entry.seed++,
         pool: build.pool,
         drafted: entry.drafted,
@@ -938,12 +1060,15 @@ window.__ModuleLoader__.load({
     }
 
     function createEntry(key, seed) {
+      const account = loadAccount(key)
       const entry = {
         key,
         battle: null,
         floor: 1,
         best: 1,
         buildId: 'fire',
+        attrs: account.attrs,
+        points: account.points,
         phase: 'fight',
         lastResult: null,
         resultTimer: 0,
@@ -993,6 +1118,16 @@ window.__ModuleLoader__.load({
       if (battle === null) return false
       if (!chooseCard(battle, id)) return false
       entry.drafted.push(id)
+      return true
+    }
+
+    function spend(entry, id) {
+      const battle = entry.battle
+      if (battle === null) return false
+      if (!spendPoint(battle, id)) return false
+      entry.attrs = { ...battle.attrs }
+      entry.points = battle.points
+      saveAccount(entry)
       return true
     }
 
@@ -1288,6 +1423,8 @@ window.__ModuleLoader__.load({
       const maxCells = battle === null ? 1 : battle.player.maxCells
       const pct = Math.max(0, Math.min(100, (cells / maxCells) * 100))
       const build = BUILDS[entry.buildId]
+      const attrs = battle !== null ? battle.attrs : entry.attrs
+      const points = battle !== null ? battle.points : entry.points
       const result = entry.phase === 'result' ? entry.lastResult : null
       const lockName = battle !== null && battle.def.locks.length > 0 ? battle.def.locks[0] : '—'
 
@@ -1346,6 +1483,29 @@ window.__ModuleLoader__.load({
             : null,
         ),
         h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%' } })),
+        h('div', { className: 'dsh-pet-attrs' },
+          h('div', { className: 'dsh-pet-attrs-head' },
+            h('span', null, '属性'),
+            h('span', { className: 'dsh-pet-points' }, '可分配 ' + points),
+          ),
+          h('div', { className: 'dsh-pet-attr-grid' },
+            ATTRIBUTES.map((attr) =>
+              h('button', {
+                key: attr.id,
+                type: 'button',
+                className: 'dsh-pet-attr',
+                title: attr.desc,
+                disabled: points <= 0 || attrs[attr.id] >= attr.max,
+                onClick: () => {
+                  if (spend(entry, attr.id)) bump()
+                },
+              },
+                h('span', null, attr.label),
+                h('span', { className: 'dsh-pet-attr-val' }, attrs[attr.id] + '/' + attr.max),
+              ),
+            ),
+          ),
+        ),
         h('div', { className: 'dsh-pet-bottom' },
           h('span', null, '格 ' + Math.max(0, cells) + '/' + maxCells),
           h('span', null, '槽 ' + (battle === null ? 0 : battle.slots.length) + '/' + MAX_SLOTS),
@@ -1414,7 +1574,7 @@ window.__ModuleLoader__.load({
         )
       },
       // 供 node --test 验证接入路径；运行时不使用。
-      __debug: { createEntry, tick, startFloor, draw, BUILDS, pickCard, awardXp, chooseCard },
+      __debug: { createEntry, tick, startFloor, draw, BUILDS, pickCard, awardXp, chooseCard, spend },
     }
   },
 })

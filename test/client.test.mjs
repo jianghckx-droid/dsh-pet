@@ -10,6 +10,7 @@ const source = fs.readFileSync(path.join(ROOT, 'client.js'), 'utf8');
 
 function loadDefinition() {
   let definition = null;
+  const store = new Map();
   const window = {
     __ModuleLoader__: {
       load(def) {
@@ -22,6 +23,10 @@ function loadDefinition() {
     clearInterval: () => {},
     fetch: async () => {
       throw new Error('offline');
+    },
+    localStorage: {
+      getItem: (key) => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => store.set(key, String(value)),
     },
   };
   const sandbox = { window, performance: { now: () => 0 }, console };
@@ -143,6 +148,31 @@ test('三选一：选卡进槽，并在下一层保留', () => {
   assert.equal(entry.battle.floor, 2);
   assert.equal(entry.battle.slots.length, 1);
   assert.ok(entry.battle.cards.some((card) => card.id === id));
+});
+
+test('属性点：花掉后写进存档，再次进入角色仍在', () => {
+  const { createEntry, awardXp, spend } = loadModule().__debug;
+  const first = createEntry('persist-key', 7);
+  awardXp(first.battle, 20);
+  assert.ok(first.battle.points > 0, 'expected points from level-ups');
+  assert.equal(spend(first, 'body'), true);
+  assert.equal(first.attrs.body, 1);
+  assert.equal(first.battle.player.maxCells, 14);
+
+  const second = createEntry('persist-key', 7);
+  assert.equal(second.attrs.body, 1);
+  assert.equal(second.points, first.points);
+});
+
+test('属性点跨层保留', () => {
+  const { createEntry, startFloor, awardXp } = loadModule().__debug;
+  const entry = createEntry('pts-key', 7);
+  awardXp(entry.battle, 6);
+  const points = entry.battle.points;
+  assert.ok(points > 0, 'expected a point from level 2');
+  startFloor(entry, 2);
+  assert.equal(entry.battle.points, points);
+  assert.equal(entry.points, points);
 });
 
 test('纯数值在第 6 层会被挡住（客户端同一套规则）', () => {

@@ -21,12 +21,58 @@ export const PLAYER = Object.freeze({
   pointsPerEdgeCell: 2, // 锋锐：每 2 点 +1 格
 });
 
+export const ATTR_MAX = 10;
+
+export const ATTRIBUTES = Object.freeze([
+  Object.freeze({ id: 'edge', label: '锋锐', max: ATTR_MAX, desc: '每 2 点 +1 格' }),
+  Object.freeze({ id: 'swift', label: '迅捷', max: ATTR_MAX, desc: '冷却 −4%/点' }),
+  Object.freeze({ id: 'body', label: '体魄', max: ATTR_MAX, desc: '生命 +2 格/点' }),
+  Object.freeze({ id: 'tough', label: '坚韧', max: ATTR_MAX, desc: '受伤 −3%/点' }),
+  Object.freeze({ id: 'recover', label: '复原', max: ATTR_MAX, desc: '每秒 +0.2 格' }),
+  Object.freeze({ id: 'vision', label: '视野', max: ATTR_MAX, desc: '射程 +6%/点' }),
+]);
+
+const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number.isFinite(v) ? v : lo)));
+
+export function normalizeAttrs(attrs = {}) {
+  const out = {};
+  for (const attr of ATTRIBUTES) out[attr.id] = clampInt(attrs[attr.id] ?? 0, 0, attr.max);
+  return out;
+}
+
+export function attrsSpent(attrs = {}) {
+  let n = 0;
+  for (const attr of ATTRIBUTES) n += attrs[attr.id] ?? 0;
+  return n;
+}
+
 export function playerCells(attrs = {}) {
   return PLAYER.baseCells + (attrs.body ?? 0) * PLAYER.cellsPerBody;
 }
 
 export function edgeCells(attrs = {}) {
   return Math.floor((attrs.edge ?? 0) / PLAYER.pointsPerEdgeCell);
+}
+
+/** 坚韧：受伤 −3%/点，至少还是掉 1 格以下（不取整，格数允许小数）。 */
+export function damageTaken(cells, attrs = {}) {
+  const cut = (attrs.tough ?? 0) * 0.03;
+  return Math.max(0.1, cells * (1 - cut));
+}
+
+/** 迅捷：冷却 −4%/点。 */
+export function cooldown(cd, attrs = {}) {
+  return cd * (1 - (attrs.swift ?? 0) * 0.04);
+}
+
+/** 复原：每秒 +0.2 格。 */
+export function regenPerSecond(attrs = {}) {
+  return (attrs.recover ?? 0) * 0.2;
+}
+
+/** 视野：射程 / 领域半径 +6%/点。 */
+export function visionScale(attrs = {}) {
+  return 1 + (attrs.vision ?? 0) * 0.06;
 }
 
 /** 主攻击的格数：卡面基础格 + 锋锐。衍生效果不要调这个函数。 */

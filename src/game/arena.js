@@ -17,12 +17,18 @@
 
 import { cardsById } from './cards.js';
 import {
+  ATTRIBUTES,
   advanceStatus,
   applyBurn,
   attackCells,
+  cooldown,
   createStatus,
+  damageTaken,
+  normalizeAttrs,
   playerCells,
+  regenPerSecond,
   resolveHit,
+  visionScale,
 } from './rules.js';
 import { enemyCells, enemyDamage, floorDef, spawnSeconds } from './floors.js';
 
@@ -77,9 +83,11 @@ function spawnPoint(rng) {
   return { x: -6, y: rng() * ARENA.h };
 }
 
-function hasRule(battle, id) {
-  return battle.rules.some((rule) => rule.id === id);
-}
+const hasRule = (battle, id) => battle.rules.some((rule) => rule.id === id);
+const orbRange = (battle) => ORB_RANGE * visionScale(battle.attrs);
+const fieldRadius = (battle) => FIELD_RADIUS * visionScale(battle.attrs);
+const selfRadius = (battle) => SELF_RADIUS * visionScale(battle.attrs);
+const summonRange = (battle) => SUMMON_RANGE * visionScale(battle.attrs);
 
 /** 把一张卡加进当前战斗。开局 build 与抽卡都走这里。 */
 export function addCard(battle, id) {
@@ -90,7 +98,7 @@ export function addCard(battle, id) {
     return card;
   }
   if (card.carrier === 'self') {
-    battle.selfs.push({ card, timer: card.cd });
+    battle.selfs.push({ card, timer: cooldown(card.cd, battle.attrs) });
     return card;
   }
   if (card.carrier === 'summon') {
@@ -99,11 +107,11 @@ export function addCard(battle, id) {
       card,
       x: battle.player.x - 8,
       y: battle.player.y - 8,
-      timer: card.cd * 0.5,
+      timer: cooldown(card.cd, battle.attrs) * 0.5,
     });
     return card;
   }
-  battle.sources.push({ card, timer: card.cd * 0.5 });
+  battle.sources.push({ card, timer: cooldown(card.cd, battle.attrs) * 0.5 });
   return card;
 }
 
@@ -127,6 +135,7 @@ export function awardXp(battle, amount) {
     battle.xp -= battle.xpNext;
     battle.level += 1;
     battle.xpNext = 6 + battle.level * 2;
+    battle.points += 1;
     if (battle.level % 2 === 0) battle.pending += 1;
   }
   rollOffer(battle);
@@ -145,13 +154,15 @@ export function chooseCard(battle, id) {
   return true;
 }
 
-export function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], drafted = [] }) {
+export function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], drafted = [], points = 0 }) {
   const def = floorDef(floor);
-  const maxCells = playerCells(attrs);
+  const normalized = normalizeAttrs(attrs);
+  const maxCells = playerCells(normalized);
   const battle = {
     def,
     floor,
-    attrs,
+    attrs: normalized,
+    points,
     pool: [...pool],
     slots: [...drafted],
     cards: [],
@@ -173,7 +184,7 @@ export function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], dr
     },
     level: 1,
     xp: 0,
-    xpNext: 8,
+    xpNext: 6,
     pending: 0,
     offer: null,
     hitCount: 0,
@@ -284,7 +295,7 @@ function hitEnemy(battle, enemy, card) {
   if (hasRule(battle, 'rule_combo')) {
     battle.hitCount += 1;
     if (battle.hitCount % COMBO_EVERY === 0) {
-      const extra = nearestEnemy(battle, battle.player, ORB_RANGE);
+      const extra = nearestEnemy(battle, battle.player, orbRange(battle));
       if (extra && extra !== enemy && extra.cells > 0) rawHit(battle, extra, 1);
     }
   }
@@ -305,7 +316,7 @@ function fireBullet(battle, from, card, target) {
 
 function pulse(battle, card) {
   const targets = battle.enemies
-    .filter((e) => e.cells > 0 && dist(battle.player, e) <= FIELD_RADIUS + e.r)
+    .filter((e) => e.cells > 0 && dist(battle.player, e) <= fieldRadius(battle) + e.r)
     .slice(0, card.aoe || 1);
   for (const e of targets) hitEnemy(battle, e, card);
   if (targets.length > 0) {
@@ -317,12 +328,12 @@ function attackTick(battle, dt) {
   for (const source of battle.sources) {
     source.timer -= dt;
     if (source.timer > 0) continue;
-    source.timer += source.card.cd;
+    source.timer += cooldown(source.card.cd, battle.attrs);
     if (source.card.carrier === 'field') {
       pulse(battle, source.card);
       continue;
     }
-    const target = nearestEnemy(battle, battle.player, ORB_RANGE);
+    const target = nearestEnemy(battle, battle.player, orbRange(battle));
     if (target) fireBullet(battle, battle.player, source.card, target);
   }
 
@@ -333,8 +344,8 @@ function attackTick(battle, dt) {
     summon.y += (ty - summon.y) * Math.min(1, dt * 3);
     summon.timer -= dt;
     if (summon.timer > 0) continue;
-    summon.timer += summon.card.cd;
-    const target = nearestEnemy(battle, summon, SUMMON_RANGE);
+    summon.timer += cooldown(summon.card.cd, battle.attrs);
+    const target = nearestEnemy(battle, summon, summonRange(battle));
     if (target) fireBullet(battle, summon, summon.card, target);
   }
 }
@@ -343,9 +354,9 @@ function selfTick(battle, dt) {
   for (const self of battle.selfs) {
     self.timer -= dt;
     if (self.timer > 0) continue;
-    self.timer += self.card.cd;
+    self.timer += cooldown(self.card.cd, battle.attrs);
     const targets = battle.enemies.filter(
-      (e) => e.cells > 0 && dist(battle.player, e) <= SELF_RADIUS + e.r,
+      (e) => e.cells > 0 && dist(battle.player, e) <= selfRadius(battle) + e.r,
     );
     for (const e of targets) hitEnemy(battle, e, self.card);
     if (targets.length > 0) {
@@ -412,8 +423,9 @@ function enemiesTick(battle, dt) {
     e.attackTimer -= dt;
     if (e.attackTimer > 0) continue;
     e.attackTimer += ENEMY_ATTACK_INTERVAL;
-    p.cells -= e.damage;
-    battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: e.damage });
+    const dmg = damageTaken(e.damage, battle.attrs);
+    p.cells -= dmg;
+    battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
     if (p.cells <= 0) {
       p.cells = 0;
       battle.state = 'dead';
@@ -495,6 +507,24 @@ function checkEnd(battle) {
   }
 }
 
+/** 花 1 点属性。体魄当场提高上限并补回等量生命。 */
+export function spendPoint(battle, id) {
+  const attr = ATTRIBUTES.find((a) => a.id === id);
+  if (attr === undefined) return false;
+  if (battle.points <= 0) return false;
+  if ((battle.attrs[id] ?? 0) >= attr.max) return false;
+  const before = playerCells(battle.attrs);
+  battle.attrs[id] += 1;
+  battle.points -= 1;
+  const after = playerCells(battle.attrs);
+  if (after !== before) {
+    battle.player.maxCells = after;
+    battle.player.cells = Math.min(after, battle.player.cells + (after - before));
+  }
+  battle.events.push({ type: 'spend', id });
+  return true;
+}
+
 /** 推进一帧，返回这一帧产生的事件。 */
 export function step(battle, dt) {
   if (battle.state !== 'fighting') return [];
@@ -508,6 +538,10 @@ export function step(battle, dt) {
   bulletsTick(battle, dt);
   enemiesTick(battle, dt);
   statusTick(battle, dt);
+  const regen = regenPerSecond(battle.attrs);
+  if (regen > 0 && battle.player.cells > 0 && battle.player.cells < battle.player.maxCells) {
+    battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + regen * dt);
+  }
   resolveDeaths(battle);
   checkEnd(battle);
   return battle.events;
