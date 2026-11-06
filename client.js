@@ -283,7 +283,88 @@ window.__ModuleLoader__.load({
         solves: Object.freeze(['bomb']),
         desc: '每 10 秒冻结全场 1.2 秒',
       }),
+      // ---- P0 位移家族 ----
+      gravity_well: Object.freeze({
+        id: 'gravity_well',
+        name: '引力井',
+        carrier: 'verb',
+        kind: 'pull',
+        cells: 0,
+        cd: 2,
+        burn: 0,
+        aoe: 0,
+        radius: 40,
+        strength: 10,
+        tags: Object.freeze(['verb', 'gravity']),
+        solves: Object.freeze(['summon']),
+        desc: '每 2 秒把 40 格内的敌人拉近 10px',
+      }),
+      shockwave: Object.freeze({
+        id: 'shockwave',
+        name: '冲击波',
+        carrier: 'verb',
+        kind: 'push',
+        cells: 1,
+        cd: 4,
+        burn: 0,
+        aoe: 0,
+        radius: 24,
+        strength: 18,
+        tags: Object.freeze(['verb', 'gravity']),
+        solves: Object.freeze(['bomb']),
+        desc: '每 4 秒推开 24 格内的敌人 18px，各 1 格',
+      }),
+      vortex: Object.freeze({
+        id: 'vortex',
+        name: '涡流',
+        carrier: 'verb',
+        kind: 'vortex',
+        cells: 0,
+        cd: 6,
+        burn: 0,
+        aoe: 0,
+        radius: 30,
+        duration: 1.5,
+        tags: Object.freeze(['verb', 'gravity']),
+        solves: Object.freeze(['summon']),
+        desc: '半径 30 内的敌人绕你旋转 1.5 秒',
+      }),
+      rule_pin: Object.freeze({
+        id: 'rule_pin',
+        name: '钉住',
+        carrier: 'rule',
+        effect: 'control',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'verb']),
+        solves: Object.freeze(['carapace']),
+        desc: '每 3 秒，下一发命中定身 1 秒',
+      }),
+      rule_wall_slam: Object.freeze({
+        id: 'rule_wall_slam',
+        name: '撞墙',
+        carrier: 'rule',
+        effect: 'phys',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'gravity']),
+        solves: Object.freeze(['carapace']),
+        desc: '被位移撞到墙的敌人受 2 格（每只每秒一次）',
+      }),
     });
+
+    /** P0 位移包：先只放这一族，便于单独验证。 */
+    const GRAVITY_PACK = Object.freeze([
+      'gravity_well',
+      'shockwave',
+      'vortex',
+      'rule_pin',
+      'rule_wall_slam',
+    ]);
 
     /** 灼烧包的抽卡池：已拥有铁弹 + 三件套时，从这 8 张里出三选一。 */
     const FIRE_PACK = Object.freeze([
@@ -441,6 +522,12 @@ window.__ModuleLoader__.load({
       split: 1.2,
       regen: 1.5,
       shield: 1.5,
+      anchor: 1.4,
+      cleanse: 1.2,
+      devour: 1.5,
+      phase: 1.3,
+      reflect: 1.2,
+      generator: 1.5,
     });
 
     function baseCells(floor) {
@@ -534,6 +621,7 @@ window.__ModuleLoader__.load({
     const COMBO_EVERY = 4;
     const EXECUTE_THRESHOLD = 2;
     const XP_PER_CELL = 3;
+    const VORTEX_SPEED = 120;
 
     const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
     const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -576,6 +664,10 @@ window.__ModuleLoader__.load({
         return card;
       }
       if (card.carrier === 'core') {
+        return card;
+      }
+      if (card.carrier === 'verb') {
+        battle.verbs.push({ card, timer: card.cd * 0.5 });
         return card;
       }
       if (card.carrier === 'self') {
@@ -663,6 +755,7 @@ window.__ModuleLoader__.load({
         cards: [],
         rules: [],
         selfs: [],
+        verbs: [],
         sources: [],
         summons: [],
         enemies: [],
@@ -688,6 +781,7 @@ window.__ModuleLoader__.load({
         offer: null,
         hitCount: 0,
         anchorTimer: 0,
+        pinCd: 0,
         spawned: 0,
         kills: 0,
         events: [],
@@ -754,11 +848,16 @@ window.__ModuleLoader__.load({
           primary: true,
           canSplit: lock === 'split',
           r: enemyRadius(cells),
-          speed: ENEMY_SPEED_BASE + battle.floor * ENEMY_SPEED_PER_FLOOR + battle.rng() * 4,
+          speed:
+            (ENEMY_SPEED_BASE + battle.floor * ENEMY_SPEED_PER_FLOOR + battle.rng() * 4) *
+            (locks.includes('anchor') ? 0.7 : 1),
           damage: enemyDamage(battle.floor),
           attackTimer: ENEMY_ATTACK_INTERVAL,
           status: createStatus(),
           freeze: 0,
+          root: 0,
+          vortex: 0,
+          wallCd: 0,
           flash: 0,
         });
         battle.spawned += 1;
@@ -812,6 +911,11 @@ window.__ModuleLoader__.load({
 
     function hitEnemy(battle, enemy, card) {
       rawHit(battle, enemy, attackCells(card, battle.attrs), card.burn ?? 0);
+
+      if (hasRule(battle, 'rule_pin') && battle.pinCd <= 0) {
+        enemy.root = Math.max(enemy.root, 1);
+        battle.pinCd = 3;
+      }
 
       if (hasRule(battle, 'rule_execute') && enemy.cells > 0 && enemy.cells <= EXECUTE_THRESHOLD) {
         enemy.cells = 0;
@@ -936,13 +1040,101 @@ window.__ModuleLoader__.load({
       battle.bullets = alive;
     }
 
+    function placeEnemy(enemy, nx, ny) {
+      const cx = clamp(nx, enemy.r, ARENA.w - enemy.r);
+      const cy = clamp(ny, enemy.r, ARENA.h - enemy.r);
+      const hitWall = cx !== nx || cy !== ny;
+      enemy.x = cx;
+      enemy.y = cy;
+      return hitWall;
+    }
+
+    /** 撞墙伤害不看甲壳：位移是"撞"，不是"打"。 */
+    function wallSlam(battle, enemy) {
+      if (!hasRule(battle, 'rule_wall_slam')) return;
+      if (enemy.wallCd > 0) return;
+      enemy.wallCd = 1;
+      enemy.cells -= 2;
+      battle.events.push({ type: 'wall', x: enemy.x, y: enemy.y });
+    }
+
+    function displacementTick(battle, dt) {
+      const p = battle.player;
+      for (const verb of battle.verbs) {
+        verb.timer -= dt;
+        if (verb.timer > 0) continue;
+        verb.timer += verb.card.cd;
+        const radius = verb.card.radius * visionScale(battle.attrs);
+
+        if (verb.card.kind === 'pull') {
+          for (const e of battle.enemies) {
+            if (e.cells <= 0 || e.locks.includes('anchor')) continue;
+            const d = dist(p, e) || 1;
+            if (d > radius) continue;
+            const hit = placeEnemy(
+              e,
+              e.x + ((p.x - e.x) / d) * verb.card.strength,
+              e.y + ((p.y - e.y) / d) * verb.card.strength,
+            );
+            if (hit) wallSlam(battle, e);
+          }
+          battle.events.push({ type: 'pull', x: p.x, y: p.y });
+          continue;
+        }
+
+        if (verb.card.kind === 'push') {
+          for (const e of battle.enemies) {
+            if (e.cells <= 0 || e.locks.includes('anchor')) continue;
+            const d = dist(p, e) || 1;
+            if (d > radius) continue;
+            rawHit(battle, e, verb.card.cells);
+            const hit = placeEnemy(
+              e,
+              e.x + ((e.x - p.x) / d) * verb.card.strength,
+              e.y + ((e.y - p.y) / d) * verb.card.strength,
+            );
+            if (hit) wallSlam(battle, e);
+          }
+          battle.events.push({ type: 'push', x: p.x, y: p.y });
+          continue;
+        }
+
+        if (verb.card.kind === 'vortex') {
+          for (const e of battle.enemies) {
+            if (e.cells <= 0 || e.locks.includes('anchor')) continue;
+            if (dist(p, e) > radius) continue;
+            e.vortex = Math.max(e.vortex, verb.card.duration);
+          }
+          battle.events.push({ type: 'vortex', x: p.x, y: p.y });
+        }
+      }
+    }
+
     function enemiesTick(battle, dt) {
       const p = battle.player;
       for (const e of battle.enemies) {
         if (e.cells <= 0) continue;
         e.flash = Math.max(0, e.flash - dt);
+        if (e.wallCd > 0) e.wallCd = Math.max(0, e.wallCd - dt);
         if (e.freeze > 0) {
           e.freeze = Math.max(0, e.freeze - dt);
+          continue;
+        }
+        if (e.root > 0) {
+          e.root = Math.max(0, e.root - dt);
+          continue;
+        }
+        if (e.vortex > 0) {
+          e.vortex = Math.max(0, e.vortex - dt);
+          const dx = e.x - p.x;
+          const dy = e.y - p.y;
+          const d = Math.hypot(dx, dy) || 1;
+          const hit = placeEnemy(
+            e,
+            e.x + (-dy / d) * VORTEX_SPEED * dt,
+            e.y + (dx / d) * VORTEX_SPEED * dt,
+          );
+          if (hit) wallSlam(battle, e);
           continue;
         }
         const dx = p.x - e.x;
@@ -1106,6 +1298,8 @@ window.__ModuleLoader__.load({
       spawnTick(battle);
       playerMove(battle, dt);
       attackTick(battle, dt);
+      displacementTick(battle, dt);
+      if (battle.pinCd > 0) battle.pinCd -= dt;
       selfTick(battle, dt);
       rulesTick(battle, dt);
       bulletsTick(battle, dt);

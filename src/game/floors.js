@@ -14,6 +14,12 @@ export const LOCK_CELLS = Object.freeze({
   split: 1.2,
   regen: 1.5,
   shield: 1.5,
+  anchor: 1.4,
+  cleanse: 1.2,
+  devour: 1.5,
+  phase: 1.3,
+  reflect: 1.2,
+  generator: 1.5,
 });
 
 export function baseCells(floor) {

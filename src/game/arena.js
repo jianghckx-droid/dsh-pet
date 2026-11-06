@@ -59,6 +59,7 @@ const ANCHOR_SECONDS = 10;
 const COMBO_EVERY = 4;
 const EXECUTE_THRESHOLD = 2;
 const XP_PER_CELL = 3;
+const VORTEX_SPEED = 120;
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -101,6 +102,10 @@ export function addCard(battle, id) {
     return card;
   }
   if (card.carrier === 'core') {
+    return card;
+  }
+  if (card.carrier === 'verb') {
+    battle.verbs.push({ card, timer: card.cd * 0.5 });
     return card;
   }
   if (card.carrier === 'self') {
@@ -188,6 +193,7 @@ export function createBattle({
     cards: [],
     rules: [],
     selfs: [],
+    verbs: [],
     sources: [],
     summons: [],
     enemies: [],
@@ -213,6 +219,7 @@ export function createBattle({
     offer: null,
     hitCount: 0,
     anchorTimer: 0,
+    pinCd: 0,
     spawned: 0,
     kills: 0,
     events: [],
@@ -279,11 +286,16 @@ function spawnTick(battle) {
       primary: true,
       canSplit: lock === 'split',
       r: enemyRadius(cells),
-      speed: ENEMY_SPEED_BASE + battle.floor * ENEMY_SPEED_PER_FLOOR + battle.rng() * 4,
+      speed:
+        (ENEMY_SPEED_BASE + battle.floor * ENEMY_SPEED_PER_FLOOR + battle.rng() * 4) *
+        (locks.includes('anchor') ? 0.7 : 1),
       damage: enemyDamage(battle.floor),
       attackTimer: ENEMY_ATTACK_INTERVAL,
       status: createStatus(),
       freeze: 0,
+      root: 0,
+      vortex: 0,
+      wallCd: 0,
       flash: 0,
     });
     battle.spawned += 1;
@@ -337,6 +349,11 @@ function rawHit(battle, enemy, cells, burn = 0) {
 
 function hitEnemy(battle, enemy, card) {
   rawHit(battle, enemy, attackCells(card, battle.attrs), card.burn ?? 0);
+
+  if (hasRule(battle, 'rule_pin') && battle.pinCd <= 0) {
+    enemy.root = Math.max(enemy.root, 1);
+    battle.pinCd = 3;
+  }
 
   if (hasRule(battle, 'rule_execute') && enemy.cells > 0 && enemy.cells <= EXECUTE_THRESHOLD) {
     enemy.cells = 0;
@@ -461,13 +478,101 @@ function bulletsTick(battle, dt) {
   battle.bullets = alive;
 }
 
+function placeEnemy(enemy, nx, ny) {
+  const cx = clamp(nx, enemy.r, ARENA.w - enemy.r);
+  const cy = clamp(ny, enemy.r, ARENA.h - enemy.r);
+  const hitWall = cx !== nx || cy !== ny;
+  enemy.x = cx;
+  enemy.y = cy;
+  return hitWall;
+}
+
+/** 撞墙伤害不看甲壳：位移是"撞"，不是"打"。 */
+function wallSlam(battle, enemy) {
+  if (!hasRule(battle, 'rule_wall_slam')) return;
+  if (enemy.wallCd > 0) return;
+  enemy.wallCd = 1;
+  enemy.cells -= 2;
+  battle.events.push({ type: 'wall', x: enemy.x, y: enemy.y });
+}
+
+function displacementTick(battle, dt) {
+  const p = battle.player;
+  for (const verb of battle.verbs) {
+    verb.timer -= dt;
+    if (verb.timer > 0) continue;
+    verb.timer += verb.card.cd;
+    const radius = verb.card.radius * visionScale(battle.attrs);
+
+    if (verb.card.kind === 'pull') {
+      for (const e of battle.enemies) {
+        if (e.cells <= 0 || e.locks.includes('anchor')) continue;
+        const d = dist(p, e) || 1;
+        if (d > radius) continue;
+        const hit = placeEnemy(
+          e,
+          e.x + ((p.x - e.x) / d) * verb.card.strength,
+          e.y + ((p.y - e.y) / d) * verb.card.strength,
+        );
+        if (hit) wallSlam(battle, e);
+      }
+      battle.events.push({ type: 'pull', x: p.x, y: p.y });
+      continue;
+    }
+
+    if (verb.card.kind === 'push') {
+      for (const e of battle.enemies) {
+        if (e.cells <= 0 || e.locks.includes('anchor')) continue;
+        const d = dist(p, e) || 1;
+        if (d > radius) continue;
+        rawHit(battle, e, verb.card.cells);
+        const hit = placeEnemy(
+          e,
+          e.x + ((e.x - p.x) / d) * verb.card.strength,
+          e.y + ((e.y - p.y) / d) * verb.card.strength,
+        );
+        if (hit) wallSlam(battle, e);
+      }
+      battle.events.push({ type: 'push', x: p.x, y: p.y });
+      continue;
+    }
+
+    if (verb.card.kind === 'vortex') {
+      for (const e of battle.enemies) {
+        if (e.cells <= 0 || e.locks.includes('anchor')) continue;
+        if (dist(p, e) > radius) continue;
+        e.vortex = Math.max(e.vortex, verb.card.duration);
+      }
+      battle.events.push({ type: 'vortex', x: p.x, y: p.y });
+    }
+  }
+}
+
 function enemiesTick(battle, dt) {
   const p = battle.player;
   for (const e of battle.enemies) {
     if (e.cells <= 0) continue;
     e.flash = Math.max(0, e.flash - dt);
+    if (e.wallCd > 0) e.wallCd = Math.max(0, e.wallCd - dt);
     if (e.freeze > 0) {
       e.freeze = Math.max(0, e.freeze - dt);
+      continue;
+    }
+    if (e.root > 0) {
+      e.root = Math.max(0, e.root - dt);
+      continue;
+    }
+    if (e.vortex > 0) {
+      e.vortex = Math.max(0, e.vortex - dt);
+      const dx = e.x - p.x;
+      const dy = e.y - p.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const hit = placeEnemy(
+        e,
+        e.x + (-dy / d) * VORTEX_SPEED * dt,
+        e.y + (dx / d) * VORTEX_SPEED * dt,
+      );
+      if (hit) wallSlam(battle, e);
       continue;
     }
     const dx = p.x - e.x;
@@ -631,6 +736,8 @@ export function step(battle, dt) {
   spawnTick(battle);
   playerMove(battle, dt);
   attackTick(battle, dt);
+  displacementTick(battle, dt);
+  if (battle.pinCd > 0) battle.pinCd -= dt;
   selfTick(battle, dt);
   rulesTick(battle, dt);
   bulletsTick(battle, dt);
