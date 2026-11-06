@@ -175,6 +175,18 @@ test('属性点跨层保留', () => {
   assert.equal(entry.points, points);
 });
 
+test('token 驱动：输出 token 换成额外敌人', () => {
+  const { createEntry, pushTokens } = loadModule().__debug;
+  const entry = createEntry('tok-key', 7);
+  assert.equal(entry.battle.extra, 0);
+  pushTokens(entry, 1200);
+  assert.equal(entry.battle.extra, 2);
+  assert.equal(entry.tokenQueue, 200);
+  pushTokens(entry, 300);
+  assert.equal(entry.battle.extra, 3);
+  assert.equal(entry.tokenQueue, 0);
+});
+
 test('纯数值在第 6 层会被挡住（客户端同一套规则）', () => {
   const { createEntry, startFloor, tick } = loadModule().__debug;
   const entry = createEntry('test', 7);

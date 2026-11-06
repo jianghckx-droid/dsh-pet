@@ -30,11 +30,12 @@ import {
   resolveHit,
   visionScale,
 } from './rules.js';
-import { enemyCells, enemyDamage, floorDef, spawnSeconds } from './floors.js';
+import { FLOOR_SECONDS, enemyCells, enemyDamage, floorDef } from './floors.js';
 
 export const ARENA = Object.freeze({ w: 160, h: 144 });
 export const TIME_LIMIT = 45;
 export const MAX_SLOTS = 3;
+export const MAX_EXTRA = 18;
 
 const PLAYER_SPEED = 52;
 const PLAYER_RADIUS = 3;
@@ -166,6 +167,7 @@ export function createBattle({
   xp = 0,
   xpNext = 6,
   pending = 0,
+  extra = 0,
 }) {
   const def = floorDef(floor);
   const normalized = normalizeAttrs(attrs);
@@ -198,6 +200,7 @@ export function createBattle({
     xp,
     xpNext,
     pending,
+    extra: Math.min(MAX_EXTRA, Math.max(0, extra)),
     offer: null,
     hitCount: 0,
     anchorTimer: 0,
@@ -226,8 +229,10 @@ function nearestEnemy(battle, from, range = Infinity) {
 }
 
 function spawnTick(battle) {
-  const interval = spawnSeconds(battle.def);
-  while (battle.spawned < battle.def.enemies && battle.time >= battle.spawned * interval) {
+  const total = battle.def.enemies + battle.extra;
+  // 额外敌人不延长层时长，而是压缩刷怪间隔，否则压力永远刷不完
+  const interval = FLOOR_SECONDS / total;
+  while (battle.spawned < total && battle.time >= battle.spawned * interval) {
     const index = battle.spawned;
     const lock = battle.def.locks.length ? battle.def.locks[index % battle.def.locks.length] : null;
     const locks = lock ? [lock] : [];
@@ -510,13 +515,23 @@ function checkEnd(battle) {
     battle.state = 'dead';
     return;
   }
-  if (battle.spawned >= battle.def.enemies && battle.enemies.length === 0) {
+  if (battle.spawned >= battle.def.enemies + battle.extra && battle.enemies.length === 0) {
     battle.state = 'cleared';
     return;
   }
   if (battle.time >= TIME_LIMIT) {
     battle.state = 'timeout';
   }
+}
+
+/** 追加压力：token 换来的额外敌人，只加数量不改组成。 */
+export function addPressure(battle, count) {
+  if (battle.state !== 'fighting') return 0;
+  const before = battle.extra;
+  const add = Math.max(0, Math.floor(count));
+  battle.extra = Math.min(MAX_EXTRA, battle.extra + add);
+  if (battle.extra > before) battle.events.push({ type: 'pressure', extra: battle.extra });
+  return battle.extra - before;
 }
 
 /** 花 1 点属性。体魄当场提高上限并补回等量生命。 */

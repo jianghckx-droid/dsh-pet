@@ -395,6 +395,7 @@ window.__ModuleLoader__.load({
     const ARENA = Object.freeze({ w: 160, h: 144 });
     const TIME_LIMIT = 45;
     const MAX_SLOTS = 3;
+    const MAX_EXTRA = 18;
 
     const PLAYER_SPEED = 52;
     const PLAYER_RADIUS = 3;
@@ -526,6 +527,7 @@ window.__ModuleLoader__.load({
       xp = 0,
       xpNext = 6,
       pending = 0,
+      extra = 0,
     }) {
       const def = floorDef(floor);
       const normalized = normalizeAttrs(attrs);
@@ -558,6 +560,7 @@ window.__ModuleLoader__.load({
         xp,
         xpNext,
         pending,
+        extra: Math.min(MAX_EXTRA, Math.max(0, extra)),
         offer: null,
         hitCount: 0,
         anchorTimer: 0,
@@ -586,8 +589,10 @@ window.__ModuleLoader__.load({
     }
 
     function spawnTick(battle) {
-      const interval = spawnSeconds(battle.def);
-      while (battle.spawned < battle.def.enemies && battle.time >= battle.spawned * interval) {
+      const total = battle.def.enemies + battle.extra;
+      // 额外敌人不延长层时长，而是压缩刷怪间隔，否则压力永远刷不完
+      const interval = FLOOR_SECONDS / total;
+      while (battle.spawned < total && battle.time >= battle.spawned * interval) {
         const index = battle.spawned;
         const lock = battle.def.locks.length ? battle.def.locks[index % battle.def.locks.length] : null;
         const locks = lock ? [lock] : [];
@@ -870,13 +875,23 @@ window.__ModuleLoader__.load({
         battle.state = 'dead';
         return;
       }
-      if (battle.spawned >= battle.def.enemies && battle.enemies.length === 0) {
+      if (battle.spawned >= battle.def.enemies + battle.extra && battle.enemies.length === 0) {
         battle.state = 'cleared';
         return;
       }
       if (battle.time >= TIME_LIMIT) {
         battle.state = 'timeout';
       }
+    }
+
+    /** 追加压力：token 换来的额外敌人，只加数量不改组成。 */
+    function addPressure(battle, count) {
+      if (battle.state !== 'fighting') return 0;
+      const before = battle.extra;
+      const add = Math.max(0, Math.floor(count));
+      battle.extra = Math.min(MAX_EXTRA, battle.extra + add);
+      if (battle.extra > before) battle.events.push({ type: 'pressure', extra: battle.extra });
+      return battle.extra - before;
     }
 
     /** 花 1 点属性。体魄当场提高上限并补回等量生命。 */
@@ -935,6 +950,7 @@ window.__ModuleLoader__.load({
     const CLEAR_PAUSE = 1.1
     const FAIL_PAUSE = 3.4
     const MAX_FLOOR = 8
+    const TOKENS_PER_ENEMY = 500
     const TYPE_ID = 'dsh-pet'
     const KIND = 'pet'
 
@@ -1045,6 +1061,24 @@ window.__ModuleLoader__.load({
 
     const ENTRIES = new Map()
 
+    function drainTokens(entry) {
+      const battle = entry.battle
+      if (battle === null || entry.phase !== 'fight') return
+      while (entry.tokenQueue >= TOKENS_PER_ENEMY) {
+        if (addPressure(battle, 1) === 0) {
+          entry.tokenQueue = 0
+          return
+        }
+        entry.tokenQueue -= TOKENS_PER_ENEMY
+      }
+    }
+
+    function pushTokens(entry, delta) {
+      if (!Number.isFinite(delta) || delta <= 0) return
+      entry.tokenQueue += delta
+      drainTokens(entry)
+    }
+
     function syncAccount(entry) {
       const battle = entry.battle
       if (battle === null) return
@@ -1077,6 +1111,7 @@ window.__ModuleLoader__.load({
         pool: build.pool,
         drafted: entry.drafted,
       })
+      drainTokens(entry)
     }
 
     function createEntry(key, seed) {
@@ -1093,6 +1128,8 @@ window.__ModuleLoader__.load({
         xp: 0,
         xpNext: 6,
         pending: 0,
+        tokenQueue: 0,
+        tokenSeen: new Map(),
         phase: 'fight',
         lastResult: null,
         resultTimer: 0,
@@ -1175,6 +1212,7 @@ window.__ModuleLoader__.load({
 
       const battle = entry.battle
       if (battle === null) return
+      drainTokens(entry)
       const events = step(battle, dt)
       for (const ev of events) {
         if (ev.type === 'pulse') entry.fx.push({ x: ev.x, y: ev.y, r: 6, life: 0.4 })
@@ -1417,11 +1455,20 @@ window.__ModuleLoader__.load({
             entry.online = true
             let running = false
             let consumed = 0
-            for (const row of Object.values(table)) {
+            for (const [sid, row] of Object.entries(table)) {
               if (row === null || typeof row !== 'object') continue
               if (row.workspaceKey !== nextKey) continue
               if (row.running === true) running = true
               if (typeof row.totalTokens === 'number') consumed += row.totalTokens
+              const out = typeof row.outputTokens === 'number' ? row.outputTokens : 0
+              const seen = entry.tokenSeen.get(sid)
+              if (seen === undefined) {
+                // 第一次见到这个会话只记基线，不把历史 token 一次性倒进战场
+                entry.tokenSeen.set(sid, out)
+              } else if (out > seen) {
+                entry.tokenSeen.set(sid, out)
+                pushTokens(entry, out - seen)
+              }
             }
             entry.running = running
             entry.consumed = consumed
@@ -1539,6 +1586,7 @@ window.__ModuleLoader__.load({
           h('span', null, '槽 ' + (battle === null ? 0 : battle.slots.length) + '/' + MAX_SLOTS),
           h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
           h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
+          h('span', null, '压力 +' + (battle === null ? 0 : battle.extra)),
           h('span', { className: 'dsh-pet-spacer' }),
           h('span', null, formatTokens(entry.consumed) + ' token'),
         ),
@@ -1602,7 +1650,7 @@ window.__ModuleLoader__.load({
         )
       },
       // 供 node --test 验证接入路径；运行时不使用。
-      __debug: { createEntry, tick, startFloor, draw, BUILDS, pickCard, awardXp, chooseCard, spend },
+      __debug: { createEntry, tick, startFloor, draw, BUILDS, pickCard, awardXp, chooseCard, spend, pushTokens },
     }
   },
 })
