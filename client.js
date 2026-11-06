@@ -514,7 +514,19 @@ window.__ModuleLoader__.load({
       return true;
     }
 
-    function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], drafted = [], points = 0 }) {
+    function createBattle({
+      floor,
+      build,
+      attrs = {},
+      seed = 1,
+      pool = [],
+      drafted = [],
+      points = 0,
+      level = 1,
+      xp = 0,
+      xpNext = 6,
+      pending = 0,
+    }) {
       const def = floorDef(floor);
       const normalized = normalizeAttrs(attrs);
       const maxCells = playerCells(normalized);
@@ -542,10 +554,10 @@ window.__ModuleLoader__.load({
           maxCells,
           speed: PLAYER_SPEED,
         },
-        level: 1,
-        xp: 0,
-        xpNext: 6,
-        pending: 0,
+        level,
+        xp,
+        xpNext,
+        pending,
         offer: null,
         hitCount: 0,
         anchorTimer: 0,
@@ -1038,6 +1050,10 @@ window.__ModuleLoader__.load({
       if (battle === null) return
       entry.points = battle.points
       entry.attrs = { ...battle.attrs }
+      entry.level = battle.level
+      entry.xp = battle.xp
+      entry.xpNext = battle.xpNext
+      entry.pending = battle.pending
       saveAccount(entry)
     }
 
@@ -1053,6 +1069,10 @@ window.__ModuleLoader__.load({
         build: [...build.cards, ...entry.drafted],
         attrs: entry.attrs,
         points: entry.points,
+        level: entry.level,
+        xp: entry.xp,
+        xpNext: entry.xpNext,
+        pending: entry.pending,
         seed: entry.seed++,
         pool: build.pool,
         drafted: entry.drafted,
@@ -1069,6 +1089,10 @@ window.__ModuleLoader__.load({
         buildId: 'fire',
         attrs: account.attrs,
         points: account.points,
+        level: 1,
+        xp: 0,
+        xpNext: 6,
+        pending: 0,
         phase: 'fight',
         lastResult: null,
         resultTimer: 0,
@@ -1089,6 +1113,11 @@ window.__ModuleLoader__.load({
 
     function resetRun(entry, floor) {
       entry.drafted = []
+      entry.level = 1
+      entry.xp = 0
+      entry.xpNext = 6
+      entry.pending = 0
+      entry.battle = null
       startFloor(entry, floor)
     }
 
@@ -1444,8 +1473,7 @@ window.__ModuleLoader__.load({
               const e = entryRef.current
               if (e === null) return
               e.buildId = e.buildId === 'fire' ? 'pure' : 'fire'
-              e.drafted = []
-              startFloor(e, 1)
+              resetRun(e, 1)
               bump()
             },
           }, build.label),

@@ -154,7 +154,19 @@ export function chooseCard(battle, id) {
   return true;
 }
 
-export function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], drafted = [], points = 0 }) {
+export function createBattle({
+  floor,
+  build,
+  attrs = {},
+  seed = 1,
+  pool = [],
+  drafted = [],
+  points = 0,
+  level = 1,
+  xp = 0,
+  xpNext = 6,
+  pending = 0,
+}) {
   const def = floorDef(floor);
   const normalized = normalizeAttrs(attrs);
   const maxCells = playerCells(normalized);
@@ -182,10 +194,10 @@ export function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], dr
       maxCells,
       speed: PLAYER_SPEED,
     },
-    level: 1,
-    xp: 0,
-    xpNext: 6,
-    pending: 0,
+    level,
+    xp,
+    xpNext,
+    pending,
     offer: null,
     hitCount: 0,
     anchorTimer: 0,
