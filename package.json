@@ -20,7 +20,10 @@
   ],
   "scripts": {
     "test": "node --test",
-    "sim": "node tools/balance-sim.mjs --sweep"
+    "build": "node tools/build-client.mjs",
+    "build:check": "node tools/build-client.mjs --check",
+    "sim": "node tools/balance-sim.mjs --sweep",
+    "arena": "node tools/arena-report.mjs"
   },
   "dsh": {
     "bundle": {

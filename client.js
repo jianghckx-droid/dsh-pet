@@ -4,24 +4,655 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
+    // <core>
+    // 由 tools/build-client.mjs 从 src/game/*.js 生成，不要手改这一段。
+    // ---- rules.js ----
+    // 战斗规则：唯一一份。
+    //
+    // 游戏端（client.js）与数值模拟器（tools/balance-sim.mjs）都必须从这里取规则，
+    // 否则"设计用的数字"和"跑起来的游戏"会各算各的。
+    //
+    // 三条硬规则，改动前先看 docs/design.md §5 与 docs/cards.md §1：
+    //   1. 结算顺序固定：基础格 → +锋锐 → 锁裁决 → 扣格
+    //   2. 锁永远最后裁决，所以属性无法覆盖锁
+    //   3. 锋锐只加主攻击，不加灼烧跳/雷跳/碎冰/尸爆/斩杀
+
+    const BURN = Object.freeze({
+      cap: 5, // 每个目标最多 5 层
+      tickSeconds: 1.5, // 每层每 1.5 秒造成 1 格
+      durationSeconds: 6, // 叠层后 6 秒内没有新层就熄灭
+      damagePerStack: 1,
+    });
+
+    const PLAYER = Object.freeze({
+      baseCells: 12,
+      cellsPerBody: 2, // 体魄：+2 格/点
+      pointsPerEdgeCell: 2, // 锋锐：每 2 点 +1 格
+    });
+
+    function playerCells(attrs = {}) {
+      return PLAYER.baseCells + (attrs.body ?? 0) * PLAYER.cellsPerBody;
+    }
+
+    function edgeCells(attrs = {}) {
+      return Math.floor((attrs.edge ?? 0) / PLAYER.pointsPerEdgeCell);
+    }
+
+    /** 主攻击的格数：卡面基础格 + 锋锐。衍生效果不要调这个函数。 */
+    function attackCells(card, attrs = {}) {
+      return (card.cells ?? 1) + edgeCells(attrs);
+    }
+
+    function locksOf(enemy) {
+      if (Array.isArray(enemy.locks)) return enemy.locks;
+      return enemy.lock ? [enemy.lock] : [];
+    }
+
+    /**
+     * 锁裁决。
+     * main=true 表示主攻击（吃护盾正面减伤），false 表示衍生伤害（灼烧跳等）。
+     */
+    function resolveHit(enemy, cells, { main = true } = {}) {
+      let dealt = cells;
+      for (const lock of locksOf(enemy)) {
+        if (lock === 'carapace') {
+          dealt = Math.min(dealt, 1); // 单次最多 1 格
+        } else if (lock === 'shield' && main) {
+          dealt = Math.max(0, dealt - 1); // 正面直接命中 -1 格
+        }
+      }
+      return Math.max(0, dealt);
+    }
+
+    function createStatus() {
+      return { burn: 0, burnLeft: 0, burnTick: BURN.tickSeconds };
+    }
+
+    function applyBurn(status, stacks) {
+      if (stacks <= 0) return;
+      status.burn = Math.min(BURN.cap, status.burn + stacks);
+      status.burnLeft = BURN.durationSeconds;
+    }
+
+    /**
+     * 推进状态，返回这一帧的灼烧伤害（0 表示没有跳）。
+     * 调用方负责再走一次 resolveHit(..., { main: false })。
+     */
+    function advanceStatus(status, dt) {
+      if (status.burn <= 0) return 0;
+      status.burnLeft -= dt;
+      if (status.burnLeft <= 0) {
+        status.burn = 0;
+        return 0;
+      }
+      status.burnTick -= dt;
+      if (status.burnTick > 0) return 0;
+      status.burnTick += BURN.tickSeconds;
+      return status.burn * BURN.damagePerStack;
+    }
+
+    /**
+     * 稳态 DPS：忽略预热与目标死亡，用来比较 build 的形状。
+     * 数值模拟器与单测共用，保证"设计稿里的 5 倍差距"能被复现。
+     */
+    function steadyDps(cards, attrs, enemy) {
+      let direct = 0;
+      let burnPerSecond = 0;
+      for (const card of cards) {
+        direct += resolveHit(enemy, attackCells(card, attrs), { main: true }) / card.cd;
+        burnPerSecond += (card.burn ?? 0) / card.cd;
+      }
+      // 层数只在"连续 6 秒没有新层"时整体熄灭，不会逐层衰减。
+      // 所以平衡态是"6 秒内能叠到几层"，再受 5 层上限约束。
+      const stacks = Math.min(BURN.cap, burnPerSecond * BURN.durationSeconds);
+      return direct + (stacks * BURN.damagePerStack) / BURN.tickSeconds;
+    }
+
+    // ---- cards.js ----
+    // 卡片数据（MVP 子集）。
+    //
+    // 只收录"行为已经实现"的卡。docs/cards.md 里的 24 张是完整设计，
+    // 但没实现的卡不进代码——否则会出现"有数据、没行为"的死卡，
+    // 玩家抽到它却什么都不会发生。
+    //
+    // MVP 需要 4 张：铁弹（起始）+ 灼烧三件套。
+    // 其余 20 张随行为一起加入。
+
+    const STARTER_ID = 'orb_phys';
+
+    const CARDS = Object.freeze({
+      orb_phys: Object.freeze({
+        id: 'orb_phys',
+        name: '铁弹',
+        carrier: 'orb',
+        effect: 'phys',
+        cells: 1,
+        cd: 0.7,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['phys', 'single']),
+        solves: Object.freeze(['shield']),
+        desc: '击退；对护盾 +1 格',
+      }),
+      orb_fire: Object.freeze({
+        id: 'orb_fire',
+        name: '火箭',
+        carrier: 'orb',
+        effect: 'fire',
+        cells: 1,
+        cd: 0.9,
+        burn: 1,
+        aoe: 0,
+        tags: Object.freeze(['fire', 'single', 'dot']),
+        solves: Object.freeze(['carapace', 'regen']),
+        desc: '灼烧 +1 层',
+      }),
+      field_fire: Object.freeze({
+        id: 'field_fire',
+        name: '火海',
+        carrier: 'field',
+        effect: 'fire',
+        cells: 1,
+        cd: 1.5,
+        burn: 1,
+        aoe: 3,
+        tags: Object.freeze(['fire', 'aoe', 'dot']),
+        solves: Object.freeze(['carapace', 'summon']),
+        desc: '半径内最多 3 个目标，各 1 格 + 灼烧 +1',
+      }),
+      summon_fire: Object.freeze({
+        id: 'summon_fire',
+        name: '火灵',
+        carrier: 'summon',
+        effect: 'fire',
+        cells: 1,
+        cd: 1.2,
+        burn: 1,
+        aoe: 0,
+        tags: Object.freeze(['fire', 'single', 'dot']),
+        solves: Object.freeze(['carapace', 'regen']),
+        desc: '射程 36，灼烧 +1；生命 4',
+      }),
+    });
+
+    /** 灼烧包的 MVP 池：三选一从这里抽。 */
+    const FIRE_POOL = Object.freeze(['orb_fire', 'field_fire', 'summon_fire']);
+
+    /** 完整的灼烧 build，供模拟器与单测使用。 */
+    const FIRE_BUILD = Object.freeze(['orb_phys', ...FIRE_POOL]);
+
+    function cardsById(ids) {
+      return ids.map((id) => {
+        const card = CARDS[id];
+        if (card === undefined) throw new Error(`unknown card: ${id}`);
+        return card;
+      });
+    }
+
+    // ---- floors.js ----
+    // 层数表（1–12 层，MVP 用 1–8）。
+    //
+    // 数值来自 docs/floors.md，改动前先跑 `node tools/balance-sim.mjs --sweep`
+    // 确认第 6 层那道墙还在。
+    //
+    // "双锁混编"的实现是：同一层的敌人轮换携带不同的单锁，而不是一只怪同时带两个锁。
+    // 同时带两个锁的怪留给以后（倍率相乘已经是按这个设计的）。
+
+    const FLOOR_SECONDS = 30;
+
+    /** 锁对格数的倍率。一只怪带多个锁时相乘。 */
+    const LOCK_CELLS = Object.freeze({
+      carapace: 2,
+      split: 1.2,
+      regen: 1.5,
+      shield: 1.5,
+    });
+
+    function baseCells(floor) {
+      return 3 + 1.2 * floor;
+    }
+
+    function lockMultiplier(locks = []) {
+      return locks.reduce((m, lock) => m * (LOCK_CELLS[lock] ?? 1), 1);
+    }
+
+    /** 先乘倍率再取整，否则 ×2 的锁会比设计值少 1 格（第 7 层就是例子）。 */
+    function enemyCells(floor, locks = []) {
+      return Math.round(baseCells(floor) * lockMultiplier(locks));
+    }
+
+    function enemyDamage(floor) {
+      return floor >= 8 ? 2 : 1;
+    }
+
+    function spawnSeconds(def) {
+      return FLOOR_SECONDS / def.enemies;
+    }
+
+    const FLOORS = Object.freeze([
+      Object.freeze({ floor: 1, enemies: 6, locks: Object.freeze([]) }),
+      Object.freeze({ floor: 2, enemies: 7, locks: Object.freeze([]) }),
+      Object.freeze({ floor: 3, enemies: 8, locks: Object.freeze([]) }),
+      Object.freeze({ floor: 4, enemies: 9, locks: Object.freeze([]) }),
+      Object.freeze({ floor: 5, enemies: 10, locks: Object.freeze([]) }),
+      Object.freeze({ floor: 6, enemies: 10, locks: Object.freeze(['carapace']) }),
+      Object.freeze({ floor: 7, enemies: 10, locks: Object.freeze(['carapace']) }),
+      Object.freeze({ floor: 8, enemies: 11, locks: Object.freeze(['carapace']) }),
+      Object.freeze({ floor: 9, enemies: 10, locks: Object.freeze(['split']) }),
+      Object.freeze({ floor: 10, enemies: 11, locks: Object.freeze(['split']) }),
+      Object.freeze({ floor: 11, enemies: 12, locks: Object.freeze(['carapace', 'split']) }),
+      Object.freeze({ floor: 12, enemies: 12, locks: Object.freeze(['carapace', 'split']) }),
+    ]);
+
+    /** MVP 只做到第 8 层（第 6 层是墙，第 8 层是切片上限）。 */
+    const MVP_FLOOR_COUNT = 8;
+
+    const MVP_FLOORS = Object.freeze(FLOORS.filter((f) => f.floor <= MVP_FLOOR_COUNT));
+
+    function floorDef(n) {
+      const def = FLOORS.find((f) => f.floor === n);
+      if (def === undefined) throw new Error(`floor not in table: ${n}`);
+      return def;
+    }
+
+    // ---- arena.js ----
+    // 战斗状态机（无渲染、无 DOM、可复现）。
+    //
+    // 这一层是游戏真正的核心：位置、走位、刷怪、命中、状态、层推进。
+    // client.js 以后只负责把 battle 画出来；测试直接跑这里。
+    //
+    // 设计约束：
+    //   - 纯函数式推进：step(battle, dt)，不读全局、不用 Math.random
+    //   - 同一 seed + 同一 dt 序列 → 同一结果
+    //   - 所有伤害都走 rules.js 的 resolveHit，锁不会在这里被绕过
+    //   - 召唤物在 MVP 里是"炮台"：会攻击，但不会被敌人选为目标
+    //
+    // 已知取舍：
+    //   - 没有寻路，敌人直线追玩家；160×144 的场地不需要
+    //   - 走位是"绕最近目标 + 回中心"的启发式，不是完整 AI（轮次 5 再做）
+
+    const ARENA = Object.freeze({ w: 160, h: 144 });
+
+    const PLAYER_SPEED = 52;
+    const PLAYER_RADIUS = 3;
+    const CONTACT_PAD = 1.5;
+    const ENEMY_ATTACK_INTERVAL = 1.6;
+    const ENEMY_SPEED_BASE = 24;
+    const ENEMY_SPEED_PER_FLOOR = 1.2;
+    const ORB_RANGE = 74;
+    const FIELD_RADIUS = 30;
+    const SUMMON_RANGE = 42;
+    const BULLET_SPEED = 180;
+    const BULLET_HIT_RADIUS = 3.5;
+    const KEEP_DISTANCE = 42;
+    const CENTER_PULL = 56;
+    const TIME_LIMIT = 45;
+
+    const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+    function mulberry32(seed) {
+      let a = seed >>> 0;
+      return () => {
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    function enemyRadius(cells) {
+      return 2.5 + Math.min(3.5, cells / 10);
+    }
+
+    function spawnPoint(rng) {
+      const edge = Math.floor(rng() * 4);
+      if (edge === 0) return { x: rng() * ARENA.w, y: -6 };
+      if (edge === 1) return { x: ARENA.w + 6, y: rng() * ARENA.h };
+      if (edge === 2) return { x: rng() * ARENA.w, y: ARENA.h + 6 };
+      return { x: -6, y: rng() * ARENA.h };
+    }
+
+    function createBattle({ floor, build, attrs = {}, seed = 1 }) {
+      const def = floorDef(floor);
+      const maxCells = playerCells(attrs);
+      return {
+        def,
+        floor,
+        attrs,
+        cards: cardsById(build),
+        rng: mulberry32(seed),
+        time: 0,
+        state: 'fighting',
+        player: {
+          x: ARENA.w / 2,
+          y: ARENA.h / 2,
+          cells: maxCells,
+          maxCells,
+          speed: PLAYER_SPEED,
+        },
+        enemies: [],
+        bullets: [],
+        summons: [],
+        sources: [],
+        spawned: 0,
+        kills: 0,
+        events: [],
+        nextId: 1,
+        seed,
+      };
+    }
+
+    function initSources(battle) {
+      for (const card of battle.cards) {
+        if (card.carrier === 'summon') {
+          battle.summons.push({
+            id: battle.nextId++,
+            card,
+            x: battle.player.x - 8,
+            y: battle.player.y - 8,
+            timer: card.cd * 0.5,
+          });
+        } else {
+          battle.sources.push({ card, timer: card.cd * 0.5 });
+        }
+      }
+    }
+
+    function nearestEnemy(battle, from, range = Infinity) {
+      let best = null;
+      let bestD = range;
+      for (const e of battle.enemies) {
+        if (e.cells <= 0) continue;
+        const d = dist(from, e);
+        if (d < bestD) {
+          best = e;
+          bestD = d;
+        }
+      }
+      return best;
+    }
+
+    function spawnTick(battle) {
+      const interval = spawnSeconds(battle.def);
+      while (battle.spawned < battle.def.enemies && battle.time >= battle.spawned * interval) {
+        const index = battle.spawned;
+        const lock = battle.def.locks.length ? battle.def.locks[index % battle.def.locks.length] : null;
+        const locks = lock ? [lock] : [];
+        const cells = enemyCells(battle.floor, locks);
+        const at = spawnPoint(battle.rng);
+        battle.enemies.push({
+          id: battle.nextId++,
+          x: at.x,
+          y: at.y,
+          cells,
+          maxCells: cells,
+          locks,
+          primary: true,
+          canSplit: lock === 'split',
+          r: enemyRadius(cells),
+          speed: ENEMY_SPEED_BASE + battle.floor * ENEMY_SPEED_PER_FLOOR + battle.rng() * 4,
+          damage: enemyDamage(battle.floor),
+          attackTimer: ENEMY_ATTACK_INTERVAL,
+          status: createStatus(),
+          flash: 0,
+        });
+        battle.spawned += 1;
+      }
+    }
+
+    function playerMove(battle, dt) {
+      const p = battle.player;
+      const nearest = nearestEnemy(battle, p);
+      let vx = 0;
+      let vy = 0;
+      if (nearest) {
+        const dx = p.x - nearest.x;
+        const dy = p.y - nearest.y;
+        const d = Math.hypot(dx, dy) || 1;
+        if (d < KEEP_DISTANCE - 8) {
+          vx += dx / d;
+          vy += dy / d;
+        } else if (d > KEEP_DISTANCE + 8) {
+          vx -= dx / d;
+          vy -= dy / d;
+        } else {
+          vx += -dy / d;
+          vy += dx / d;
+        }
+      }
+      const cx = ARENA.w / 2 - p.x;
+      const cy = ARENA.h / 2 - p.y;
+      const cd = Math.hypot(cx, cy) || 1;
+      if (cd > CENTER_PULL) {
+        vx += (cx / cd) * 0.7;
+        vy += (cy / cd) * 0.7;
+      }
+      const len = Math.hypot(vx, vy);
+      if (len < 0.001) return;
+      p.x = clamp(p.x + (vx / len) * p.speed * dt, 6, ARENA.w - 6);
+      p.y = clamp(p.y + (vy / len) * p.speed * dt, 6, ARENA.h - 6);
+    }
+
+    function fireBullet(battle, from, card, target) {
+      battle.bullets.push({
+        id: battle.nextId++,
+        x: from.x,
+        y: from.y,
+        targetId: target.id,
+        cells: attackCells(card, battle.attrs),
+        burn: card.burn ?? 0,
+        life: 1.2,
+      });
+      battle.events.push({ type: 'shot', x: from.x, y: from.y, card: card.id });
+    }
+
+    function pulse(battle, card) {
+      const targets = battle.enemies
+        .filter((e) => e.cells > 0 && dist(battle.player, e) <= FIELD_RADIUS + e.r)
+        .slice(0, card.aoe || 1);
+      for (const e of targets) {
+        hitEnemy(battle, e, card);
+      }
+      if (targets.length > 0) {
+        battle.events.push({ type: 'pulse', x: battle.player.x, y: battle.player.y, card: card.id });
+      }
+    }
+
+    function hitEnemy(battle, enemy, card) {
+      const dealt = resolveHit(enemy, attackCells(card, battle.attrs), { main: true });
+      enemy.cells -= dealt;
+      enemy.flash = 0.12;
+      if (card.burn) applyBurn(enemy.status, card.burn);
+      battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
+    }
+
+    function attackTick(battle, dt) {
+      for (const source of battle.sources) {
+        source.timer -= dt;
+        if (source.timer > 0) continue;
+        source.timer += source.card.cd;
+        if (source.card.carrier === 'field') {
+          pulse(battle, source.card);
+          continue;
+        }
+        const target = nearestEnemy(battle, battle.player, ORB_RANGE);
+        if (target) fireBullet(battle, battle.player, source.card, target);
+      }
+
+      for (const summon of battle.summons) {
+        // 炮台跟随，简化成围绕玩家的偏移
+        const tx = battle.player.x - 10;
+        const ty = battle.player.y - 10;
+        summon.x += (tx - summon.x) * Math.min(1, dt * 3);
+        summon.y += (ty - summon.y) * Math.min(1, dt * 3);
+        summon.timer -= dt;
+        if (summon.timer > 0) continue;
+        summon.timer += summon.card.cd;
+        const target = nearestEnemy(battle, summon, SUMMON_RANGE);
+        if (target) fireBullet(battle, summon, summon.card, target);
+      }
+    }
+
+    function bulletsTick(battle, dt) {
+      const alive = [];
+      for (const bullet of battle.bullets) {
+        const target = battle.enemies.find((e) => e.id === bullet.targetId && e.cells > 0);
+        if (!target) {
+          bullet.life -= dt;
+          if (bullet.life > 0) alive.push(bullet);
+          continue;
+        }
+        const dx = target.x - bullet.x;
+        const dy = target.y - bullet.y;
+        const d = Math.hypot(dx, dy) || 1;
+        const travel = BULLET_SPEED * dt;
+        if (d <= travel + BULLET_HIT_RADIUS) {
+          hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn });
+          continue;
+        }
+        bullet.x += (dx / d) * travel;
+        bullet.y += (dy / d) * travel;
+        alive.push(bullet);
+      }
+      battle.bullets = alive;
+    }
+
+    function enemiesTick(battle, dt) {
+      const p = battle.player;
+      for (const e of battle.enemies) {
+        if (e.cells <= 0) continue;
+        e.flash = Math.max(0, e.flash - dt);
+        const dx = p.x - e.x;
+        const dy = p.y - e.y;
+        const d = Math.hypot(dx, dy) || 1;
+        const reach = e.r + PLAYER_RADIUS + CONTACT_PAD;
+        if (d > reach) {
+          const step = Math.min(e.speed * dt, d - reach);
+          e.x += (dx / d) * step;
+          e.y += (dy / d) * step;
+          e.attackTimer = Math.min(e.attackTimer, ENEMY_ATTACK_INTERVAL);
+          continue;
+        }
+        e.attackTimer -= dt;
+        if (e.attackTimer > 0) continue;
+        e.attackTimer += ENEMY_ATTACK_INTERVAL;
+        p.cells -= e.damage;
+        battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: e.damage });
+        if (p.cells <= 0) {
+          p.cells = 0;
+          battle.state = 'dead';
+          return;
+        }
+      }
+    }
+
+    function statusTick(battle, dt) {
+      for (const e of battle.enemies) {
+        if (e.cells <= 0) continue;
+        const burn = advanceStatus(e.status, dt);
+        if (burn <= 0) continue;
+        const dealt = resolveHit(e, burn, { main: false });
+        e.cells -= dealt;
+        battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: dealt });
+      }
+    }
+
+    function resolveDeaths(battle) {
+      const alive = [];
+      for (const e of battle.enemies) {
+        if (e.cells > 0) {
+          alive.push(e);
+          continue;
+        }
+        battle.kills += 1;
+        battle.events.push({ type: 'kill', x: e.x, y: e.y, id: e.id });
+        if (e.canSplit && e.primary) {
+          const child = Math.max(1, Math.ceil(e.maxCells * 0.5));
+          for (let i = 0; i < 2; i += 1) {
+            alive.push({
+              ...e,
+              id: battle.nextId++,
+              cells: child,
+              maxCells: child,
+              primary: false,
+              canSplit: false,
+              locks: [],
+              r: enemyRadius(child),
+              status: createStatus(),
+              flash: 0,
+            });
+          }
+        }
+      }
+      battle.enemies = alive;
+    }
+
+    function checkEnd(battle) {
+      if (battle.state !== 'fighting') return;
+      if (battle.player.cells <= 0) {
+        battle.state = 'dead';
+        return;
+      }
+      if (battle.spawned >= battle.def.enemies && battle.enemies.length === 0) {
+        battle.state = 'cleared';
+        return;
+      }
+      if (battle.time >= TIME_LIMIT) {
+        battle.state = 'timeout';
+      }
+    }
+
+    /** 推进一帧，返回这一帧产生的事件。 */
+    function step(battle, dt) {
+      if (battle.state !== 'fighting') return [];
+      battle.events = [];
+      if (battle.sources.length === 0 && battle.summons.length === 0) initSources(battle);
+      battle.time += dt;
+      spawnTick(battle);
+      playerMove(battle, dt);
+      attackTick(battle, dt);
+      bulletsTick(battle, dt);
+      enemiesTick(battle, dt);
+      statusTick(battle, dt);
+      resolveDeaths(battle);
+      checkEnd(battle);
+      return battle.events;
+    }
+
+    /** 一直跑到结束，返回同一场战斗。dt 固定，保证可复现。 */
+    function runToEnd(battle, { dt = 1 / 60, maxSeconds = 120 } = {}) {
+      while (battle.state === 'fighting' && battle.time < maxSeconds) {
+        step(battle, dt);
+      }
+      return battle;
+    }
+// </core>
+
+    const W = ARENA.w
+    const H = ARENA.h
+    const STEP = 1 / 60
+    const POLL_MS = 800
+    const CLEAR_PAUSE = 1.1
+    const FAIL_PAUSE = 3.4
+    const MAX_FLOOR = 8
     const TYPE_ID = 'dsh-pet'
     const KIND = 'pet'
 
-    // The arena is rendered at a fixed low resolution and scaled up by CSS,
-    // which is what gives the panel its pixel-art look without image assets.
-    const W = 160
-    const H = 144
-    const STEP = 1 / 60
-    const LEGACY_KEY = 'dsh.pet.v1'
-    const KEY_PREFIX = 'dsh.pet.v2.'
-    const POLL_MS = 800
-    const MAX_ENEMIES = 60
-    const MAX_ELITES = 4
-    // Comfort threshold: past this many bodies the arena stops being dodgeable,
-    // so the token budget is spent on higher tiers instead of more bodies.
-    const COMFORT_ENEMIES = 22
-    const BASE_SPAWN_SECONDS = 5.5
-    const MAX_PENDING = 5
+    const BUILDS = {
+      fire: {
+        id: 'fire',
+        label: '灼烧',
+        cards: [...FIRE_BUILD],
+        attrs: { edge: 0, body: 10 },
+      },
+      pure: {
+        id: 'pure',
+        label: '纯数值',
+        cards: ['orb_phys'],
+        attrs: { edge: 10, body: 0 },
+      },
+    }
 
     const COLORS = {
       bg: '#0a0d12',
@@ -30,758 +661,123 @@ window.__ModuleLoader__.load({
       player: '#cfe3ef',
       playerDark: '#7fa3b8',
       eye: '#0a0d12',
-      enemy: '#c4534b',
-      enemyDark: '#7e312c',
-      elite: '#8f4bd6',
-      eliteDark: '#4d2379',
       bullet: '#ffd166',
-      spark: '#ffe9b0',
+      burn: '#ff9f45',
+      enemy: { rim: '#7e312c', body: '#c4534b' },
+      carapace: { rim: '#2f4a5c', body: '#6f97b0' },
+      split: { rim: '#4d2379', body: '#8f4bd6' },
+      summon: { rim: '#7a5410', body: '#e0a526' },
     }
 
     const CSS = [
-      '.dsh-pet{display:flex;flex-direction:column;gap:6px;padding:10px;height:100%;box-sizing:border-box;',
-      'font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#c8d4de;background:#0a0d12;overflow:hidden}',
-      '.dsh-pet-top{display:flex;align-items:center;gap:8px;font-size:11px}',
-      '.dsh-pet-lv{color:#ffd166;font-weight:700}',
-      '.dsh-pet-stat{color:#7f93a3}',
-      '.dsh-pet-dot{font-size:10px;color:#5c6c7a}',
-      '.dsh-pet-dot.on{color:#6ee7a8}',
-      '.dsh-pet-usage{margin-left:auto;font-size:10px;color:#6ee7a8;white-space:nowrap}',
-      '.dsh-pet-hot{color:#ffb74d}',
-      '.dsh-pet-tiers{display:flex;gap:8px;font-size:10px;color:#7f93a3;align-items:center}',
-      '.dsh-pet-tier{display:inline-flex;align-items:center;gap:3px}',
-      '.dsh-pet-tier i{width:7px;height:7px;border-radius:2px;display:inline-block}',
-      '.dsh-pet-tier.zero{opacity:.35}',
-      '.dsh-pet-xp{height:2px;background:#1a2430;border-radius:2px;overflow:hidden}',
-      '.dsh-pet-xp i{display:block;height:100%;background:#4ea3ff}',
-      '.dsh-pet-stage{position:relative;flex:1;min-height:120px;display:flex;align-items:center;justify-content:center}',
-      '.dsh-pet-canvas{width:100%;height:auto;max-height:100%;image-rendering:pixelated;border-radius:6px;display:block}',
-      '.dsh-pet-cards{position:absolute;left:6px;right:6px;bottom:6px;max-height:78%;overflow-y:auto;',
-      'display:flex;flex-direction:column;gap:4px;',
-      'background:rgba(8,12,18,.94);border:1px solid #24313f;border-radius:8px;padding:8px}',
-      '.dsh-pet-cards-list{display:flex;flex-direction:column;gap:4px}',
-      '.dsh-pet-cards-title{font-size:10px;color:#7f93a3;margin-bottom:2px}',
-      '.dsh-pet-card{display:flex;flex-direction:column;gap:2px;text-align:left;background:#111a24;color:#dbe7f0;',
-      'border:1px solid #263342;border-radius:6px;padding:6px 8px;cursor:pointer;font:inherit;font-size:11px}',
-      '.dsh-pet-card:hover{background:#16222e;border-color:#3a5470}',
-      '.dsh-pet-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:6px}',
-      '.dsh-pet-card-name{color:#ffd166;font-weight:700;white-space:nowrap}',
-      '.dsh-pet-card-delta{font-size:10px;color:#6ee7a8;white-space:nowrap}',
-      '.dsh-pet-card-desc{color:#8fa4b5}',
-      '.dsh-pet-stats{display:flex;gap:10px;font-size:10px;color:#7f93a3}',
-      '.dsh-pet-build{display:flex;flex-wrap:wrap;gap:4px}',
-      '.dsh-pet-chip{font-size:9px;color:#8fa4b5;background:#111a24;border:1px solid #1f2a36;border-radius:4px;padding:0 4px}',
-      '.dsh-pet-dead{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;',
-      'justify-content:center;gap:4px;background:rgba(8,12,18,.72);border-radius:6px}',
-      '.dsh-pet-dead-title{font-size:14px;color:#e35d5d;letter-spacing:.2em}',
-      '.dsh-pet-dead-sub{font-size:10px;color:#7f93a3}',
-      '.dsh-pet-hp{height:3px;background:#1a2430;border-radius:2px;overflow:hidden}',
-      '.dsh-pet-hp i{display:block;height:100%;background:#e35d5d}',
-      '.dsh-pet-bottom{display:flex;gap:8px;font-size:10px;color:#6c8091}',
-      '.dsh-pet-pending{margin-left:auto;color:#ffd166}',
+      '.dsh-pet{display:flex;flex-direction:column;gap:6px;padding:8px;color:#dbe7f0;font-size:11px;',
+      'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;height:100%;box-sizing:border-box}',
+      '.dsh-pet-top{display:flex;align-items:center;gap:6px}',
+      '.dsh-pet-floor{font-weight:700;color:#ffd166;letter-spacing:.04em}',
+      '.dsh-pet-muted{color:#7f93a3}',
+      '.dsh-pet-spacer{margin-left:auto}',
+      '.dsh-pet-btn{font:inherit;font-size:10px;color:#cfe3ef;background:#111a24;border:1px solid #24313d;',
+      'border-radius:4px;padding:2px 6px;cursor:pointer}',
+      '.dsh-pet-btn:hover{background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-dot{width:6px;height:6px;border-radius:50%;background:#41505f}',
+      '.dsh-pet-dot.on{background:#6ee7a8;box-shadow:0 0 6px #6ee7a8}',
+      '.dsh-pet-stage{position:relative;border-radius:4px;overflow:hidden;background:#0a0d12}',
+      '.dsh-pet-canvas{display:block;width:100%;height:auto;image-rendering:pixelated}',
+      '.dsh-pet-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;',
+      'justify-content:center;gap:4px;padding:8px;text-align:center;background:rgba(8,12,18,.72)}',
+      '.dsh-pet-overlay-title{font-size:15px;letter-spacing:.18em}',
+      '.dsh-pet-overlay-title.bad{color:#e35d5d}',
+      '.dsh-pet-overlay-title.good{color:#6ee7a8}',
+      '.dsh-pet-overlay-sub{font-size:10px;color:#9fb2c2;line-height:1.5}',
+      '.dsh-pet-cells{height:4px;background:#18212b;border-radius:2px;overflow:hidden}',
+      '.dsh-pet-cells i{display:block;height:100%;background:#6ee7a8;transition:width .12s linear}',
+      '.dsh-pet-bottom{display:flex;gap:8px;color:#6c8091;font-size:10px}',
     ].join('')
 
-    const UPGRADES = [
-      { id: 'rate', name: '连射', desc: '攻速 +25%', apply: (p) => { p.fireEvery *= 0.8 }, delta: (p) => '间隔 ' + p.fireEvery.toFixed(2) + ' → ' + (p.fireEvery * 0.8).toFixed(2) + 's' },
-      { id: 'dmg', name: '重弹', desc: '伤害 +30%', apply: (p) => { p.dmg *= 1.3 }, delta: (p) => '伤害 ' + Math.round(p.dmg) + ' → ' + Math.round(p.dmg * 1.3) },
-      { id: 'hp', name: '强健', desc: '生命上限 +25 并回复', apply: (p) => { p.maxHp += 25; p.hp = Math.min(p.maxHp, p.hp + 25) }, delta: (p) => '上限 ' + Math.round(p.maxHp) + ' → ' + Math.round(p.maxHp + 25) },
-      { id: 'speed', name: '疾行', desc: '移动速度 +12%', apply: (p) => { p.speed *= 1.12 }, delta: (p) => '移速 ' + Math.round(p.speed) + ' → ' + Math.round(p.speed * 1.12) },
-      { id: 'multi', name: '散射', desc: '每次多射 1 发', apply: (p) => { p.projectiles += 1 }, delta: (p) => '弹数 ' + p.projectiles + ' → ' + (p.projectiles + 1) },
-      { id: 'leech', name: '汲取', desc: '击杀回复 1 点生命', apply: (p) => { p.leech += 1 }, delta: (p) => '吸血 ' + p.leech + ' → ' + (p.leech + 1) },
-      { id: 'range', name: '远射', desc: '射击距离 +25%', apply: (p) => { p.range *= 1.25 }, delta: (p) => '射程 ' + Math.round(p.range) + ' → ' + Math.round(p.range * 1.25) },
-      { id: 'armor', name: '甲壳', desc: '受到伤害 -15%', apply: (p) => { p.armor = Math.min(0.6, p.armor + 0.15) }, delta: (p) => '减伤 ' + Math.round(p.armor * 100) + '% → ' + Math.round(Math.min(0.6, p.armor + 0.15) * 100) + '%' },
-    ]
-    const UPGRADE_BY_ID = new Map(UPGRADES.map((u) => [u.id, u]))
+    // ---- 进度 ----
 
-    const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v)
+    const ENTRIES = new Map()
 
-    // The canvas is rendered at twice the logical resolution, so half-pixel
-    // positions are real pixels. Quantizing to 0.5 halves the apparent jitter
-    // of rounding compared with the old 1x buffer.
-    const Q = (v) => Math.round(v * 2) / 2
-
-    const nextXpFor = (level) => Math.round(8 + level * 4)
-
-    function formatTokens(n) {
-      if (!Number.isFinite(n) || n <= 0) return '0'
-      if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
-      if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
-      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k'
-      return String(Math.round(n))
-    }
-
-    function readJSON(key) {
-      try {
-        const raw = window.localStorage.getItem(key)
-        if (raw === null) return null
-        const parsed = JSON.parse(raw)
-        return parsed !== null && typeof parsed === 'object' ? parsed : null
-      } catch {
-        return null
-      }
-    }
-
-    function readSave(key) {
-      const own = readJSON(KEY_PREFIX + key)
-      const legacy = own === null ? readJSON(LEGACY_KEY) : null
-      const base = own !== null ? own : legacy !== null ? legacy : {}
-      const num = (v, fallback) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback)
-      const upgrades = {}
-      const src = base.upgrades
-      if (src !== null && typeof src === 'object') {
-        for (const [id, count] of Object.entries(src)) {
-          if (typeof count === 'number' && count > 0) upgrades[id] = Math.floor(count)
-        }
-      }
-      const level = Math.max(1, Math.floor(num(base.level, 1)))
-      return {
-        genes: num(base.genes, 0),
-        runs: num(base.runs, 0),
-        totalTokens: num(base.totalTokens, 0),
-        consumed: num(base.consumed, 0),
-        seenUsed:
-          base.seenUsed !== null && typeof base.seenUsed === 'object' ? base.seenUsed : {},
-        bestLevel: num(base.bestLevel, level),
-        level,
-        xp: Math.max(0, num(base.xp, 0)),
-        xpNext: Math.max(1, num(base.xpNext, nextXpFor(level))),
-        upgrades,
-      }
-    }
-
-    function writeSave(game) {
-      if (game === null || game.key === null) return
-      try {
-        window.localStorage.setItem(
-          KEY_PREFIX + game.key,
-          JSON.stringify({
-            level: game.level,
-            xp: game.xp,
-            xpNext: game.xpNext,
-            upgrades: game.upgrades,
-            genes: game.genes,
-            runs: game.runs,
-            totalTokens: game.totalTokens,
-            consumed: game.consumed,
-            // Per-session utilization already counted, so reopening the panel
-            // after a while still adds what was spent meanwhile.
-            seenUsed: game.seenUsed,
-            bestLevel: Math.max(game.bestLevel, game.level),
-          }),
-        )
-      } catch {
-        // a full or blocked storage must not break the run
-      }
-    }
-
-    function makePlayer(genes) {
-      const bonus = Math.min(80, genes * 2)
-      return {
-        x: W / 2,
-        y: H / 2,
-        vx: 0,
-        vy: 0,
-        hp: 100 + bonus,
-        maxHp: 100 + bonus,
-        speed: 52,
-        dmg: 8,
-        fireEvery: 0.55,
-        fireTimer: 0,
-        // Roughly a third of the arena: the old 96 covered almost its whole
-        // half-diagonal (107), which made range look unlimited.
-        range: 46,
-        projectiles: 1,
-        pierce: 1,
-        leech: 0,
-        armor: 0,
-      }
-    }
-
-    // The build lives on the character, not on the run: every respawn rebuilds
-    // the same stats from the saved upgrade counts.
-    function applyBuild(game) {
-      for (const [id, count] of Object.entries(game.upgrades)) {
-        const upgrade = UPGRADE_BY_ID.get(id)
-        if (upgrade === undefined) continue
-        for (let i = 0; i < count; i++) upgrade.apply(game.player)
-      }
-    }
-
-    function createGame(key) {
-      const saved = readSave(key)
-      const game = {
-        key,
-        tokens: 0,
-        spawnDebt: 0,
-        gold: 0,
-        kills: 0,
-        level: saved.level,
-        xp: saved.xp,
-        xpNext: saved.xpNext,
-        runXp: 0,
-        genes: saved.genes,
-        runs: saved.runs,
-        totalTokens: saved.totalTokens,
-        // Whole-bill tokens (input + output) observed for this workspace.
-        consumed: saved.consumed,
-        seenUsed: saved.seenUsed,
-        bestLevel: saved.bestLevel,
-        upgrades: saved.upgrades,
-        pending: 0,
-        offer: [],
-        dead: false,
-        deadTimer: 0,
-        lastGeneGain: 0,
-        // work signals mirrored from the host
-        running: false,
-        online: true,
-        activeSessions: 1,
-        liveSessions: 1,
-        busyMs: 0,
-        toolCalls: 0,
-        // pressure model
-        pressure: 0.6,
-        idleTimer: 1.5,
-        eliteQueue: 0,
-        // steering state: the character keeps its velocity between frames, so
-        // direction changes bend the path instead of snapping it
-        orbit: Math.random() * Math.PI * 2,
-        orbitSign: 1,
-        // per-session counters already accounted for
-        seen: new Map(),
-        acc: 0,
-        player: makePlayer(saved.genes),
-        enemies: [],
-        bullets: [],
-        sparks: [],
-      }
-      applyBuild(game)
-      return game
-    }
-
-    function respawn(game) {
-      game.player = makePlayer(game.genes)
-      applyBuild(game)
-      game.enemies = []
-      game.bullets = []
-      game.sparks = []
-      game.dead = false
-      game.deadTimer = 0
-      game.runXp = 0
-      game.spawnDebt = 0
-      game.eliteQueue = 0
-      game.idleTimer = 1.5
-    }
-
-    // Which edges a wave can come from: one hostile session is a lone straggler,
-    // a second session means pincer pressure, and so on.
-    function pickEdge(game) {
-      const n = clamp(game.activeSessions, 1, 4)
-      if (n === 1) return Math.floor(Math.random() * 4)
-      const edges = n === 2 ? [1, 3] : n === 3 ? [1, 2, 3] : [0, 1, 2, 3]
-      return edges[Math.floor(Math.random() * edges.length)]
-    }
-
-    function spawnPoint(edge) {
-      if (edge === 0) return { x: Math.random() * W, y: -6 }
-      if (edge === 1) return { x: W + 6, y: Math.random() * H }
-      if (edge === 2) return { x: Math.random() * W, y: H + 6 }
-      return { x: -6, y: Math.random() * H }
-    }
-
-    function groundSpeed(game) {
-      return 13 + Math.min(16, game.level * 1.6) + Math.random() * 5
-    }
-
-    // Monster tiers. The tier is decided by how many tokens the player can spend
-    // at once, and the colour tells the player which tier they are facing:
-    // 1 橙 · 2 绿 · 3 紫 · 4 金.
-    const TIERS = [
-      { level: 1, cost: 50, hpMul: 1, r: 2.8, speedMul: 1, dmg: 9, xp: 1, gold: 0, size: 5 },
-      { level: 2, cost: 110, hpMul: 3, r: 3.5, speedMul: 0.95, dmg: 12, xp: 4, gold: 1, size: 7 },
-      { level: 3, cost: 220, hpMul: 6, r: 4.4, speedMul: 0.85, dmg: 18, xp: 10, gold: 3, size: 9 },
-      { level: 4, cost: 400, hpMul: 10, r: 5.4, speedMul: 0.75, dmg: 24, xp: 22, gold: 6, size: 11 },
-    ]
-
-    const TIER_STYLE = {
-      1: { rim: '#7e312c', body: '#c4534b', eye: '#ffd9d4' },
-      2: { rim: '#2c5f34', body: '#4fae5a', eye: '#d6ffd9' },
-      3: { rim: '#4d2379', body: '#8f4bd6', eye: '#ffd166' },
-      4: { rim: '#7a5410', body: '#e0a526', eye: '#3a2a06' },
-    }
-
-    function spawnMonster(game, tier) {
-      const at = spawnPoint(pickEdge(game))
-      const hp = Math.round((6 + game.level * 3) * tier.hpMul)
-      game.enemies.push({
-        x: at.x,
-        y: at.y,
-        hp,
-        maxHp: hp,
-        r: tier.r,
-        speed: groundSpeed(game) * tier.speedMul,
-        dmg: tier.dmg,
-        xp: tier.xp,
-        gold: tier.gold,
-        tier: tier.level,
-        cool: 0,
-        flash: 0,
+    function startFloor(entry, floor) {
+      const build = BUILDS[entry.buildId]
+      entry.floor = floor
+      entry.phase = 'fight'
+      entry.fx = []
+      entry.acc = 0
+      entry.battle = createBattle({
+        floor,
+        build: build.cards,
+        attrs: build.attrs,
+        seed: entry.seed++,
       })
     }
 
-    // Spend as much of the token debt as possible on the strongest tier the
-    // player can afford: one big purchase beats a screen full of bodies.
-    function pickTier(game) {
-      const minLevel = game.enemies.length >= COMFORT_ENEMIES ? 2 : 1
-      for (let i = TIERS.length - 1; i >= 0; i--) {
-        const tier = TIERS[i]
-        if (tier.level >= minLevel && game.spawnDebt >= tier.cost) return tier
+    function createEntry(key, seed) {
+      const entry = {
+        key,
+        battle: null,
+        floor: 1,
+        best: 1,
+        buildId: 'fire',
+        phase: 'fight',
+        lastResult: null,
+        resultTimer: 0,
+        fx: [],
+        acc: 0,
+        seed: seed === undefined ? (Date.now() % 100000) + 1 : seed,
+        running: false,
+        online: true,
+        consumed: 0,
+        raf: 0,
+        last: 0,
+        subs: 0,
       }
-      return null
+      startFloor(entry, 1)
+      return entry
     }
 
-    function highTierCount(game, level) {
-      let n = 0
-      for (const e of game.enemies) if (e.tier >= level) n += 1
-      return n
-    }
-
-    function spark(game, x, y) {
-      for (let i = 0; i < 3; i++) {
-        const a = Math.random() * Math.PI * 2
-        game.sparks.push({ x, y, vx: Math.cos(a) * 26, vy: Math.sin(a) * 26, life: 0.25 })
-      }
-    }
-
-    let CARD_SEQ = 0
-
-    function rollCards() {
-      const pool = UPGRADES.slice()
-      const picked = []
-      while (picked.length < 3 && pool.length > 0) {
-        const upgrade = pool.splice(Math.floor(Math.random() * pool.length), 1)[0]
-        // Each offered card is its own instance: the same upgrade can sit in the
-        // pool twice after two level-ups, so it needs a unique identity.
-        picked.push({
-          uid: ++CARD_SEQ,
-          id: upgrade.id,
-          name: upgrade.name,
-          desc: upgrade.desc,
-          apply: upgrade.apply,
-          delta: upgrade.delta,
-        })
-      }
-      return picked
-    }
-
-    function buildSize(game) {
-      let n = 0
-      for (const count of Object.values(game.upgrades)) n += count
-      return n
-    }
-
-    function buildEntries(game) {
-      const rows = []
-      for (const [id, count] of Object.entries(game.upgrades)) {
-        const upgrade = UPGRADE_BY_ID.get(id)
-        if (upgrade === undefined || count <= 0) continue
-        rows.push([upgrade.name, count])
-      }
-      rows.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-      return rows
-    }
-
-    function chooseCard(game, uid) {
-      const index = game.offer.findIndex((entry) => entry.uid === uid)
-      if (index < 0) return
-      const card = game.offer[index]
-      game.offer.splice(index, 1)
-      card.apply(game.player)
-      game.upgrades[card.id] = (game.upgrades[card.id] || 0) + 1
-      game.pending = Math.max(0, game.pending - 1)
-      // Outstanding picks are exhausted: whatever was left over is no longer
-      // choosable, so clear it instead of leaving dead buttons around.
-      if (game.pending <= 0) {
-        game.pending = 0
-        game.offer.length = 0
-      }
-      writeSave(game)
-    }
-
-    function movePlayer(game, dt) {
-      const p = game.player
-      let nearest = null
-      let nd = Infinity
-      for (const e of game.enemies) {
-        const d = Math.hypot(e.x - p.x, e.y - p.y)
-        if (d < nd) {
-          nd = d
-          nearest = e
-        }
-      }
-
-      // No mode switches at all: the orbit and the escape vector are both
-      // evaluated every frame and blended by threat distance. A threshold (even
-      // with hysteresis) still produces a back-and-forth cycle; a smooth blend
-      // only changes how strongly each pull applies.
-      game.orbit += dt * 0.5
-      const tx = W / 2 + Math.cos(game.orbit) * 32
-      const ty = H / 2 + Math.sin(game.orbit) * 26
-      const ddx = tx - p.x
-      const ddy = ty - p.y
-      const dd = Math.hypot(ddx, ddy)
-      let ovx = 0
-      let ovy = 0
-      if (dd > 0.001) {
-        // Braking distance: a full-speed seek overshoots the target every frame.
-        // The proportional speed makes the approach continuous, so no dead zone
-        // is needed to stop it — it slows down to a stop instead of oscillating.
-        const wanted = Math.min(p.speed, dd * 5)
-        ovx = (ddx / dd) * wanted
-        ovy = (ddy / dd) * wanted
-      }
-
-      let fvx = 0
-      let fvy = 0
-      let threat = 0
-      if (nearest !== null) {
-        // The kite distance follows the current range, so a long-range build
-        // backs off earlier instead of standing still inside its own reach.
-        const keepAway = clamp(p.range * 0.55, 20, 58)
-        threat = clamp((keepAway * 1.35 - nd) / (keepAway * 0.75), 0, 1)
-        if (threat > 0) {
-          const inv = nd > 0.001 ? 1 / nd : 0
-          const ax = (p.x - nearest.x) * inv
-          const ay = (p.y - nearest.y) * inv
-          // Away plus a sideways component: circle the threat instead of
-          // running straight into a wall and stalling there.
-          let dx = ax * 0.9 - ay * game.orbitSign * 0.55
-          let dy = ay * 0.9 + ax * game.orbitSign * 0.55
-          const len = Math.hypot(dx, dy)
-          if (len > 0.001) {
-            dx /= len
-            dy /= len
-          }
-          fvx = dx * p.speed
-          fvy = dy * p.speed
-        }
-      }
-
-      let tvx = ovx * (1 - threat) + fvx * threat
-      let tvy = ovy * (1 - threat) + fvy * threat
-
-      // Soft wall avoidance: steer away from an edge before the position clamp
-      // has to. Clamping alone makes the body press into the border and flip
-      // between two directions every frame, which is the last source of
-      // side-to-side vibration.
-      const inset = 18
-      const leftGap = p.x - 5
-      const rightGap = W - 5 - p.x
-      const topGap = p.y - 5
-      const bottomGap = H - 5 - p.y
-      if (leftGap < inset) tvx += p.speed * (1 - leftGap / inset) * 1.6
-      if (rightGap < inset) tvx -= p.speed * (1 - rightGap / inset) * 1.6
-      if (topGap < inset) tvy += p.speed * (1 - topGap / inset) * 1.6
-      if (bottomGap < inset) tvy -= p.speed * (1 - bottomGap / inset) * 1.6
-
-      const wantedMag = Math.hypot(tvx, tvy)
-      const cap = p.speed * 1.15
-      if (wantedMag > cap) {
-        tvx = (tvx / wantedMag) * cap
-        tvy = (tvy / wantedMag) * cap
-      }
-
-      // Velocity smoothing: the desired velocity is approached instead of
-      // assigned, so a mode change bends the path rather than snapping it.
-      const k = 1 - Math.exp(-dt * 9)
-      p.vx += (tvx - p.vx) * k
-      p.vy += (tvy - p.vy) * k
-
-      // Exponential approach never reaches exactly zero. Snap it, otherwise
-      // the sprite keeps flipping across a half-pixel rounding boundary.
-      if (Math.hypot(p.vx, p.vy) < 1.5) {
-        p.vx = 0
-        p.vy = 0
-      }
-
-      let nx = p.x + p.vx * dt
-      let ny = p.y + p.vy * dt
-      if (nx < 5 || nx > W - 5) {
-        nx = clamp(nx, 5, W - 5)
-        p.vx = 0
-      }
-      if (ny < 5 || ny > H - 5) {
-        ny = clamp(ny, 5, H - 5)
-        p.vy = 0
-      }
-      p.x = nx
-      p.y = ny
-    }
-
-    function fire(game) {
-      const p = game.player
-      let target = null
-      let nd = p.range
-      for (const e of game.enemies) {
-        const d = Math.hypot(e.x - p.x, e.y - p.y)
-        if (d < nd) {
-          nd = d
-          target = e
-        }
-      }
-      if (target === null) return
-      const base = Math.atan2(target.y - p.y, target.x - p.x)
-      for (let i = 0; i < p.projectiles; i++) {
-        const a = base + (i - (p.projectiles - 1) / 2) * 0.18
-        game.bullets.push({
-          x: p.x,
-          y: p.y,
-          vx: Math.cos(a) * 130,
-          vy: Math.sin(a) * 130,
-          dmg: p.dmg,
-          // The bullet must be able to reach the edge of the range it was fired
-          // over, otherwise every range upgrade past ~140px does nothing.
-          life: p.range / 130 + 0.05,
-          pierce: p.pierce,
-        })
-      }
-    }
-
-    function updatePressure(game) {
-      const active = clamp(game.activeSessions, 1, 4)
-      const base = game.running ? 1 + (active - 1) * 0.5 : 0.6
-      const busy = game.busyMs > 10000 ? 1.4 : 1
-      game.pressure = base * busy
-    }
-
-    function tick(game, dt) {
-      if (game.dead) {
-        game.deadTimer -= dt
-        if (game.deadTimer <= 0) respawn(game)
+    function advance(entry) {
+      const cleared = entry.lastResult !== null && entry.lastResult.kind === 'cleared'
+      if (!cleared) {
+        startFloor(entry, 1)
         return
       }
-      const p = game.player
-      updatePressure(game)
-
-      // Baseline wanderers: the arena is never fully empty, even when no
-      // tokens are being spent.
-      game.idleTimer -= dt
-      if (game.idleTimer <= 0) {
-        if (game.enemies.length < MAX_ENEMIES) spawnMonster(game, TIERS[0])
-        game.idleTimer = BASE_SPAWN_SECONDS / Math.max(0.2, game.pressure)
-      }
-
-      // Token-driven tiers: the debt is spent on the strongest tier it can
-      // afford, so a big turn produces a few high-tier bodies, not a wall.
-      let guard = 0
-      while (guard < 64) {
-        const tier = pickTier(game)
-        if (tier === null) break
-        game.spawnDebt -= tier.cost
-        guard += 1
-        if (game.enemies.length >= MAX_ENEMIES) {
-          game.gold += 1
-          continue
-        }
-        spawnMonster(game, tier)
-      }
-
-      // One tool dispatch = one tier-3 monster.
-      while (game.eliteQueue > 0) {
-        game.eliteQueue -= 1
-        if (game.enemies.length >= MAX_ENEMIES) break
-        if (highTierCount(game, 3) >= MAX_ELITES) spawnMonster(game, TIERS[0])
-        else spawnMonster(game, TIERS[2])
-      }
-
-      game.prevX = p.x
-      game.prevY = p.y
-      movePlayer(game, dt)
-
-      p.fireTimer -= dt
-      if (p.fireTimer <= 0) {
-        fire(game)
-        p.fireTimer = p.fireEvery
-      }
-
-      for (let i = game.enemies.length - 1; i >= 0; i--) {
-        const e = game.enemies[i]
-        const dx = p.x - e.x
-        const dy = p.y - e.y
-        const d = Math.hypot(dx, dy) || 1
-        if (d > e.r + 2) {
-          e.x += (dx / d) * e.speed * dt
-          e.y += (dy / d) * e.speed * dt
-        }
-        if (e.flash > 0) e.flash -= dt
-        if (e.cool > 0) e.cool -= dt
-        if (d < e.r + 3 && e.cool <= 0) {
-          e.cool = 0.8
-          p.hp -= e.dmg * (1 - p.armor)
-        }
-      }
-
-      for (let i = game.bullets.length - 1; i >= 0; i--) {
-        const b = game.bullets[i]
-        b.x += b.vx * dt
-        b.y += b.vy * dt
-        b.life -= dt
-        if (b.life <= 0 || b.x < -4 || b.x > W + 4 || b.y < -4 || b.y > H + 4) {
-          game.bullets.splice(i, 1)
-          continue
-        }
-        for (let j = game.enemies.length - 1; j >= 0; j--) {
-          const e = game.enemies[j]
-          if (Math.hypot(e.x - b.x, e.y - b.y) < e.r + 2) {
-            e.hp -= b.dmg
-            e.flash = 0.08
-            b.pierce -= 1
-            if (e.hp <= 0) {
-              game.enemies.splice(j, 1)
-              game.kills += 1
-              game.xp += e.xp
-              game.runXp += e.xp
-              if (e.gold) game.gold += e.gold
-              if (p.leech > 0) p.hp = Math.min(p.maxHp, p.hp + p.leech)
-              spark(game, e.x, e.y)
-            }
-            if (b.pierce <= 0) {
-              game.bullets.splice(i, 1)
-              break
-            }
-          }
-        }
-      }
-
-      for (let i = game.sparks.length - 1; i >= 0; i--) {
-        const s = game.sparks[i]
-        s.x += s.vx * dt
-        s.y += s.vy * dt
-        s.life -= dt
-        if (s.life <= 0) game.sparks.splice(i, 1)
-      }
-
-      if (game.xp >= game.xpNext) {
-        game.xp -= game.xpNext
-        game.level += 1
-        game.xpNext = nextXpFor(game.level)
-        if (game.pending < MAX_PENDING) {
-          game.pending += 1
-          // Roll at level-up time and keep every roll: options the player has
-          // already been shown are never replaced by a fresh roll.
-          for (const card of rollCards()) game.offer.push(card)
-        } else {
-          game.gold += 2
-        }
-      }
-
-      if (p.hp <= 0) {
-        p.hp = 0
-        game.dead = true
-        game.deadTimer = 2.6
-        game.runs += 1
-        const gain = Math.floor(game.runXp * 0.3)
-        game.genes += gain
-        game.lastGeneGain = gain
-        game.bestLevel = Math.max(game.bestLevel, game.level)
-        // Level and build stay on the character; only the run ends.
-        writeSave(game)
-      }
+      const next = entry.floor + 1
+      startFloor(entry, next > MAX_FLOOR ? 1 : next)
     }
 
-    function drawPlayer(c, px, py, moving) {
-      const x = Q(px) - 3
-      const y = Q(py) - 3
-      c.fillStyle = COLORS.playerDark
-      c.fillRect(x, y + 5, 6, 1)
-      c.fillStyle = COLORS.player
-      c.fillRect(x, y, 6, 5)
-      c.fillStyle = COLORS.eye
-      c.fillRect(x + 1, y + 2, 1, 1)
-      c.fillRect(x + 4, y + 2, 1, 1)
-      if (moving) {
-        c.fillStyle = COLORS.playerDark
-        c.fillRect(x, y + 6, 1, 1)
-        c.fillRect(x + 5, y + 6, 1, 1)
+    function tick(entry, dt) {
+      for (const f of entry.fx) {
+        f.life -= dt
+        f.r += dt * 46
+      }
+      if (entry.fx.length > 0) entry.fx = entry.fx.filter((f) => f.life > 0)
+
+      if (entry.phase === 'result') {
+        entry.resultTimer -= dt
+        if (entry.resultTimer <= 0) advance(entry)
+        return
+      }
+
+      const battle = entry.battle
+      if (battle === null) return
+      const events = step(battle, dt)
+      for (const ev of events) {
+        if (ev.type === 'pulse') entry.fx.push({ x: ev.x, y: ev.y, r: 6, life: 0.4 })
+        else if (ev.type === 'kill') entry.fx.push({ x: ev.x, y: ev.y, r: 2, life: 0.28 })
+      }
+      if (battle.state !== 'fighting') {
+        entry.lastResult = {
+          kind: battle.state,
+          floor: entry.floor,
+          kills: battle.kills,
+          cells: battle.player.cells,
+        }
+        entry.phase = 'result'
+        entry.resultTimer = battle.state === 'cleared' ? CLEAR_PAUSE : FAIL_PAUSE
+        if (battle.state === 'cleared') entry.best = Math.max(entry.best, entry.floor)
       }
     }
-
-    function drawEnemy(c, e) {
-      const lit = e.flash > 0
-      const tier = TIERS[e.tier - 1] || TIERS[0]
-      const style = TIER_STYLE[tier.level]
-      const size = tier.size
-      const half = Math.floor(size / 2)
-      const x = Q(e.x) - half
-      const y = Q(e.y) - half
-      c.fillStyle = lit ? '#ffffff' : style.rim
-      c.fillRect(x, y, size, size)
-      c.fillStyle = lit ? '#ffffff' : style.body
-      c.fillRect(x + 1, y + 1, size - 2, size - 2)
-      if (!lit) {
-        const inset = Math.floor(size / 4)
-        c.fillStyle = style.eye
-        c.fillRect(x + inset, y + inset, 1, 1)
-        c.fillRect(x + size - 1 - inset, y + inset, 1, 1)
-      }
-      if (tier.level > 1 && e.hp < e.maxHp) {
-        c.fillStyle = '#12161c'
-        c.fillRect(x - 1, y - 3, size + 2, 1)
-        c.fillStyle = style.body
-        c.fillRect(x - 1, y - 3, Math.max(1, Math.round((e.hp / e.maxHp) * (size + 2))), 1)
-      }
-    }
-
-    function drawRangeRing(c, p) {
-      const r = p.range
-      if (r < 8) return
-      c.fillStyle = '#1d3a52'
-      const steps = Math.max(24, Math.round(r * 1.4))
-      for (let i = 0; i < steps; i++) {
-        const a = (i / steps) * Math.PI * 2
-        c.fillRect(Q(p.x + Math.cos(a) * r), Q(p.y + Math.sin(a) * r), 1, 1)
-      }
-    }
-
-    function draw(c, game, time) {
-      // The buffer is 2x the logical arena, so every logical unit is two
-      // device pixels and half-pixel positions stay crisp.
-      c.setTransform(2, 0, 0, 2, 0, 0)
-      c.imageSmoothingEnabled = false
-      c.fillStyle = COLORS.bg
-      c.fillRect(0, 0, W, H)
-      c.fillStyle = COLORS.grid
-      for (let x = 8; x < W; x += 8) {
-        for (let y = 8; y < H; y += 8) c.fillRect(x, y, 1, 1)
-      }
-      c.fillStyle = COLORS.frame
-      c.fillRect(0, 0, W, 1)
-      c.fillRect(0, H - 1, W, 1)
-      c.fillRect(0, 0, 1, H)
-      c.fillRect(W - 1, 0, 1, H)
-      // Draw the firing reach so "range" is a visible boundary, not a number.
-      drawRangeRing(c, game.player)
-      for (const e of game.enemies) drawEnemy(c, e)
-      c.fillStyle = COLORS.bullet
-      for (const b of game.bullets) c.fillRect(Q(b.x), Q(b.y), 1, 2)
-
-      // Render between the last two simulation steps: fixed-step updates land
-      // unevenly on a display frame, and without this the whole scene stutters.
-      const p = game.player
-      const alpha = clamp(game.acc / STEP, 0, 1)
-      const px = game.prevX === undefined ? p.x : game.prevX + (p.x - game.prevX) * alpha
-      const py = game.prevY === undefined ? p.y : game.prevY + (p.y - game.prevY) * alpha
-      drawPlayer(c, px, py, Math.hypot(p.vx, p.vy) > 8)
-
-      c.fillStyle = COLORS.spark
-      for (const s of game.sparks) {
-        if (s.life > 0) c.fillRect(Q(s.x), Q(s.y), 1, 1)
-      }
-    }
-
-    // One character per workspace: every panel showing that workspace shares
-    // the same simulation, and only mounted panels keep it ticking.
-    const ENTRIES = new Map()
 
     function startTicker(entry) {
       if (entry.raf !== 0) return
@@ -790,14 +786,14 @@ window.__ModuleLoader__.load({
         entry.raf = window.requestAnimationFrame(loop)
         const dt = Math.min(0.1, (now - entry.last) / 1000)
         entry.last = now
-        entry.game.acc += dt
+        entry.acc += dt
         let guard = 0
-        while (entry.game.acc >= STEP && guard < 6) {
-          tick(entry.game, STEP)
-          entry.game.acc -= STEP
+        while (entry.acc >= STEP && guard < 8) {
+          tick(entry, STEP)
+          entry.acc -= STEP
           guard += 1
         }
-        if (guard >= 6) entry.game.acc = 0
+        if (guard >= 8) entry.acc = 0
       }
       entry.raf = window.requestAnimationFrame(loop)
     }
@@ -805,7 +801,7 @@ window.__ModuleLoader__.load({
     function acquireEntry(key) {
       let entry = ENTRIES.get(key)
       if (entry === undefined) {
-        entry = { game: createGame(key), subs: 0, raf: 0, last: 0 }
+        entry = createEntry(key)
         ENTRIES.set(key, entry)
       }
       entry.subs += 1
@@ -820,41 +816,165 @@ window.__ModuleLoader__.load({
       if (entry.subs === 0 && entry.raf !== 0) {
         window.cancelAnimationFrame(entry.raf)
         entry.raf = 0
-        writeSave(entry.game)
       }
     }
 
+    // ---- 绘制 ----
+
+    function drawEnemy(c, e) {
+      const size = Math.round(4 + Math.min(6, e.cells / 4))
+      const half = Math.floor(size / 2)
+      const x = Math.round(e.x) - half
+      const y = Math.round(e.y) - half
+      const style = e.locks.includes('carapace')
+        ? COLORS.carapace
+        : e.locks.includes('split')
+          ? COLORS.split
+          : COLORS.enemy
+      const lit = e.flash > 0
+      c.fillStyle = lit ? '#ffffff' : style.rim
+      c.fillRect(x, y, size, size)
+      c.fillStyle = lit ? '#ffffff' : style.body
+      c.fillRect(x + 1, y + 1, Math.max(1, size - 2), Math.max(1, size - 2))
+
+      // 格数条
+      const barW = Math.max(3, size)
+      c.fillStyle = '#101820'
+      c.fillRect(x, y - 4, barW, 1)
+      c.fillStyle = style.body
+      const filled = Math.max(1, Math.round((e.cells / e.maxCells) * barW))
+      c.fillRect(x, y - 4, Math.min(barW, filled), 1)
+
+      // 锁标记
+      if (e.locks.includes('carapace')) {
+        c.fillStyle = '#8fd8ff'
+        c.fillRect(x - 2, y - 2, 1, 2)
+      }
+      // 灼烧标记
+      if (e.status.burn > 0) {
+        c.fillStyle = COLORS.burn
+        c.fillRect(x + size + 1, y, 1, 1)
+        if (e.status.burn >= 3) c.fillRect(x + size + 1, y + 2, 1, 1)
+      }
+    }
+
+    function drawSummon(c, s) {
+      const x = Math.round(s.x) - 2
+      const y = Math.round(s.y) - 2
+      c.fillStyle = COLORS.summon.rim
+      c.fillRect(x, y, 4, 4)
+      c.fillStyle = COLORS.summon.body
+      c.fillRect(x + 1, y + 1, 2, 2)
+    }
+
+    function drawPlayer(c, p) {
+      const x = Math.round(p.x) - 3
+      const y = Math.round(p.y) - 3
+      c.fillStyle = COLORS.playerDark
+      c.fillRect(x, y + 5, 6, 1)
+      c.fillStyle = COLORS.player
+      c.fillRect(x, y, 6, 5)
+      c.fillStyle = COLORS.eye
+      c.fillRect(x + 1, y + 2, 1, 1)
+      c.fillRect(x + 4, y + 2, 1, 1)
+    }
+
+    function draw(c, entry) {
+      c.setTransform(2, 0, 0, 2, 0, 0)
+      c.imageSmoothingEnabled = false
+      c.fillStyle = COLORS.bg
+      c.fillRect(0, 0, W, H)
+      c.fillStyle = COLORS.grid
+      for (let x = 8; x < W; x += 8) for (let y = 8; y < H; y += 8) c.fillRect(x, y, 1, 1)
+      c.fillStyle = COLORS.frame
+      c.fillRect(0, 0, W, 1)
+      c.fillRect(0, H - 1, W, 1)
+      c.fillRect(0, 0, 1, H)
+      c.fillRect(W - 1, 0, 1, H)
+
+      const battle = entry.battle
+      if (battle === null) return
+
+      for (const f of entry.fx) {
+        const alpha = Math.max(0, f.life * 2.4)
+        c.fillStyle = 'rgba(255,209,102,' + alpha.toFixed(2) + ')'
+        for (let i = 0; i < 10; i += 1) {
+          const a = (i / 10) * Math.PI * 2
+          c.fillRect(Math.round(f.x + Math.cos(a) * f.r), Math.round(f.y + Math.sin(a) * f.r), 1, 1)
+        }
+      }
+
+      for (const e of battle.enemies) drawEnemy(c, e)
+      for (const s of battle.summons) drawSummon(c, s)
+      c.fillStyle = COLORS.bullet
+      for (const b of battle.bullets) c.fillRect(Math.round(b.x), Math.round(b.y), 1, 1)
+      drawPlayer(c, battle.player)
+    }
+
+    // ---- 诊断 ----
+
+    function diagnose(entry) {
+      const r = entry.lastResult
+      if (r === null) return ''
+      if (r.kind === 'cleared') return '进入第 ' + (entry.floor + 1) + ' 层'
+      const def = floorDef(r.floor)
+      const lock = def.locks.length > 0 ? def.locks[0] : null
+      if (lock === 'carapace') {
+        return entry.buildId === 'pure'
+          ? '锁：甲壳（单次最多 1 格）。锋锐被完全浪费，换灼烧。'
+          : '锁：甲壳。灼烧能穿过去，但这一层的厚度压过了输出。'
+      }
+      return TIME_LIMIT + ' 秒内没清完：输出不够。'
+    }
+
+    // ---- 界面 ----
+
+    function formatTokens(n) {
+      if (!Number.isFinite(n) || n <= 0) return '0'
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k'
+      return String(Math.round(n))
+    }
+
     function PetBody(props) {
-      const sessionId = props !== null && props.sessionId !== undefined ? String(props.sessionId) : ''
+      const sessionId = props !== null && props !== undefined && props.sessionId !== undefined
+        ? String(props.sessionId)
+        : ''
       const canvasRef = React.useRef(null)
-      const gameRef = React.useRef(null)
+      const entryRef = React.useRef(null)
       const [key, setKey] = React.useState(null)
       const bump = React.useReducer((n) => n + 1, 0)[1]
 
       React.useEffect(() => {
         if (key === null) return undefined
         const entry = acquireEntry(key)
-        gameRef.current = entry.game
+        entryRef.current = entry
         bump()
         return () => {
-          gameRef.current = null
+          entryRef.current = null
           releaseEntry(key)
         }
       }, [key, bump])
 
       React.useEffect(() => {
         let raf = 0
-        const loop = (now) => {
+        const loop = () => {
           raf = window.requestAnimationFrame(loop)
-          const game = gameRef.current
+          const entry = entryRef.current
           const canvas = canvasRef.current
-          if (game === null || canvas === null) return
+          if (entry === null || canvas === null) return
           const c = canvas.getContext('2d')
-          if (c !== null) draw(c, game, now / 1000)
+          if (c !== null) draw(c, entry)
         }
         raf = window.requestAnimationFrame(loop)
         return () => window.cancelAnimationFrame(raf)
       }, [])
+
+      React.useEffect(() => {
+        const id = window.setInterval(() => bump(), 200)
+        return () => window.clearInterval(id)
+      }, [bump])
 
       React.useEffect(() => {
         let disposed = false
@@ -866,77 +986,35 @@ window.__ModuleLoader__.load({
             const res = await window.fetch('/dsh-pet/usage', { headers: { accept: 'application/json' } })
             if (!res.ok) throw new Error('status ' + res.status)
             const data = await res.json()
-            const table = data !== null && typeof data === 'object' ? data.sessions : undefined
+            const table = data !== null && typeof data === 'object' ? data.sessions : null
             if (table === null || typeof table !== 'object') throw new Error('bad payload')
-
             const own = table[sessionId]
             const nextKey =
               own !== undefined && typeof own.workspaceKey === 'string' && own.workspaceKey.length > 0
                 ? own.workspaceKey
                 : 'session:' + sessionId
-            if (keyRef !== nextKey) {
+            if (nextKey !== keyRef) {
               keyRef = nextKey
               setKey(nextKey)
             }
-
-            const game = gameRef.current
-            if (game === null) return
+            const entry = entryRef.current
+            if (entry === null) return
             failures = 0
-            game.online = true
-
-            let active = 0
-            let busy = 0
+            entry.online = true
             let running = false
-            for (const [sid, entry] of Object.entries(table)) {
-              if (entry === null || typeof entry !== 'object') continue
-              if (entry.workspaceKey !== nextKey) continue
-              if (entry.running === true) {
-                active += 1
-                running = true
-              }
-              if (typeof entry.busyMs === 'number' && entry.busyMs > busy) busy = entry.busyMs
-
-              const out = typeof entry.outputTokens === 'number' ? entry.outputTokens : 0
-              const used = typeof entry.totalTokens === 'number' ? entry.totalTokens : 0
-              const tools = typeof entry.toolCalls === 'number' ? entry.toolCalls : 0
-              const seen = game.seen.get(sid)
-              if (seen === undefined) {
-                const prior = game.seenUsed[sid]
-                const baseline = typeof prior === 'number' && Number.isFinite(prior) ? prior : used
-                game.seen.set(sid, { out, used: baseline, tools })
-                if (used > baseline) game.consumed += used - baseline
-                game.seenUsed[sid] = used
-                continue
-              }
-              const delta = out - seen.out
-              if (delta > 0) {
-                game.spawnDebt += delta
-                game.tokens += delta
-                game.totalTokens += delta
-              }
-              seen.out = out
-              const usedDelta = used - seen.used
-              if (usedDelta > 0) game.consumed += usedDelta
-              seen.used = used
-              game.seenUsed[sid] = used
-              const toolDelta = tools - seen.tools
-              if (toolDelta > 0) game.eliteQueue += Math.min(4, toolDelta)
-              seen.tools = tools
+            let consumed = 0
+            for (const row of Object.values(table)) {
+              if (row === null || typeof row !== 'object') continue
+              if (row.workspaceKey !== nextKey) continue
+              if (row.running === true) running = true
+              if (typeof row.totalTokens === 'number') consumed += row.totalTokens
             }
-
-            game.running = running
-            game.busyMs = busy
-            game.activeSessions = Math.max(1, active)
-            game.liveSessions = Object.keys(table).length
+            entry.running = running
+            entry.consumed = consumed
           } catch {
             failures += 1
-            const game = gameRef.current
-            if (game !== null && failures >= 3) {
-              game.online = false
-              game.running = true
-              game.spawnDebt += 6
-              game.tokens += 6
-            }
+            const entry = entryRef.current
+            if (entry !== null && failures >= 3) entry.online = false
           }
         }
         poll()
@@ -947,123 +1025,61 @@ window.__ModuleLoader__.load({
         }
       }, [sessionId])
 
-      React.useEffect(() => {
-        const id = window.setInterval(() => bump(), 120)
-        return () => window.clearInterval(id)
-      }, [bump])
-
-      React.useEffect(() => {
-        if (key === null) return undefined
-        const id = window.setInterval(() => {
-          if (gameRef.current !== null) writeSave(gameRef.current)
-        }, 3000)
-        return () => {
-          window.clearInterval(id)
-          if (gameRef.current !== null) writeSave(gameRef.current)
-        }
-      }, [key])
-
-      const game = gameRef.current
-      if (game === null) {
+      const entry = entryRef.current
+      if (entry === null) {
         return h('div', { className: 'dsh-pet' },
           h('style', { key: 'style' }, CSS),
-          h('div', { className: 'dsh-pet-top' },
-            h('span', { className: 'dsh-pet-lv' }, '宠物'),
-            h('span', { className: 'dsh-pet-dot' }, '连接中…'),
-          ),
+          h('div', { className: 'dsh-pet-top' }, h('span', { className: 'dsh-pet-muted' }, '连接中…')),
         )
       }
 
-      const p = game.player
-      const hpPct = clamp((p.hp / p.maxHp) * 100, 0, 100)
-      const xpPct = clamp((game.xp / game.xpNext) * 100, 0, 100)
-      const statusText = game.online ? (game.running ? '进行中' : '待机') : '离线演示'
-      const build = buildSize(game)
-      const tierRows = []
-      for (const tier of TIERS) {
-        let count = 0
-        for (const enemy of game.enemies) if (enemy.tier === tier.level) count += 1
-        tierRows.push({ level: tier.level, count })
-      }
+      const battle = entry.battle
+      const cells = battle === null ? 0 : battle.player.cells
+      const maxCells = battle === null ? 1 : battle.player.maxCells
+      const pct = Math.max(0, Math.min(100, (cells / maxCells) * 100))
+      const build = BUILDS[entry.buildId]
+      const result = entry.phase === 'result' ? entry.lastResult : null
+      const lockName = battle !== null && battle.def.locks.length > 0 ? battle.def.locks[0] : '—'
 
       return h('div', { className: 'dsh-pet' },
         h('style', { key: 'style' }, CSS),
         h('div', { className: 'dsh-pet-top' },
-          h('span', { className: 'dsh-pet-lv' }, 'Lv.' + game.level),
-          h('span', { className: 'dsh-pet-stat' }, '击杀 ' + game.kills),
-          h('span', { className: 'dsh-pet-stat' }, '强化 ' + build),
-          h('span', {
-            className: 'dsh-pet-usage',
-            title: '本工作区累计消耗 ' + Math.round(game.consumed) + ' token（输入 + 输出，自插件启用以来的观测值）',
-          }, '累计 ' + formatTokens(game.consumed)),
-          h('span', { className: 'dsh-pet-dot' + (game.running ? ' on' : '') }, statusText),
+          h('span', { className: 'dsh-pet-floor' }, '第 ' + entry.floor + ' 层'),
+          h('span', { className: 'dsh-pet-muted' }, '最佳 ' + entry.best),
+          h('span', { className: 'dsh-pet-muted' }, '锁 ' + lockName),
+          h('span', { className: 'dsh-pet-spacer' }),
+          h('button', {
+            type: 'button',
+            className: 'dsh-pet-btn',
+            title: '切换 build 并重新开始',
+            onClick: () => {
+              const e = entryRef.current
+              if (e === null) return
+              e.buildId = e.buildId === 'fire' ? 'pure' : 'fire'
+              startFloor(e, 1)
+              bump()
+            },
+          }, build.label),
+          h('span', { className: 'dsh-pet-dot' + (entry.online ? ' on' : '') }),
         ),
-        h('div', { className: 'dsh-pet-xp' }, h('i', { style: { width: xpPct + '%' } })),
         h('div', { className: 'dsh-pet-stage' },
           h('canvas', { ref: canvasRef, width: W * 2, height: H * 2, className: 'dsh-pet-canvas' }),
-          game.offer.length > 0
-            ? h('div', { className: 'dsh-pet-cards' },
-                h('div', { className: 'dsh-pet-cards-title' }, '升级 · 待选 ×' + game.pending),
-                h('div', { className: 'dsh-pet-cards-list' },
-                  game.offer.map((card) =>
-                    h('button', {
-                      key: card.uid,
-                      type: 'button',
-                      className: 'dsh-pet-card',
-                      onClick: () => {
-                        chooseCard(gameRef.current, card.uid)
-                        bump()
-                      },
-                    },
-                      h('span', { className: 'dsh-pet-card-head' },
-                        h('span', { className: 'dsh-pet-card-name' }, card.name),
-                        h('span', { className: 'dsh-pet-card-delta' }, card.delta(game.player)),
-                      ),
-                      h('span', { className: 'dsh-pet-card-desc' }, card.desc),
-                    ),
-                  ),
-                ),
-              )
-            : null,
-          game.dead
-            ? h('div', { className: 'dsh-pet-dead' },
-                h('div', { className: 'dsh-pet-dead-title' }, '阵亡'),
-                h('div', { className: 'dsh-pet-dead-sub' }, '保留 Lv.' + game.level + ' 与全部强化'),
+          result !== null
+            ? h('div', { className: 'dsh-pet-overlay' },
+                h('div', {
+                  className: 'dsh-pet-overlay-title ' + (result.kind === 'cleared' ? 'good' : 'bad'),
+                }, result.kind === 'cleared' ? '清层' : result.kind === 'dead' ? '阵亡' : '超时'),
+                h('div', { className: 'dsh-pet-overlay-sub' }, diagnose(entry)),
               )
             : null,
         ),
-        h('div', { className: 'dsh-pet-hp' }, h('i', { style: { width: hpPct + '%' } })),
-        h('div', { className: 'dsh-pet-stats' },
-          h('span', null, '移速 ' + Math.round(p.speed)),
-          h('span', null, '射程 ' + Math.round(p.range)),
-          h('span', null, '伤害 ' + Math.round(p.dmg)),
-          h('span', null, '间隔 ' + p.fireEvery.toFixed(2) + 's'),
-        ),
-        h('div', { className: 'dsh-pet-tiers' },
-          tierRows.map((row) =>
-            h('span', {
-              key: row.level,
-              className: 'dsh-pet-tier' + (row.count === 0 ? ' zero' : ''),
-            },
-              h('i', { style: { background: TIER_STYLE[row.level].body } }),
-              row.count,
-            ),
-          ),
-        ),
-        build > 0
-          ? h('div', { className: 'dsh-pet-build' },
-              buildEntries(game).map((row) =>
-                h('span', { key: row[0], className: 'dsh-pet-chip' }, row[0] + '×' + row[1]),
-              ),
-            )
-          : null,
+        h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%' } })),
         h('div', { className: 'dsh-pet-bottom' },
-          h('span', null, 'HP ' + Math.max(0, Math.round(p.hp)) + '/' + Math.round(p.maxHp)),
-          h('span', { className: game.enemies.length >= COMFORT_ENEMIES ? 'dsh-pet-hot' : null },
-            '敌 ' + game.enemies.length + '/' + MAX_ENEMIES),
-          h('span', null, '会话 ' + clamp(game.activeSessions, 1, 4)),
-          game.busyMs > 10000 ? h('span', null, '工具 ' + Math.round(game.busyMs / 1000) + 's') : null,
-          game.pending > 0 ? h('span', { className: 'dsh-pet-pending' }, '待选 ×' + game.pending) : null,
+          h('span', null, '格 ' + Math.max(0, cells) + '/' + maxCells),
+          h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
+          h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
+          h('span', { className: 'dsh-pet-spacer' }),
+          h('span', null, formatTokens(entry.consumed) + ' token'),
         ),
       )
     }
@@ -1105,7 +1121,7 @@ window.__ModuleLoader__.load({
             kind: KIND,
             title: () => '宠物',
             keepMounted: true,
-            guide: [{ id: 'pet', title: '宠物', description: '用输出 token 驱动的自动战斗' }],
+            guide: [{ id: 'pet', title: '宠物', description: '按层推进的自动战斗' }],
           }),
         )
 
@@ -1124,6 +1140,8 @@ window.__ModuleLoader__.load({
           ),
         )
       },
+      // 供 node --test 验证接入路径；运行时不使用。
+      __debug: { createEntry, tick, startFloor, draw, BUILDS },
     }
   },
 })
