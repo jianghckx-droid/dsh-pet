@@ -109,14 +109,13 @@ window.__ModuleLoader__.load({
     }
 
     // ---- cards.js ----
-    // 卡片数据（MVP 子集）。
+    // 卡片数据（MVP 子集：灼烧包）。
     //
     // 只收录"行为已经实现"的卡。docs/cards.md 里的 24 张是完整设计，
-    // 但没实现的卡不进代码——否则会出现"有数据、没行为"的死卡，
-    // 玩家抽到它却什么都不会发生。
+    // 但没实现的卡不进代码——否则会出现"有数据、没行为"的死卡。
     //
-    // MVP 需要 4 张：铁弹（起始）+ 灼烧三件套。
-    // 其余 20 张随行为一起加入。
+    // 与 cards.md §7 的偏差：MVP 用「斩杀 / 时锚」替换了「压缩 / 禁疗」，
+    // 因为 MVP 没有回血敌人，禁疗无处生效。
 
     const STARTER_ID = 'orb_phys';
 
@@ -173,13 +172,87 @@ window.__ModuleLoader__.load({
         solves: Object.freeze(['carapace', 'regen']),
         desc: '射程 36，灼烧 +1；生命 4',
       }),
+      self_fire: Object.freeze({
+        id: 'self_fire',
+        name: '燃身',
+        carrier: 'self',
+        effect: 'fire',
+        cells: 1,
+        cd: 3,
+        burn: 2,
+        aoe: 0,
+        tags: Object.freeze(['fire', 'self', 'dot']),
+        solves: Object.freeze(['carapace']),
+        desc: '每 3 秒：周围 1 格 + 灼烧 2 层',
+      }),
+      rule_boom: Object.freeze({
+        id: 'rule_boom',
+        name: '尸爆',
+        carrier: 'rule',
+        effect: 'fire',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'aoe']),
+        solves: Object.freeze(['split', 'summon']),
+        desc: '击杀时对周围造成 2 次 1 格',
+      }),
+      rule_combo: Object.freeze({
+        id: 'rule_combo',
+        name: '连击',
+        carrier: 'rule',
+        effect: 'fire',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'multi']),
+        solves: Object.freeze(['carapace']),
+        desc: '每 4 次命中，追加 1 次 1 格',
+      }),
+      rule_execute: Object.freeze({
+        id: 'rule_execute',
+        name: '斩杀',
+        carrier: 'rule',
+        effect: 'fire',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'execute']),
+        solves: Object.freeze(['split', 'summon']),
+        desc: '命中后，2 格以下的目标直接移除',
+      }),
+      rule_anchor: Object.freeze({
+        id: 'rule_anchor',
+        name: '时锚',
+        carrier: 'rule',
+        effect: 'fire',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['rule', 'control']),
+        solves: Object.freeze(['bomb']),
+        desc: '每 10 秒冻结全场 1.2 秒',
+      }),
     });
 
-    /** 灼烧包的 MVP 池：三选一从这里抽。 */
-    const FIRE_POOL = Object.freeze(['orb_fire', 'field_fire', 'summon_fire']);
+    /** 灼烧包的抽卡池：已拥有铁弹 + 三件套时，从这 8 张里出三选一。 */
+    const FIRE_PACK = Object.freeze([
+      'orb_fire',
+      'field_fire',
+      'summon_fire',
+      'self_fire',
+      'rule_boom',
+      'rule_combo',
+      'rule_execute',
+      'rule_anchor',
+    ]);
 
-    /** 完整的灼烧 build，供模拟器与单测使用。 */
-    const FIRE_BUILD = Object.freeze(['orb_phys', ...FIRE_POOL]);
+    /** 灼烧包的开局 build（模拟器与单测用）。 */
+    const FIRE_BUILD = Object.freeze(['orb_phys', 'orb_fire', 'field_fire', 'summon_fire']);
 
     function cardsById(ids) {
       return ids.map((id) => {
@@ -258,20 +331,24 @@ window.__ModuleLoader__.load({
     // ---- arena.js ----
     // 战斗状态机（无渲染、无 DOM、可复现）。
     //
-    // 这一层是游戏真正的核心：位置、走位、刷怪、命中、状态、层推进。
-    // client.js 以后只负责把 battle 画出来；测试直接跑这里。
+    // 这一层是游戏真正的核心：位置、走位、刷怪、命中、状态、层推进、三选一。
+    // client.js 只负责把 battle 画出来；测试直接跑这里。
     //
     // 设计约束：
     //   - 纯函数式推进：step(battle, dt)，不读全局、不用 Math.random
     //   - 同一 seed + 同一 dt 序列 → 同一结果
     //   - 所有伤害都走 rules.js 的 resolveHit，锁不会在这里被绕过
-    //   - 召唤物在 MVP 里是"炮台"：会攻击，但不会被敌人选为目标
+    //   - 抽卡只在 arena 里发生，UI 只调用 chooseCard
     //
     // 已知取舍：
     //   - 没有寻路，敌人直线追玩家；160×144 的场地不需要
     //   - 走位是"绕最近目标 + 回中心"的启发式，不是完整 AI（轮次 5 再做）
+    //   - 召唤物是炮台：会攻击，但不会被敌人选为目标
+    //   - 分裂子体不给经验，避免刷经验
 
     const ARENA = Object.freeze({ w: 160, h: 144 });
+    const TIME_LIMIT = 45;
+    const MAX_SLOTS = 3;
 
     const PLAYER_SPEED = 52;
     const PLAYER_RADIUS = 3;
@@ -286,7 +363,14 @@ window.__ModuleLoader__.load({
     const BULLET_HIT_RADIUS = 3.5;
     const KEEP_DISTANCE = 42;
     const CENTER_PULL = 56;
-    const TIME_LIMIT = 45;
+
+    const SELF_RADIUS = 20;
+    const BOOM_RADIUS = 14;
+    const FREEZE_SECONDS = 1.2;
+    const ANCHOR_SECONDS = 10;
+    const COMBO_EVERY = 4;
+    const EXECUTE_THRESHOLD = 2;
+    const XP_PER_CELL = 3;
 
     const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
     const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -313,14 +397,90 @@ window.__ModuleLoader__.load({
       return { x: -6, y: rng() * ARENA.h };
     }
 
-    function createBattle({ floor, build, attrs = {}, seed = 1 }) {
+    function hasRule(battle, id) {
+      return battle.rules.some((rule) => rule.id === id);
+    }
+
+    /** 把一张卡加进当前战斗。开局 build 与抽卡都走这里。 */
+    function addCard(battle, id) {
+      const card = cardsById([id])[0];
+      battle.cards.push(card);
+      if (card.carrier === 'rule') {
+        battle.rules.push(card);
+        return card;
+      }
+      if (card.carrier === 'self') {
+        battle.selfs.push({ card, timer: card.cd });
+        return card;
+      }
+      if (card.carrier === 'summon') {
+        battle.summons.push({
+          id: battle.nextId++,
+          card,
+          x: battle.player.x - 8,
+          y: battle.player.y - 8,
+          timer: card.cd * 0.5,
+        });
+        return card;
+      }
+      battle.sources.push({ card, timer: card.cd * 0.5 });
+      return card;
+    }
+
+    function rollOffer(battle) {
+      if (battle.offer !== null || battle.pending <= 0) return;
+      if (battle.slots.length >= MAX_SLOTS) return;
+      const owned = new Set(battle.cards.map((card) => card.id));
+      const available = battle.pool.filter((id) => !owned.has(id));
+      if (available.length === 0) return;
+      const picked = [];
+      while (picked.length < 3 && available.length > 0) {
+        const index = Math.floor(battle.rng() * available.length);
+        picked.push(available.splice(index, 1)[0]);
+      }
+      battle.offer = picked;
+    }
+
+    function awardXp(battle, amount) {
+      battle.xp += amount;
+      while (battle.xp >= battle.xpNext) {
+        battle.xp -= battle.xpNext;
+        battle.level += 1;
+        battle.xpNext = 6 + battle.level * 2;
+        if (battle.level % 2 === 0) battle.pending += 1;
+      }
+      rollOffer(battle);
+    }
+
+    /** 选中一张卡：进槽、生效、刷新下一次 offer。 */
+    function chooseCard(battle, id) {
+      if (battle.offer === null || !battle.offer.includes(id)) return false;
+      if (battle.slots.length >= MAX_SLOTS) return false;
+      battle.slots.push(id);
+      battle.offer = null;
+      battle.pending = Math.max(0, battle.pending - 1);
+      addCard(battle, id);
+      battle.events.push({ type: 'draft', id });
+      rollOffer(battle);
+      return true;
+    }
+
+    function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], drafted = [] }) {
       const def = floorDef(floor);
       const maxCells = playerCells(attrs);
-      return {
+      const battle = {
         def,
         floor,
         attrs,
-        cards: cardsById(build),
+        pool: [...pool],
+        slots: [...drafted],
+        cards: [],
+        rules: [],
+        selfs: [],
+        sources: [],
+        summons: [],
+        enemies: [],
+        bullets: [],
         rng: mulberry32(seed),
         time: 0,
         state: 'fighting',
@@ -331,32 +491,21 @@ window.__ModuleLoader__.load({
           maxCells,
           speed: PLAYER_SPEED,
         },
-        enemies: [],
-        bullets: [],
-        summons: [],
-        sources: [],
+        level: 1,
+        xp: 0,
+        xpNext: 8,
+        pending: 0,
+        offer: null,
+        hitCount: 0,
+        anchorTimer: 0,
         spawned: 0,
         kills: 0,
         events: [],
         nextId: 1,
         seed,
       };
-    }
-
-    function initSources(battle) {
-      for (const card of battle.cards) {
-        if (card.carrier === 'summon') {
-          battle.summons.push({
-            id: battle.nextId++,
-            card,
-            x: battle.player.x - 8,
-            y: battle.player.y - 8,
-            timer: card.cd * 0.5,
-          });
-        } else {
-          battle.sources.push({ card, timer: card.cd * 0.5 });
-        }
-      }
+      for (const id of build) addCard(battle, id);
+      return battle;
     }
 
     function nearestEnemy(battle, from, range = Infinity) {
@@ -395,6 +544,7 @@ window.__ModuleLoader__.load({
           damage: enemyDamage(battle.floor),
           attackTimer: ENEMY_ATTACK_INTERVAL,
           status: createStatus(),
+          freeze: 0,
           flash: 0,
         });
         battle.spawned += 1;
@@ -434,6 +584,32 @@ window.__ModuleLoader__.load({
       p.y = clamp(p.y + (vy / len) * p.speed * dt, 6, ARENA.h - 6);
     }
 
+    function rawHit(battle, enemy, cells, burn = 0) {
+      const dealt = resolveHit(enemy, cells, { main: true });
+      enemy.cells -= dealt;
+      enemy.flash = 0.12;
+      if (burn) applyBurn(enemy.status, burn);
+      battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
+      return dealt;
+    }
+
+    function hitEnemy(battle, enemy, card) {
+      rawHit(battle, enemy, attackCells(card, battle.attrs), card.burn ?? 0);
+
+      if (hasRule(battle, 'rule_execute') && enemy.cells > 0 && enemy.cells <= EXECUTE_THRESHOLD) {
+        enemy.cells = 0;
+        battle.events.push({ type: 'execute', x: enemy.x, y: enemy.y });
+      }
+
+      if (hasRule(battle, 'rule_combo')) {
+        battle.hitCount += 1;
+        if (battle.hitCount % COMBO_EVERY === 0) {
+          const extra = nearestEnemy(battle, battle.player, ORB_RANGE);
+          if (extra && extra !== enemy && extra.cells > 0) rawHit(battle, extra, 1);
+        }
+      }
+    }
+
     function fireBullet(battle, from, card, target) {
       battle.bullets.push({
         id: battle.nextId++,
@@ -451,20 +627,10 @@ window.__ModuleLoader__.load({
       const targets = battle.enemies
         .filter((e) => e.cells > 0 && dist(battle.player, e) <= FIELD_RADIUS + e.r)
         .slice(0, card.aoe || 1);
-      for (const e of targets) {
-        hitEnemy(battle, e, card);
-      }
+      for (const e of targets) hitEnemy(battle, e, card);
       if (targets.length > 0) {
         battle.events.push({ type: 'pulse', x: battle.player.x, y: battle.player.y, card: card.id });
       }
-    }
-
-    function hitEnemy(battle, enemy, card) {
-      const dealt = resolveHit(enemy, attackCells(card, battle.attrs), { main: true });
-      enemy.cells -= dealt;
-      enemy.flash = 0.12;
-      if (card.burn) applyBurn(enemy.status, card.burn);
-      battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
     }
 
     function attackTick(battle, dt) {
@@ -481,7 +647,6 @@ window.__ModuleLoader__.load({
       }
 
       for (const summon of battle.summons) {
-        // 炮台跟随，简化成围绕玩家的偏移
         const tx = battle.player.x - 10;
         const ty = battle.player.y - 10;
         summon.x += (tx - summon.x) * Math.min(1, dt * 3);
@@ -492,6 +657,32 @@ window.__ModuleLoader__.load({
         const target = nearestEnemy(battle, summon, SUMMON_RANGE);
         if (target) fireBullet(battle, summon, summon.card, target);
       }
+    }
+
+    function selfTick(battle, dt) {
+      for (const self of battle.selfs) {
+        self.timer -= dt;
+        if (self.timer > 0) continue;
+        self.timer += self.card.cd;
+        const targets = battle.enemies.filter(
+          (e) => e.cells > 0 && dist(battle.player, e) <= SELF_RADIUS + e.r,
+        );
+        for (const e of targets) hitEnemy(battle, e, self.card);
+        if (targets.length > 0) {
+          battle.events.push({ type: 'pulse', x: battle.player.x, y: battle.player.y, card: self.card.id });
+        }
+      }
+    }
+
+    function rulesTick(battle, dt) {
+      if (!hasRule(battle, 'rule_anchor')) return;
+      battle.anchorTimer += dt;
+      if (battle.anchorTimer < ANCHOR_SECONDS) return;
+      battle.anchorTimer -= ANCHOR_SECONDS;
+      for (const e of battle.enemies) {
+        if (e.cells > 0) e.freeze = Math.max(e.freeze, FREEZE_SECONDS);
+      }
+      battle.events.push({ type: 'freeze' });
     }
 
     function bulletsTick(battle, dt) {
@@ -523,6 +714,10 @@ window.__ModuleLoader__.load({
       for (const e of battle.enemies) {
         if (e.cells <= 0) continue;
         e.flash = Math.max(0, e.flash - dt);
+        if (e.freeze > 0) {
+          e.freeze = Math.max(0, e.freeze - dt);
+          continue;
+        }
         const dx = p.x - e.x;
         const dy = p.y - e.y;
         const d = Math.hypot(dx, dy) || 1;
@@ -560,6 +755,7 @@ window.__ModuleLoader__.load({
 
     function resolveDeaths(battle) {
       const alive = [];
+      const booms = [];
       for (const e of battle.enemies) {
         if (e.cells > 0) {
           alive.push(e);
@@ -567,6 +763,10 @@ window.__ModuleLoader__.load({
         }
         battle.kills += 1;
         battle.events.push({ type: 'kill', x: e.x, y: e.y, id: e.id });
+        if (e.primary) {
+          awardXp(battle, Math.max(1, Math.round(e.maxCells / XP_PER_CELL)));
+          if (hasRule(battle, 'rule_boom')) booms.push({ x: e.x, y: e.y });
+        }
         if (e.canSplit && e.primary) {
           const child = Math.max(1, Math.ceil(e.maxCells * 0.5));
           for (let i = 0; i < 2; i += 1) {
@@ -580,12 +780,24 @@ window.__ModuleLoader__.load({
               locks: [],
               r: enemyRadius(child),
               status: createStatus(),
+              freeze: 0,
               flash: 0,
             });
           }
         }
       }
       battle.enemies = alive;
+
+      for (const at of booms) {
+        for (const e of alive) {
+          if (e.cells <= 0) continue;
+          if (dist(e, at) > BOOM_RADIUS) continue;
+          e.cells -= 1;
+          e.cells -= 1;
+          e.flash = 0.1;
+          battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: 2 });
+        }
+      }
     }
 
     function checkEnd(battle) {
@@ -607,11 +819,12 @@ window.__ModuleLoader__.load({
     function step(battle, dt) {
       if (battle.state !== 'fighting') return [];
       battle.events = [];
-      if (battle.sources.length === 0 && battle.summons.length === 0) initSources(battle);
       battle.time += dt;
       spawnTick(battle);
       playerMove(battle, dt);
       attackTick(battle, dt);
+      selfTick(battle, dt);
+      rulesTick(battle, dt);
       bulletsTick(battle, dt);
       enemiesTick(battle, dt);
       statusTick(battle, dt);
@@ -644,12 +857,14 @@ window.__ModuleLoader__.load({
         id: 'fire',
         label: '灼烧',
         cards: [...FIRE_BUILD],
+        pool: [...FIRE_PACK],
         attrs: { edge: 0, body: 10 },
       },
       pure: {
         id: 'pure',
         label: '纯数值',
         cards: ['orb_phys'],
+        pool: [],
         attrs: { edge: 10, body: 0 },
       },
     }
@@ -692,6 +907,14 @@ window.__ModuleLoader__.load({
       '.dsh-pet-cells{height:4px;background:#18212b;border-radius:2px;overflow:hidden}',
       '.dsh-pet-cells i{display:block;height:100%;background:#6ee7a8;transition:width .12s linear}',
       '.dsh-pet-bottom{display:flex;gap:8px;color:#6c8091;font-size:10px}',
+      '.dsh-pet-offer{position:absolute;left:5px;right:5px;bottom:5px;display:flex;flex-direction:column;gap:3px;',
+      'background:rgba(10,14,20,.94);border:1px solid #2a3a4a;border-radius:5px;padding:5px}',
+      '.dsh-pet-offer-title{font-size:9px;color:#ffd166;letter-spacing:.08em}',
+      '.dsh-pet-card{display:flex;flex-direction:column;gap:1px;text-align:left;font:inherit;font-size:10px;',
+      'color:#dbe7f0;background:#111a24;border:1px solid #1f2a36;border-radius:4px;padding:3px 5px;cursor:pointer}',
+      '.dsh-pet-card:hover{background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-card-name{color:#ffd166;font-weight:700}',
+      '.dsh-pet-card-desc{color:#8fa4b5;font-size:9px}',
     ].join('')
 
     // ---- 进度 ----
@@ -706,9 +929,11 @@ window.__ModuleLoader__.load({
       entry.acc = 0
       entry.battle = createBattle({
         floor,
-        build: build.cards,
+        build: [...build.cards, ...entry.drafted],
         attrs: build.attrs,
         seed: entry.seed++,
+        pool: build.pool,
+        drafted: entry.drafted,
       })
     }
 
@@ -724,6 +949,7 @@ window.__ModuleLoader__.load({
         resultTimer: 0,
         fx: [],
         acc: 0,
+        drafted: [],
         seed: seed === undefined ? (Date.now() % 100000) + 1 : seed,
         running: false,
         online: true,
@@ -736,14 +962,38 @@ window.__ModuleLoader__.load({
       return entry
     }
 
+    function resetRun(entry, floor) {
+      entry.drafted = []
+      startFloor(entry, floor)
+    }
+
     function advance(entry) {
       const cleared = entry.lastResult !== null && entry.lastResult.kind === 'cleared'
       if (!cleared) {
-        startFloor(entry, 1)
+        resetRun(entry, 1)
         return
       }
+      // 没选的三选一跨层保留，否则玩家一不留神就丢了这次升级。
+      const carried = entry.battle === null ? null : entry.battle.offer
+      const carriedPending = entry.battle === null ? 0 : entry.battle.pending
       const next = entry.floor + 1
-      startFloor(entry, next > MAX_FLOOR ? 1 : next)
+      if (next > MAX_FLOOR) {
+        resetRun(entry, 1)
+        return
+      }
+      startFloor(entry, next)
+      if (carried !== null && entry.battle !== null && entry.battle.offer === null) {
+        entry.battle.offer = carried
+        entry.battle.pending = Math.max(1, carriedPending)
+      }
+    }
+
+    function pickCard(entry, id) {
+      const battle = entry.battle
+      if (battle === null) return false
+      if (!chooseCard(battle, id)) return false
+      entry.drafted.push(id)
+      return true
     }
 
     function tick(entry, dt) {
@@ -1045,6 +1295,7 @@ window.__ModuleLoader__.load({
         h('style', { key: 'style' }, CSS),
         h('div', { className: 'dsh-pet-top' },
           h('span', { className: 'dsh-pet-floor' }, '第 ' + entry.floor + ' 层'),
+          h('span', { className: 'dsh-pet-muted' }, 'Lv.' + (battle === null ? 1 : battle.level)),
           h('span', { className: 'dsh-pet-muted' }, '最佳 ' + entry.best),
           h('span', { className: 'dsh-pet-muted' }, '锁 ' + lockName),
           h('span', { className: 'dsh-pet-spacer' }),
@@ -1056,6 +1307,7 @@ window.__ModuleLoader__.load({
               const e = entryRef.current
               if (e === null) return
               e.buildId = e.buildId === 'fire' ? 'pure' : 'fire'
+              e.drafted = []
               startFloor(e, 1)
               bump()
             },
@@ -1072,10 +1324,31 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'dsh-pet-overlay-sub' }, diagnose(entry)),
               )
             : null,
+          result === null && battle !== null && battle.offer !== null
+            ? h('div', { className: 'dsh-pet-offer' },
+                h('div', { className: 'dsh-pet-offer-title' },
+                  '升级 · 三选一（剩余 ' + battle.pending + '）'),
+                battle.offer.map((id) => {
+                  const card = CARDS[id]
+                  return h('button', {
+                    key: id,
+                    type: 'button',
+                    className: 'dsh-pet-card',
+                    onClick: () => {
+                      if (pickCard(entry, id)) bump()
+                    },
+                  },
+                    h('span', { className: 'dsh-pet-card-name' }, card.name),
+                    h('span', { className: 'dsh-pet-card-desc' }, card.desc),
+                  )
+                }),
+              )
+            : null,
         ),
         h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%' } })),
         h('div', { className: 'dsh-pet-bottom' },
           h('span', null, '格 ' + Math.max(0, cells) + '/' + maxCells),
+          h('span', null, '槽 ' + (battle === null ? 0 : battle.slots.length) + '/' + MAX_SLOTS),
           h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
           h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
           h('span', { className: 'dsh-pet-spacer' }),
@@ -1141,7 +1414,7 @@ window.__ModuleLoader__.load({
         )
       },
       // 供 node --test 验证接入路径；运行时不使用。
-      __debug: { createEntry, tick, startFloor, draw, BUILDS },
+      __debug: { createEntry, tick, startFloor, draw, BUILDS, pickCard, awardXp, chooseCard },
     }
   },
 })

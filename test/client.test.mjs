@@ -129,6 +129,22 @@ test('切换 build 后重开第 1 层，卡片数随之变化', () => {
   assert.equal(entry.battle.player.maxCells, 12);
 });
 
+test('三选一：选卡进槽，并在下一层保留', () => {
+  const { createEntry, startFloor, pickCard, awardXp } = loadModule().__debug;
+  const entry = createEntry('test', 7);
+  awardXp(entry.battle, 8);
+  assert.ok(entry.battle.offer, 'expected an offer');
+  const id = entry.battle.offer[0];
+  assert.equal(pickCard(entry, id), true);
+  assert.equal(entry.battle.slots.length, 1);
+  assert.ok(entry.drafted.includes(id));
+
+  startFloor(entry, 2);
+  assert.equal(entry.battle.floor, 2);
+  assert.equal(entry.battle.slots.length, 1);
+  assert.ok(entry.battle.cards.some((card) => card.id === id));
+});
+
 test('纯数值在第 6 层会被挡住（客户端同一套规则）', () => {
   const { createEntry, startFloor, tick } = loadModule().__debug;
   const entry = createEntry('test', 7);

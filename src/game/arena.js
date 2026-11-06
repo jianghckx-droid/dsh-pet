@@ -1,17 +1,19 @@
 // 战斗状态机（无渲染、无 DOM、可复现）。
 //
-// 这一层是游戏真正的核心：位置、走位、刷怪、命中、状态、层推进。
-// client.js 以后只负责把 battle 画出来；测试直接跑这里。
+// 这一层是游戏真正的核心：位置、走位、刷怪、命中、状态、层推进、三选一。
+// client.js 只负责把 battle 画出来；测试直接跑这里。
 //
 // 设计约束：
 //   - 纯函数式推进：step(battle, dt)，不读全局、不用 Math.random
 //   - 同一 seed + 同一 dt 序列 → 同一结果
 //   - 所有伤害都走 rules.js 的 resolveHit，锁不会在这里被绕过
-//   - 召唤物在 MVP 里是"炮台"：会攻击，但不会被敌人选为目标
+//   - 抽卡只在 arena 里发生，UI 只调用 chooseCard
 //
 // 已知取舍：
 //   - 没有寻路，敌人直线追玩家；160×144 的场地不需要
 //   - 走位是"绕最近目标 + 回中心"的启发式，不是完整 AI（轮次 5 再做）
+//   - 召唤物是炮台：会攻击，但不会被敌人选为目标
+//   - 分裂子体不给经验，避免刷经验
 
 import { cardsById } from './cards.js';
 import {
@@ -25,6 +27,8 @@ import {
 import { enemyCells, enemyDamage, floorDef, spawnSeconds } from './floors.js';
 
 export const ARENA = Object.freeze({ w: 160, h: 144 });
+export const TIME_LIMIT = 45;
+export const MAX_SLOTS = 3;
 
 const PLAYER_SPEED = 52;
 const PLAYER_RADIUS = 3;
@@ -39,7 +43,14 @@ const BULLET_SPEED = 180;
 const BULLET_HIT_RADIUS = 3.5;
 const KEEP_DISTANCE = 42;
 const CENTER_PULL = 56;
-const TIME_LIMIT = 45;
+
+const SELF_RADIUS = 20;
+const BOOM_RADIUS = 14;
+const FREEZE_SECONDS = 1.2;
+const ANCHOR_SECONDS = 10;
+const COMBO_EVERY = 4;
+const EXECUTE_THRESHOLD = 2;
+const XP_PER_CELL = 3;
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -66,14 +77,90 @@ function spawnPoint(rng) {
   return { x: -6, y: rng() * ARENA.h };
 }
 
-export function createBattle({ floor, build, attrs = {}, seed = 1 }) {
+function hasRule(battle, id) {
+  return battle.rules.some((rule) => rule.id === id);
+}
+
+/** 把一张卡加进当前战斗。开局 build 与抽卡都走这里。 */
+export function addCard(battle, id) {
+  const card = cardsById([id])[0];
+  battle.cards.push(card);
+  if (card.carrier === 'rule') {
+    battle.rules.push(card);
+    return card;
+  }
+  if (card.carrier === 'self') {
+    battle.selfs.push({ card, timer: card.cd });
+    return card;
+  }
+  if (card.carrier === 'summon') {
+    battle.summons.push({
+      id: battle.nextId++,
+      card,
+      x: battle.player.x - 8,
+      y: battle.player.y - 8,
+      timer: card.cd * 0.5,
+    });
+    return card;
+  }
+  battle.sources.push({ card, timer: card.cd * 0.5 });
+  return card;
+}
+
+function rollOffer(battle) {
+  if (battle.offer !== null || battle.pending <= 0) return;
+  if (battle.slots.length >= MAX_SLOTS) return;
+  const owned = new Set(battle.cards.map((card) => card.id));
+  const available = battle.pool.filter((id) => !owned.has(id));
+  if (available.length === 0) return;
+  const picked = [];
+  while (picked.length < 3 && available.length > 0) {
+    const index = Math.floor(battle.rng() * available.length);
+    picked.push(available.splice(index, 1)[0]);
+  }
+  battle.offer = picked;
+}
+
+export function awardXp(battle, amount) {
+  battle.xp += amount;
+  while (battle.xp >= battle.xpNext) {
+    battle.xp -= battle.xpNext;
+    battle.level += 1;
+    battle.xpNext = 6 + battle.level * 2;
+    if (battle.level % 2 === 0) battle.pending += 1;
+  }
+  rollOffer(battle);
+}
+
+/** 选中一张卡：进槽、生效、刷新下一次 offer。 */
+export function chooseCard(battle, id) {
+  if (battle.offer === null || !battle.offer.includes(id)) return false;
+  if (battle.slots.length >= MAX_SLOTS) return false;
+  battle.slots.push(id);
+  battle.offer = null;
+  battle.pending = Math.max(0, battle.pending - 1);
+  addCard(battle, id);
+  battle.events.push({ type: 'draft', id });
+  rollOffer(battle);
+  return true;
+}
+
+export function createBattle({ floor, build, attrs = {}, seed = 1, pool = [], drafted = [] }) {
   const def = floorDef(floor);
   const maxCells = playerCells(attrs);
-  return {
+  const battle = {
     def,
     floor,
     attrs,
-    cards: cardsById(build),
+    pool: [...pool],
+    slots: [...drafted],
+    cards: [],
+    rules: [],
+    selfs: [],
+    sources: [],
+    summons: [],
+    enemies: [],
+    bullets: [],
     rng: mulberry32(seed),
     time: 0,
     state: 'fighting',
@@ -84,32 +171,21 @@ export function createBattle({ floor, build, attrs = {}, seed = 1 }) {
       maxCells,
       speed: PLAYER_SPEED,
     },
-    enemies: [],
-    bullets: [],
-    summons: [],
-    sources: [],
+    level: 1,
+    xp: 0,
+    xpNext: 8,
+    pending: 0,
+    offer: null,
+    hitCount: 0,
+    anchorTimer: 0,
     spawned: 0,
     kills: 0,
     events: [],
     nextId: 1,
     seed,
   };
-}
-
-function initSources(battle) {
-  for (const card of battle.cards) {
-    if (card.carrier === 'summon') {
-      battle.summons.push({
-        id: battle.nextId++,
-        card,
-        x: battle.player.x - 8,
-        y: battle.player.y - 8,
-        timer: card.cd * 0.5,
-      });
-    } else {
-      battle.sources.push({ card, timer: card.cd * 0.5 });
-    }
-  }
+  for (const id of build) addCard(battle, id);
+  return battle;
 }
 
 function nearestEnemy(battle, from, range = Infinity) {
@@ -148,6 +224,7 @@ function spawnTick(battle) {
       damage: enemyDamage(battle.floor),
       attackTimer: ENEMY_ATTACK_INTERVAL,
       status: createStatus(),
+      freeze: 0,
       flash: 0,
     });
     battle.spawned += 1;
@@ -187,6 +264,32 @@ function playerMove(battle, dt) {
   p.y = clamp(p.y + (vy / len) * p.speed * dt, 6, ARENA.h - 6);
 }
 
+function rawHit(battle, enemy, cells, burn = 0) {
+  const dealt = resolveHit(enemy, cells, { main: true });
+  enemy.cells -= dealt;
+  enemy.flash = 0.12;
+  if (burn) applyBurn(enemy.status, burn);
+  battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
+  return dealt;
+}
+
+function hitEnemy(battle, enemy, card) {
+  rawHit(battle, enemy, attackCells(card, battle.attrs), card.burn ?? 0);
+
+  if (hasRule(battle, 'rule_execute') && enemy.cells > 0 && enemy.cells <= EXECUTE_THRESHOLD) {
+    enemy.cells = 0;
+    battle.events.push({ type: 'execute', x: enemy.x, y: enemy.y });
+  }
+
+  if (hasRule(battle, 'rule_combo')) {
+    battle.hitCount += 1;
+    if (battle.hitCount % COMBO_EVERY === 0) {
+      const extra = nearestEnemy(battle, battle.player, ORB_RANGE);
+      if (extra && extra !== enemy && extra.cells > 0) rawHit(battle, extra, 1);
+    }
+  }
+}
+
 function fireBullet(battle, from, card, target) {
   battle.bullets.push({
     id: battle.nextId++,
@@ -204,20 +307,10 @@ function pulse(battle, card) {
   const targets = battle.enemies
     .filter((e) => e.cells > 0 && dist(battle.player, e) <= FIELD_RADIUS + e.r)
     .slice(0, card.aoe || 1);
-  for (const e of targets) {
-    hitEnemy(battle, e, card);
-  }
+  for (const e of targets) hitEnemy(battle, e, card);
   if (targets.length > 0) {
     battle.events.push({ type: 'pulse', x: battle.player.x, y: battle.player.y, card: card.id });
   }
-}
-
-function hitEnemy(battle, enemy, card) {
-  const dealt = resolveHit(enemy, attackCells(card, battle.attrs), { main: true });
-  enemy.cells -= dealt;
-  enemy.flash = 0.12;
-  if (card.burn) applyBurn(enemy.status, card.burn);
-  battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
 }
 
 function attackTick(battle, dt) {
@@ -234,7 +327,6 @@ function attackTick(battle, dt) {
   }
 
   for (const summon of battle.summons) {
-    // 炮台跟随，简化成围绕玩家的偏移
     const tx = battle.player.x - 10;
     const ty = battle.player.y - 10;
     summon.x += (tx - summon.x) * Math.min(1, dt * 3);
@@ -245,6 +337,32 @@ function attackTick(battle, dt) {
     const target = nearestEnemy(battle, summon, SUMMON_RANGE);
     if (target) fireBullet(battle, summon, summon.card, target);
   }
+}
+
+function selfTick(battle, dt) {
+  for (const self of battle.selfs) {
+    self.timer -= dt;
+    if (self.timer > 0) continue;
+    self.timer += self.card.cd;
+    const targets = battle.enemies.filter(
+      (e) => e.cells > 0 && dist(battle.player, e) <= SELF_RADIUS + e.r,
+    );
+    for (const e of targets) hitEnemy(battle, e, self.card);
+    if (targets.length > 0) {
+      battle.events.push({ type: 'pulse', x: battle.player.x, y: battle.player.y, card: self.card.id });
+    }
+  }
+}
+
+function rulesTick(battle, dt) {
+  if (!hasRule(battle, 'rule_anchor')) return;
+  battle.anchorTimer += dt;
+  if (battle.anchorTimer < ANCHOR_SECONDS) return;
+  battle.anchorTimer -= ANCHOR_SECONDS;
+  for (const e of battle.enemies) {
+    if (e.cells > 0) e.freeze = Math.max(e.freeze, FREEZE_SECONDS);
+  }
+  battle.events.push({ type: 'freeze' });
 }
 
 function bulletsTick(battle, dt) {
@@ -276,6 +394,10 @@ function enemiesTick(battle, dt) {
   for (const e of battle.enemies) {
     if (e.cells <= 0) continue;
     e.flash = Math.max(0, e.flash - dt);
+    if (e.freeze > 0) {
+      e.freeze = Math.max(0, e.freeze - dt);
+      continue;
+    }
     const dx = p.x - e.x;
     const dy = p.y - e.y;
     const d = Math.hypot(dx, dy) || 1;
@@ -313,6 +435,7 @@ function statusTick(battle, dt) {
 
 function resolveDeaths(battle) {
   const alive = [];
+  const booms = [];
   for (const e of battle.enemies) {
     if (e.cells > 0) {
       alive.push(e);
@@ -320,6 +443,10 @@ function resolveDeaths(battle) {
     }
     battle.kills += 1;
     battle.events.push({ type: 'kill', x: e.x, y: e.y, id: e.id });
+    if (e.primary) {
+      awardXp(battle, Math.max(1, Math.round(e.maxCells / XP_PER_CELL)));
+      if (hasRule(battle, 'rule_boom')) booms.push({ x: e.x, y: e.y });
+    }
     if (e.canSplit && e.primary) {
       const child = Math.max(1, Math.ceil(e.maxCells * 0.5));
       for (let i = 0; i < 2; i += 1) {
@@ -333,12 +460,24 @@ function resolveDeaths(battle) {
           locks: [],
           r: enemyRadius(child),
           status: createStatus(),
+          freeze: 0,
           flash: 0,
         });
       }
     }
   }
   battle.enemies = alive;
+
+  for (const at of booms) {
+    for (const e of alive) {
+      if (e.cells <= 0) continue;
+      if (dist(e, at) > BOOM_RADIUS) continue;
+      e.cells -= 1;
+      e.cells -= 1;
+      e.flash = 0.1;
+      battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: 2 });
+    }
+  }
 }
 
 function checkEnd(battle) {
@@ -360,11 +499,12 @@ function checkEnd(battle) {
 export function step(battle, dt) {
   if (battle.state !== 'fighting') return [];
   battle.events = [];
-  if (battle.sources.length === 0 && battle.summons.length === 0) initSources(battle);
   battle.time += dt;
   spawnTick(battle);
   playerMove(battle, dt);
   attackTick(battle, dt);
+  selfTick(battle, dt);
+  rulesTick(battle, dt);
   bulletsTick(battle, dt);
   enemiesTick(battle, dt);
   statusTick(battle, dt);
@@ -380,5 +520,3 @@ export function runToEnd(battle, { dt = 1 / 60, maxSeconds = 120 } = {}) {
   }
   return battle;
 }
-
-export { TIME_LIMIT };
