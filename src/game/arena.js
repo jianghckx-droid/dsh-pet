@@ -93,6 +93,49 @@ const fieldRadius = (battle) => FIELD_RADIUS * visionScale(battle.attrs);
 const selfRadius = (battle) => SELF_RADIUS * visionScale(battle.attrs);
 const summonRange = (battle) => SUMMON_RANGE * visionScale(battle.attrs);
 
+function makeSummon(battle, card) {
+  const hp = card.hp ?? 4;
+  return {
+    id: battle.nextId++,
+    card,
+    x: battle.player.x - 8,
+    y: battle.player.y - 8,
+    cells: hp,
+    maxCells: hp,
+    mode: card.mode ?? 'turret',
+    timer: cooldown(card.cd, battle.attrs) * 0.5,
+  };
+}
+
+function nearestSummon(battle, from, range = Infinity) {
+  let best = null;
+  let bestD = range;
+  for (const s of battle.summons) {
+    const d = dist(from, s);
+    if (d < bestD) {
+      best = s;
+      bestD = d;
+    }
+  }
+  return best;
+}
+
+function refreshOneCooldown(battle) {
+  const pool = [...battle.sources, ...battle.selfs];
+  if (pool.length === 0) return;
+  const pick = pool[Math.floor(battle.rng() * pool.length)];
+  pick.timer = 0;
+}
+
+function killSummon(battle, summon) {
+  const index = battle.summons.indexOf(summon);
+  if (index < 0) return;
+  battle.summons.splice(index, 1);
+  if (hasRule(battle, 'sacrifice')) refreshOneCooldown(battle);
+  battle.respawns.push({ card: summon.card, at: battle.time + 8 });
+  battle.events.push({ type: 'summonDown', x: summon.x, y: summon.y });
+}
+
 /** 把一张卡加进当前战斗。开局 build 与抽卡都走这里。 */
 export function addCard(battle, id) {
   const card = cardsById([id])[0];
@@ -113,13 +156,7 @@ export function addCard(battle, id) {
     return card;
   }
   if (card.carrier === 'summon') {
-    battle.summons.push({
-      id: battle.nextId++,
-      card,
-      x: battle.player.x - 8,
-      y: battle.player.y - 8,
-      timer: cooldown(card.cd, battle.attrs) * 0.5,
-    });
+    battle.summons.push(makeSummon(battle, card));
     return card;
   }
   battle.sources.push({ card, timer: cooldown(card.cd, battle.attrs) * 0.5 });
@@ -196,6 +233,7 @@ export function createBattle({
     verbs: [],
     sources: [],
     summons: [],
+    respawns: [],
     enemies: [],
     bullets: [],
     rng: mulberry32(seed),
@@ -315,6 +353,7 @@ function spawnTick(battle) {
       mark: 0,
       markLeft: 0,
       cleanseCd: 3,
+      devourCd: 6,
       flash: 0,
     });
     battle.spawned += 1;
@@ -445,16 +484,70 @@ function attackTick(battle, dt) {
     if (target) fireBullet(battle, battle.player, source.card, target);
   }
 
-  for (const summon of battle.summons) {
-    const tx = battle.player.x - 10;
-    const ty = battle.player.y - 10;
+}
+
+function summonsTick(battle, dt) {
+  const p = battle.player;
+
+  if (hasRule(battle, 'merge')) {
+    for (let i = 0; i < battle.summons.length; i += 1) {
+      for (let j = i + 1; j < battle.summons.length; j += 1) {
+        const a = battle.summons[i];
+        const b = battle.summons[j];
+        if (dist(a, b) > 10) continue;
+        a.cells += b.cells;
+        a.maxCells += b.maxCells;
+        a.merged = true;
+        battle.summons.splice(j, 1);
+        j -= 1;
+        battle.events.push({ type: 'merge', x: a.x, y: a.y });
+      }
+    }
+  }
+
+  for (let i = battle.summons.length - 1; i >= 0; i -= 1) {
+    const summon = battle.summons[i];
+
+    if (summon.mode === 'totem') {
+      summon.timer -= dt;
+      if (summon.timer > 0) continue;
+      summon.timer += cooldown(summon.card.cd, battle.attrs);
+      for (const other of battle.summons) {
+        if (other === summon) continue;
+        if (dist(summon, other) > 30) continue;
+        other.cells = Math.min(other.maxCells, other.cells + 1);
+      }
+      continue;
+    }
+
+    if (summon.mode === 'charge') {
+      const target = nearestEnemy(battle, summon, 220);
+      if (target === null) continue;
+      const d = dist(summon, target) || 1;
+      if (d <= target.r + 4) {
+        for (const e of battle.enemies) {
+          if (e.cells <= 0) continue;
+          if (dist(e, summon) > (summon.card.radius ?? 18)) continue;
+          rawHit(battle, e, summon.card.blast ?? 3);
+        }
+        battle.events.push({ type: 'blast', x: summon.x, y: summon.y });
+        killSummon(battle, summon);
+        continue;
+      }
+      summon.x += ((target.x - summon.x) / d) * 60 * dt;
+      summon.y += ((target.y - summon.y) / d) * 60 * dt;
+      continue;
+    }
+
+    const tx = p.x - 10;
+    const ty = p.y - 10;
     summon.x += (tx - summon.x) * Math.min(1, dt * 3);
     summon.y += (ty - summon.y) * Math.min(1, dt * 3);
     summon.timer -= dt;
     if (summon.timer > 0) continue;
     summon.timer += cooldown(summon.card.cd, battle.attrs);
     const target = pickTarget(battle, summon, summonRange(battle));
-    if (target) fireBullet(battle, summon, summon.card, target);
+    if (target !== null) fireBullet(battle, summon, summon.card, target);
   }
 }
 
@@ -613,6 +706,17 @@ function enemiesTick(battle, dt) {
       if (hit) wallSlam(battle, e);
       continue;
     }
+    if (e.locks.includes('devour')) {
+      e.devourCd = (e.devourCd ?? 6) - dt;
+      if (e.devourCd <= 0) {
+        e.devourCd += 6;
+        const prey = nearestSummon(battle, e, 12);
+        if (prey !== null) {
+          e.cells = Math.min(e.maxCells, e.cells + 3);
+          killSummon(battle, prey);
+        }
+      }
+    }
     const dx = p.x - e.x;
     const dy = p.y - e.y;
     const d = Math.hypot(dx, dy) || 1;
@@ -627,7 +731,16 @@ function enemiesTick(battle, dt) {
     e.attackTimer -= dt;
     if (e.attackTimer > 0) continue;
     e.attackTimer += ENEMY_ATTACK_INTERVAL;
-    const dmg = damageTaken(e.damage, battle.attrs);
+    let dmg = damageTaken(e.damage, battle.attrs);
+    if (hasRule(battle, 'link')) {
+      const linked = nearestSummon(battle, p, 40);
+      if (linked !== null) {
+        const transfer = dmg * 0.5;
+        linked.cells -= transfer;
+        dmg -= transfer;
+        if (linked.cells <= 0) killSummon(battle, linked);
+      }
+    }
     p.cells -= dmg;
     battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
     if (p.cells <= 0) {
@@ -808,8 +921,14 @@ export function step(battle, dt) {
   battle.events = [];
   battle.time += dt;
   spawnTick(battle);
+  for (let i = battle.respawns.length - 1; i >= 0; i -= 1) {
+    if (battle.time < battle.respawns[i].at) continue;
+    const dead = battle.respawns.splice(i, 1)[0];
+    if (battle.summons.length < 6) battle.summons.push(makeSummon(battle, dead.card));
+  }
   playerMove(battle, dt);
   attackTick(battle, dt);
+  summonsTick(battle, dt);
   displacementTick(battle, dt);
   if (battle.pinCd > 0) battle.pinCd -= dt;
   selfTick(battle, dt);
