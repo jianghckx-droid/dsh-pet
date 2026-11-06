@@ -15,7 +15,7 @@
 //   - 召唤物是炮台：会攻击，但不会被敌人选为目标
 //   - 分裂子体不给经验，避免刷经验
 
-import { cardsById } from './cards.js';
+import { cardById, cardsById } from './cards.js';
 import {
   ATTRIBUTES,
   BURN,
@@ -31,7 +31,7 @@ import {
   resolveHit,
   visionScale,
 } from './rules.js';
-import { FLOOR_SECONDS, enemyCells, enemyDamage, floorDef } from './floors.js';
+import { FLOOR_SECONDS, enemyCells, enemyDamage, floorDef, floorModifier } from './floors.js';
 
 export const ARENA = Object.freeze({ w: 160, h: 144 });
 export const TIME_LIMIT = 45;
@@ -186,7 +186,30 @@ function rollOffer(battle) {
   const owned = new Set(battle.cards.map((card) => card.id));
   const available = battle.pool.filter((id) => !owned.has(id));
   if (available.length === 0) return;
+
   const picked = [];
+
+  // 定向保底：上一轮死在哪把锁，这次一定给一张能解它的卡
+  if (battle.pity !== null) {
+    const counter = available.find((id) => (cardById(id)?.solves ?? []).includes(battle.pity));
+    if (counter !== undefined) {
+      picked.push(counter);
+      available.splice(available.indexOf(counter), 1);
+    }
+    battle.pity = null;
+  }
+
+  // 按家族抽：优先从同一个主题里取，保证三张能互相组合
+  if (battle.families.length > 0 && picked.length < 3) {
+    const family = battle.families[Math.floor(battle.rng() * battle.families.length)];
+    for (const id of family) {
+      if (picked.length >= 3) break;
+      if (!available.includes(id)) continue;
+      picked.push(id);
+      available.splice(available.indexOf(id), 1);
+    }
+  }
+
   while (picked.length < 3 && available.length > 0) {
     const index = Math.floor(battle.rng() * available.length);
     picked.push(available.splice(index, 1)[0]);
@@ -233,6 +256,8 @@ export function createBattle({
   pending = 0,
   extra = 0,
   cores = [],
+  families = [],
+  pity = null,
 }) {
   const def = floorDef(floor);
   const normalized = normalizeAttrs(attrs);
@@ -243,6 +268,9 @@ export function createBattle({
     attrs: normalized,
     points,
     pool: [...pool],
+    families: families.map((family) => [...family]),
+    pity,
+    modifier: floorModifier(floor),
     slots: [...drafted],
     cards: [],
     rules: [],
@@ -289,6 +317,8 @@ export function createBattle({
     chainStacks: 0,
     shieldTimer: 6,
     bloodStacks: 0,
+    stats: { damage: {}, killsByLock: {} },
+    surge: false,
     spawned: 0,
     kills: 0,
     events: [],
@@ -303,6 +333,7 @@ export function createBattle({
     battle.player.cells = Math.max(1, battle.player.cells - 3);
     refreshCooldowns(battle);
   }
+  if (battle.pending > 0) rollOffer(battle);
   return battle;
 }
 
@@ -355,15 +386,26 @@ function pickTarget(battle, from, range, excludeId = -1) {
   return best;
 }
 
+/** 本方实际要刷多少只：拥挤层 +50%，过载潮再叠加。 */
+function enemyTotal(battle) {
+  let base = battle.def.enemies;
+  if (battle.modifier === 'crowded') base = Math.round(base * 1.5);
+  return base + battle.extra;
+}
+
 function spawnTick(battle) {
-  const total = battle.def.enemies + battle.extra;
+  const total = enemyTotal(battle);
   // 额外敌人不延长层时长，而是压缩刷怪间隔，否则压力永远刷不完
   const interval = FLOOR_SECONDS / total;
   while (battle.spawned < total && battle.time >= battle.spawned * interval) {
     const index = battle.spawned;
+    const isElite = battle.modifier === 'elite' && index === total - 1;
     const lock = battle.def.locks.length ? battle.def.locks[index % battle.def.locks.length] : null;
-    const locks = lock ? [lock] : [];
-    const cells = enemyCells(battle.floor, locks);
+    const locks = isElite ? ['carapace', 'phase'] : lock ? [lock] : [];
+    let cells = isElite
+      ? Math.round(enemyCells(battle.floor, []) * 3)
+      : enemyCells(battle.floor, locks);
+    if (!isElite && battle.modifier === 'crowded') cells = Math.round(cells * 0.7);
     const at = spawnPoint(battle.rng);
     battle.enemies.push({
       id: battle.nextId++,
@@ -374,11 +416,13 @@ function spawnTick(battle) {
       locks,
       primary: true,
       canSplit: lock === 'split',
+      elite: isElite,
       r: enemyRadius(cells),
       speed:
         (ENEMY_SPEED_BASE + battle.floor * ENEMY_SPEED_PER_FLOOR + battle.rng() * 4) *
-        (locks.includes('anchor') ? 0.7 : 1),
-      damage: enemyDamage(battle.floor),
+        (locks.includes('anchor') ? 0.7 : 1) *
+        (battle.modifier === 'frenzy' ? 1.3 : 1),
+      damage: enemyDamage(battle.floor) + (battle.modifier === 'frenzy' ? 1 : 0),
       attackTimer: ENEMY_ATTACK_INTERVAL,
       status: createStatus(),
       freeze: 0,
@@ -448,13 +492,19 @@ function applyDamage(enemy, amount) {
   return left;
 }
 
-function rawHit(battle, enemy, cells, burn = 0) {
+function recordDamage(battle, id, amount) {
+  if (!(amount > 0)) return;
+  battle.stats.damage[id] = (battle.stats.damage[id] ?? 0) + amount;
+}
+
+function rawHit(battle, enemy, cells, burn = 0, source = 'bullet') {
   if ((enemy.invuln ?? 0) > 0) {
     battle.events.push({ type: 'phase', x: enemy.x, y: enemy.y });
     return 0;
   }
   const dealt = resolveHit(enemy, cells, { main: true });
-  applyDamage(enemy, dealt);
+  const applied = applyDamage(enemy, dealt);
+  recordDamage(battle, source, applied);
   enemy.flash = 0.12;
   if (burn) applyBurn(enemy.status, burn, battle.burnCap);
   battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
@@ -472,7 +522,7 @@ function hitEnemy(battle, enemy, card) {
     cells += battle.bloodStacks;
     battle.bloodStacks = 0;
   }
-  rawHit(battle, enemy, cells, card.burn ?? 0);
+  rawHit(battle, enemy, cells, card.burn ?? 0, card.id ?? 'bullet');
 
   if (card.mark) addMark(enemy, card.mark);
   if (hasRule(battle, 'mark_hunter')) addMark(enemy, 1);
@@ -501,7 +551,7 @@ function hitEnemy(battle, enemy, card) {
     battle.hitCount += 1;
     if (battle.hitCount % COMBO_EVERY === 0) {
       const extra = pickTarget(battle, battle.player, orbRange(battle), enemy.id);
-      if (extra !== null && extra.cells > 0) rawHit(battle, extra, 1);
+      if (extra !== null && extra.cells > 0) rawHit(battle, extra, 1, 0, 'combo');
     }
   }
 }
@@ -534,6 +584,7 @@ function pulse(battle, card) {
 
 function attackTick(battle, dt) {
   for (const source of battle.sources) {
+    if (battle.modifier === 'silent' && source.card.carrier === 'field') continue;
     source.timer -= dt;
     if (source.timer > 0) continue;
     source.timer += cardCooldown(battle, source.card.cd);
@@ -594,7 +645,7 @@ function summonsTick(battle, dt) {
         for (const e of battle.enemies) {
           if (e.cells <= 0) continue;
           if (dist(e, summon) > (summon.card.radius ?? 18)) continue;
-          rawHit(battle, e, summon.card.blast ?? 3);
+          rawHit(battle, e, summon.card.blast ?? 3, 0, summon.card.id);
         }
         battle.events.push({ type: 'blast', x: summon.x, y: summon.y });
         killSummon(battle, summon);
@@ -660,7 +711,7 @@ function burstShield(battle) {
   for (const e of battle.enemies) {
     if (e.cells <= 0) continue;
     if (dist(battle.player, e) > 24) continue;
-    rawHit(battle, e, 3);
+    rawHit(battle, e, 3, 0, 'burst');
   }
   battle.events.push({ type: 'burst', x: battle.player.x, y: battle.player.y });
 }
@@ -694,7 +745,7 @@ function trapTick(battle, dt) {
       for (const e of battle.enemies) {
         if (e.cells <= 0) continue;
         if (dist(trap, e) > trap.card.radius + e.r) continue;
-        if (trap.card.cells) rawHit(battle, e, trap.card.cells);
+        if (trap.card.cells) rawHit(battle, e, trap.card.cells, 0, trap.card.id);
         if (trap.card.burn) applyBurn(e.status, trap.card.burn, battle.burnCap);
         if (trap.card.freeze) e.freeze = Math.max(e.freeze, trap.card.freeze);
       }
@@ -721,8 +772,7 @@ function trapTick(battle, dt) {
       for (const e of battle.enemies) {
         if (e.cells <= 0) continue;
         if (dist(trail, e) > trail.card.radius + e.r) continue;
-        rawHit(battle, e, trail.card.cells);
-        if (trail.card.burn) applyBurn(e.status, trail.card.burn, battle.burnCap);
+        rawHit(battle, e, trail.card.cells, trail.card.burn ?? 0, trail.card.id);
       }
     }
     if (trail.ttl <= 0) battle.trails.splice(i, 1);
@@ -780,7 +830,7 @@ function wallSlam(battle, enemy) {
   if (!hasRule(battle, 'rule_wall_slam')) return;
   if (enemy.wallCd > 0) return;
   enemy.wallCd = 1;
-  applyDamage(enemy, 2);
+  recordDamage(battle, 'wall', applyDamage(enemy, 2));
   battle.events.push({ type: 'wall', x: enemy.x, y: enemy.y });
 }
 
@@ -813,7 +863,7 @@ function displacementTick(battle, dt) {
         if (e.cells <= 0 || e.locks.includes('anchor')) continue;
         const d = dist(p, e) || 1;
         if (d > radius) continue;
-        rawHit(battle, e, verb.card.cells);
+        rawHit(battle, e, verb.card.cells, 0, verb.card.id);
         const hit = placeEnemy(
           e,
           e.x + ((e.x - p.x) / d) * verb.card.strength,
@@ -964,7 +1014,7 @@ function statusTick(battle, dt) {
     const burn = advanceStatus(e.status, dt);
     if (burn <= 0) continue;
     const dealt = resolveHit(e, burn, { main: false });
-    applyDamage(e, dealt);
+    recordDamage(battle, 'burn', applyDamage(e, dealt));
     battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: dealt });
   }
 }
@@ -986,9 +1036,17 @@ function resolveDeaths(battle) {
       continue;
     }
     battle.kills += 1;
+    battle.stats.kills = (battle.stats.kills ?? 0) + 1;
+    for (const lock of e.locks) {
+      battle.stats.killsByLock[lock] = (battle.stats.killsByLock[lock] ?? 0) + 1;
+    }
     battle.events.push({ type: 'kill', x: e.x, y: e.y, id: e.id });
     if (e.primary) {
       awardXp(battle, Math.max(1, Math.round(e.maxCells / XP_PER_CELL)));
+      if (e.elite) {
+        battle.pending += 1;
+        battle.events.push({ type: 'elite', x: e.x, y: e.y });
+      }
       if (hasRule(battle, 'rule_boom')) booms.push({ x: e.x, y: e.y });
       if (hasCore(battle, 'core_siphon')) {
         battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + 1);
@@ -1045,7 +1103,7 @@ function resolveDeaths(battle) {
       for (const other of alive) {
         if (other.cells <= 0) continue;
         if (Math.hypot(other.x - mark.x, other.y - mark.y) > 18) continue;
-        applyDamage(other, mark.stacks);
+        recordDamage(battle, 'fuse', applyDamage(other, mark.stacks));
         battle.events.push({ type: 'burn', x: other.x, y: other.y, cells: mark.stacks });
       }
     }
@@ -1065,8 +1123,7 @@ function resolveDeaths(battle) {
     for (const e of alive) {
       if (e.cells <= 0) continue;
       if (dist(e, at) > BOOM_RADIUS) continue;
-      applyDamage(e, 1);
-      applyDamage(e, 1);
+      recordDamage(battle, 'boom', applyDamage(e, 1) + applyDamage(e, 1));
       e.flash = 0.1;
       battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: 2 });
     }
@@ -1079,8 +1136,14 @@ function checkEnd(battle) {
     battle.state = 'dead';
     return;
   }
-  if (battle.spawned >= battle.def.enemies + battle.extra && battle.enemies.length === 0) {
+  if (battle.spawned >= enemyTotal(battle) && battle.enemies.length === 0) {
     battle.state = 'cleared';
+    if (battle.surge) {
+      battle.surge = false;
+      battle.pending += 1;
+      rollOffer(battle);
+      battle.events.push({ type: 'surgeReward' });
+    }
     return;
   }
   if (battle.time >= TIME_LIMIT) {
@@ -1096,6 +1159,15 @@ export function addPressure(battle, count) {
   battle.extra = Math.min(MAX_EXTRA, battle.extra + add);
   if (battle.extra > before) battle.events.push({ type: 'pressure', extra: battle.extra });
   return battle.extra - before;
+}
+
+/** 过载潮：token 攒满时来一波额外的怪，清层后给一次三选一。 */
+export function triggerSurge(battle, extra = 6) {
+  if (battle.state !== 'fighting' || battle.surge) return false;
+  addPressure(battle, extra);
+  battle.surge = true;
+  battle.events.push({ type: 'surge' });
+  return true;
 }
 
 /** 花 1 点属性。体魄当场提高上限并补回等量生命。 */

@@ -835,10 +835,14 @@ window.__ModuleLoader__.load({
 
     function cardsById(ids) {
       return ids.map((id) => {
-        const card = CARDS[id] ?? CORE_CARDS[id];
+        const card = cardById(id);
         if (card === undefined) throw new Error(`unknown card: ${id}`);
         return card;
       });
+    }
+
+    function cardById(id) {
+      return CARDS[id] ?? CORE_CARDS[id];
     }
 
     // ---- floors.js ----
@@ -851,6 +855,20 @@ window.__ModuleLoader__.load({
     // 同时带两个锁的怪留给以后（倍率相乘已经是按这个设计的）。
 
     const FLOOR_SECONDS = 26;
+
+    /** 层修饰符：让同一套 build 在不同层表现不同。 */
+    const MODIFIERS = Object.freeze({
+      crowded: Object.freeze({ name: '拥挤', desc: '敌人 +50%，血量 −30%' }),
+      frenzy: Object.freeze({ name: '狂暴', desc: '敌人移速 +30%，伤害 +1' }),
+      silent: Object.freeze({ name: '静默', desc: '领域类卡失效' }),
+      elite: Object.freeze({ name: '精英', desc: '最后一只怪带双锁，击杀给一次三选一' }),
+    });
+
+    const FLOOR_MODIFIERS = Object.freeze({ 4: 'crowded', 7: 'frenzy', 10: 'silent', 13: 'elite' });
+
+    function floorModifier(floor) {
+      return FLOOR_MODIFIERS[floor] ?? null;
+    }
 
     /** 锁对格数的倍率。一只怪带多个锁时相乘。 */
     const LOCK_CELLS = Object.freeze({
@@ -1089,7 +1107,30 @@ window.__ModuleLoader__.load({
       const owned = new Set(battle.cards.map((card) => card.id));
       const available = battle.pool.filter((id) => !owned.has(id));
       if (available.length === 0) return;
+
       const picked = [];
+
+      // 定向保底：上一轮死在哪把锁，这次一定给一张能解它的卡
+      if (battle.pity !== null) {
+        const counter = available.find((id) => (cardById(id)?.solves ?? []).includes(battle.pity));
+        if (counter !== undefined) {
+          picked.push(counter);
+          available.splice(available.indexOf(counter), 1);
+        }
+        battle.pity = null;
+      }
+
+      // 按家族抽：优先从同一个主题里取，保证三张能互相组合
+      if (battle.families.length > 0 && picked.length < 3) {
+        const family = battle.families[Math.floor(battle.rng() * battle.families.length)];
+        for (const id of family) {
+          if (picked.length >= 3) break;
+          if (!available.includes(id)) continue;
+          picked.push(id);
+          available.splice(available.indexOf(id), 1);
+        }
+      }
+
       while (picked.length < 3 && available.length > 0) {
         const index = Math.floor(battle.rng() * available.length);
         picked.push(available.splice(index, 1)[0]);
@@ -1136,6 +1177,8 @@ window.__ModuleLoader__.load({
       pending = 0,
       extra = 0,
       cores = [],
+      families = [],
+      pity = null,
     }) {
       const def = floorDef(floor);
       const normalized = normalizeAttrs(attrs);
@@ -1146,6 +1189,9 @@ window.__ModuleLoader__.load({
         attrs: normalized,
         points,
         pool: [...pool],
+        families: families.map((family) => [...family]),
+        pity,
+        modifier: floorModifier(floor),
         slots: [...drafted],
         cards: [],
         rules: [],
@@ -1192,6 +1238,8 @@ window.__ModuleLoader__.load({
         chainStacks: 0,
         shieldTimer: 6,
         bloodStacks: 0,
+        stats: { damage: {}, killsByLock: {} },
+        surge: false,
         spawned: 0,
         kills: 0,
         events: [],
@@ -1206,6 +1254,7 @@ window.__ModuleLoader__.load({
         battle.player.cells = Math.max(1, battle.player.cells - 3);
         refreshCooldowns(battle);
       }
+      if (battle.pending > 0) rollOffer(battle);
       return battle;
     }
 
@@ -1258,15 +1307,26 @@ window.__ModuleLoader__.load({
       return best;
     }
 
+    /** 本方实际要刷多少只：拥挤层 +50%，过载潮再叠加。 */
+    function enemyTotal(battle) {
+      let base = battle.def.enemies;
+      if (battle.modifier === 'crowded') base = Math.round(base * 1.5);
+      return base + battle.extra;
+    }
+
     function spawnTick(battle) {
-      const total = battle.def.enemies + battle.extra;
+      const total = enemyTotal(battle);
       // 额外敌人不延长层时长，而是压缩刷怪间隔，否则压力永远刷不完
       const interval = FLOOR_SECONDS / total;
       while (battle.spawned < total && battle.time >= battle.spawned * interval) {
         const index = battle.spawned;
+        const isElite = battle.modifier === 'elite' && index === total - 1;
         const lock = battle.def.locks.length ? battle.def.locks[index % battle.def.locks.length] : null;
-        const locks = lock ? [lock] : [];
-        const cells = enemyCells(battle.floor, locks);
+        const locks = isElite ? ['carapace', 'phase'] : lock ? [lock] : [];
+        let cells = isElite
+          ? Math.round(enemyCells(battle.floor, []) * 3)
+          : enemyCells(battle.floor, locks);
+        if (!isElite && battle.modifier === 'crowded') cells = Math.round(cells * 0.7);
         const at = spawnPoint(battle.rng);
         battle.enemies.push({
           id: battle.nextId++,
@@ -1277,11 +1337,13 @@ window.__ModuleLoader__.load({
           locks,
           primary: true,
           canSplit: lock === 'split',
+          elite: isElite,
           r: enemyRadius(cells),
           speed:
             (ENEMY_SPEED_BASE + battle.floor * ENEMY_SPEED_PER_FLOOR + battle.rng() * 4) *
-            (locks.includes('anchor') ? 0.7 : 1),
-          damage: enemyDamage(battle.floor),
+            (locks.includes('anchor') ? 0.7 : 1) *
+            (battle.modifier === 'frenzy' ? 1.3 : 1),
+          damage: enemyDamage(battle.floor) + (battle.modifier === 'frenzy' ? 1 : 0),
           attackTimer: ENEMY_ATTACK_INTERVAL,
           status: createStatus(),
           freeze: 0,
@@ -1351,13 +1413,19 @@ window.__ModuleLoader__.load({
       return left;
     }
 
-    function rawHit(battle, enemy, cells, burn = 0) {
+    function recordDamage(battle, id, amount) {
+      if (!(amount > 0)) return;
+      battle.stats.damage[id] = (battle.stats.damage[id] ?? 0) + amount;
+    }
+
+    function rawHit(battle, enemy, cells, burn = 0, source = 'bullet') {
       if ((enemy.invuln ?? 0) > 0) {
         battle.events.push({ type: 'phase', x: enemy.x, y: enemy.y });
         return 0;
       }
       const dealt = resolveHit(enemy, cells, { main: true });
-      applyDamage(enemy, dealt);
+      const applied = applyDamage(enemy, dealt);
+      recordDamage(battle, source, applied);
       enemy.flash = 0.12;
       if (burn) applyBurn(enemy.status, burn, battle.burnCap);
       battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
@@ -1375,7 +1443,7 @@ window.__ModuleLoader__.load({
         cells += battle.bloodStacks;
         battle.bloodStacks = 0;
       }
-      rawHit(battle, enemy, cells, card.burn ?? 0);
+      rawHit(battle, enemy, cells, card.burn ?? 0, card.id ?? 'bullet');
 
       if (card.mark) addMark(enemy, card.mark);
       if (hasRule(battle, 'mark_hunter')) addMark(enemy, 1);
@@ -1404,7 +1472,7 @@ window.__ModuleLoader__.load({
         battle.hitCount += 1;
         if (battle.hitCount % COMBO_EVERY === 0) {
           const extra = pickTarget(battle, battle.player, orbRange(battle), enemy.id);
-          if (extra !== null && extra.cells > 0) rawHit(battle, extra, 1);
+          if (extra !== null && extra.cells > 0) rawHit(battle, extra, 1, 0, 'combo');
         }
       }
     }
@@ -1437,6 +1505,7 @@ window.__ModuleLoader__.load({
 
     function attackTick(battle, dt) {
       for (const source of battle.sources) {
+        if (battle.modifier === 'silent' && source.card.carrier === 'field') continue;
         source.timer -= dt;
         if (source.timer > 0) continue;
         source.timer += cardCooldown(battle, source.card.cd);
@@ -1497,7 +1566,7 @@ window.__ModuleLoader__.load({
             for (const e of battle.enemies) {
               if (e.cells <= 0) continue;
               if (dist(e, summon) > (summon.card.radius ?? 18)) continue;
-              rawHit(battle, e, summon.card.blast ?? 3);
+              rawHit(battle, e, summon.card.blast ?? 3, 0, summon.card.id);
             }
             battle.events.push({ type: 'blast', x: summon.x, y: summon.y });
             killSummon(battle, summon);
@@ -1563,7 +1632,7 @@ window.__ModuleLoader__.load({
       for (const e of battle.enemies) {
         if (e.cells <= 0) continue;
         if (dist(battle.player, e) > 24) continue;
-        rawHit(battle, e, 3);
+        rawHit(battle, e, 3, 0, 'burst');
       }
       battle.events.push({ type: 'burst', x: battle.player.x, y: battle.player.y });
     }
@@ -1597,7 +1666,7 @@ window.__ModuleLoader__.load({
           for (const e of battle.enemies) {
             if (e.cells <= 0) continue;
             if (dist(trap, e) > trap.card.radius + e.r) continue;
-            if (trap.card.cells) rawHit(battle, e, trap.card.cells);
+            if (trap.card.cells) rawHit(battle, e, trap.card.cells, 0, trap.card.id);
             if (trap.card.burn) applyBurn(e.status, trap.card.burn, battle.burnCap);
             if (trap.card.freeze) e.freeze = Math.max(e.freeze, trap.card.freeze);
           }
@@ -1624,8 +1693,7 @@ window.__ModuleLoader__.load({
           for (const e of battle.enemies) {
             if (e.cells <= 0) continue;
             if (dist(trail, e) > trail.card.radius + e.r) continue;
-            rawHit(battle, e, trail.card.cells);
-            if (trail.card.burn) applyBurn(e.status, trail.card.burn, battle.burnCap);
+            rawHit(battle, e, trail.card.cells, trail.card.burn ?? 0, trail.card.id);
           }
         }
         if (trail.ttl <= 0) battle.trails.splice(i, 1);
@@ -1683,7 +1751,7 @@ window.__ModuleLoader__.load({
       if (!hasRule(battle, 'rule_wall_slam')) return;
       if (enemy.wallCd > 0) return;
       enemy.wallCd = 1;
-      applyDamage(enemy, 2);
+      recordDamage(battle, 'wall', applyDamage(enemy, 2));
       battle.events.push({ type: 'wall', x: enemy.x, y: enemy.y });
     }
 
@@ -1716,7 +1784,7 @@ window.__ModuleLoader__.load({
             if (e.cells <= 0 || e.locks.includes('anchor')) continue;
             const d = dist(p, e) || 1;
             if (d > radius) continue;
-            rawHit(battle, e, verb.card.cells);
+            rawHit(battle, e, verb.card.cells, 0, verb.card.id);
             const hit = placeEnemy(
               e,
               e.x + ((e.x - p.x) / d) * verb.card.strength,
@@ -1867,7 +1935,7 @@ window.__ModuleLoader__.load({
         const burn = advanceStatus(e.status, dt);
         if (burn <= 0) continue;
         const dealt = resolveHit(e, burn, { main: false });
-        applyDamage(e, dealt);
+        recordDamage(battle, 'burn', applyDamage(e, dealt));
         battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: dealt });
       }
     }
@@ -1889,9 +1957,17 @@ window.__ModuleLoader__.load({
           continue;
         }
         battle.kills += 1;
+        battle.stats.kills = (battle.stats.kills ?? 0) + 1;
+        for (const lock of e.locks) {
+          battle.stats.killsByLock[lock] = (battle.stats.killsByLock[lock] ?? 0) + 1;
+        }
         battle.events.push({ type: 'kill', x: e.x, y: e.y, id: e.id });
         if (e.primary) {
           awardXp(battle, Math.max(1, Math.round(e.maxCells / XP_PER_CELL)));
+          if (e.elite) {
+            battle.pending += 1;
+            battle.events.push({ type: 'elite', x: e.x, y: e.y });
+          }
           if (hasRule(battle, 'rule_boom')) booms.push({ x: e.x, y: e.y });
           if (hasCore(battle, 'core_siphon')) {
             battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + 1);
@@ -1948,7 +2024,7 @@ window.__ModuleLoader__.load({
           for (const other of alive) {
             if (other.cells <= 0) continue;
             if (Math.hypot(other.x - mark.x, other.y - mark.y) > 18) continue;
-            applyDamage(other, mark.stacks);
+            recordDamage(battle, 'fuse', applyDamage(other, mark.stacks));
             battle.events.push({ type: 'burn', x: other.x, y: other.y, cells: mark.stacks });
           }
         }
@@ -1968,8 +2044,7 @@ window.__ModuleLoader__.load({
         for (const e of alive) {
           if (e.cells <= 0) continue;
           if (dist(e, at) > BOOM_RADIUS) continue;
-          applyDamage(e, 1);
-          applyDamage(e, 1);
+          recordDamage(battle, 'boom', applyDamage(e, 1) + applyDamage(e, 1));
           e.flash = 0.1;
           battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: 2 });
         }
@@ -1982,8 +2057,14 @@ window.__ModuleLoader__.load({
         battle.state = 'dead';
         return;
       }
-      if (battle.spawned >= battle.def.enemies + battle.extra && battle.enemies.length === 0) {
+      if (battle.spawned >= enemyTotal(battle) && battle.enemies.length === 0) {
         battle.state = 'cleared';
+        if (battle.surge) {
+          battle.surge = false;
+          battle.pending += 1;
+          rollOffer(battle);
+          battle.events.push({ type: 'surgeReward' });
+        }
         return;
       }
       if (battle.time >= TIME_LIMIT) {
@@ -1999,6 +2080,15 @@ window.__ModuleLoader__.load({
       battle.extra = Math.min(MAX_EXTRA, battle.extra + add);
       if (battle.extra > before) battle.events.push({ type: 'pressure', extra: battle.extra });
       return battle.extra - before;
+    }
+
+    /** 过载潮：token 攒满时来一波额外的怪，清层后给一次三选一。 */
+    function triggerSurge(battle, extra = 6) {
+      if (battle.state !== 'fighting' || battle.surge) return false;
+      addPressure(battle, extra);
+      battle.surge = true;
+      battle.events.push({ type: 'surge' });
+      return true;
     }
 
     /** 花 1 点属性。体魄当场提高上限并补回等量生命。 */
@@ -2117,6 +2207,15 @@ window.__ModuleLoader__.load({
         label: '实验',
         cards: ['orb_phys', 'orb_fire', 'field_fire'],
         pool: [...LAB_PACK],
+        families: [
+          [...FIRE_PACK],
+          [...GRAVITY_PACK],
+          [...MARK_PACK],
+          [...SUMMON_PACK],
+          [...TIME_PACK],
+          [...RISK_PACK],
+          [...ENV_PACK],
+        ],
       },
     }
 
@@ -2158,6 +2257,7 @@ window.__ModuleLoader__.load({
       '.dsh-pet-cells{height:4px;background:#18212b;border-radius:2px;overflow:hidden}',
       '.dsh-pet-cells i{display:block;height:100%;background:#6ee7a8;transition:width .12s linear}',
       '.dsh-pet-bottom{display:flex;gap:8px;color:#6c8091;font-size:10px}',
+      '.dsh-pet-hot{color:#e35d5d}',
       '.dsh-pet-offer{position:absolute;left:5px;right:5px;bottom:5px;display:flex;flex-direction:column;gap:3px;',
       'background:rgba(10,14,20,.94);border:1px solid #2a3a4a;border-radius:5px;padding:5px}',
       '.dsh-pet-offer-title{font-size:9px;color:#ffd166;letter-spacing:.08em}',
@@ -2254,6 +2354,11 @@ window.__ModuleLoader__.load({
     function pushTokens(entry, delta) {
       if (!Number.isFinite(delta) || delta <= 0) return
       entry.tokenQueue += delta
+      entry.surgeMeter += delta
+      if (entry.surgeMeter >= 3000) {
+        entry.surgeMeter -= 3000
+        if (entry.battle !== null && entry.phase === 'fight') triggerSurge(entry.battle)
+      }
       drainTokens(entry)
     }
 
@@ -2293,8 +2398,11 @@ window.__ModuleLoader__.load({
         pending: entry.pending,
         seed: entry.seed++,
         pool: build.pool,
+        families: build.families,
+        pity: entry.pity,
         drafted: entry.drafted,
       })
+      entry.pity = null
       drainTokens(entry)
     }
 
@@ -2316,6 +2424,9 @@ window.__ModuleLoader__.load({
         pending: 0,
         tokenQueue: 0,
         tokenSeen: new Map(),
+        surgeMeter: 0,
+        pity: null,
+        dropped: null,
         phase: 'fight',
         lastResult: null,
         resultTimer: 0,
@@ -2347,7 +2458,16 @@ window.__ModuleLoader__.load({
     function advance(entry) {
       const cleared = entry.lastResult !== null && entry.lastResult.kind === 'cleared'
       if (!cleared) {
-        resetRun(entry, 1)
+        // 失败不再回第 1 层：停在失败层，保留 build 与属性，
+        // 下一次三选一保底给一张能解致死锁的卡。
+        const def = floorDef(entry.floor)
+        entry.pity = def.locks.length > 0 ? def.locks[0] : null
+        syncAccount(entry)
+        // 槽位满时没有地方放保底卡：弃置最早的一张，换一次重抽机会
+        if (entry.drafted.length >= 3) entry.dropped = entry.drafted.shift()
+        entry.pending = 1
+        entry.battle = null
+        startFloor(entry, entry.floor)
         return
       }
       // 没选的三选一跨层保留，否则玩家一不留神就丢了这次升级。
@@ -2602,16 +2722,54 @@ window.__ModuleLoader__.load({
 
     // ---- 诊断 ----
 
+    const LOCK_NAMES = {
+      carapace: '甲壳',
+      split: '分裂',
+      regen: '再生',
+      shield: '护盾',
+      anchor: '锚定',
+      cleanse: '净化',
+      devour: '吞噬',
+      phase: '相位',
+      reflect: '反射',
+      generator: '发生器',
+    }
+
+    const DAMAGE_LABELS = {
+      burn: '灼烧',
+      wall: '撞墙',
+      boom: '尸爆',
+      fuse: '引信',
+      burst: '护盾爆',
+      combo: '连击',
+      bullet: '弹丸',
+    }
+
+    function damageReport(entry) {
+      const battle = entry.battle
+      if (battle === null) return ''
+      const entries = Object.entries(battle.stats.damage)
+      if (entries.length === 0) return ''
+      entries.sort((a, b) => b[1] - a[1])
+      const total = entries.reduce((sum, [, value]) => sum + value, 0) || 1
+      return entries
+        .slice(0, 3)
+        .map(([id, value]) => {
+          const card = cardById(id)
+          const name = card !== undefined ? card.name : DAMAGE_LABELS[id] ?? id
+          return name + ' ' + Math.round((value / total) * 100) + '%'
+        })
+        .join(' / ')
+    }
+
     function diagnose(entry) {
       const r = entry.lastResult
       if (r === null) return ''
       if (r.kind === 'cleared') return '进入第 ' + (entry.floor + 1) + ' 层'
       const def = floorDef(r.floor)
       const lock = def.locks.length > 0 ? def.locks[0] : null
-      if (lock === 'carapace') {
-        return entry.buildId === 'pure'
-          ? '锁：甲壳（单次最多 1 格）。锋锐被完全浪费，换灼烧。'
-          : '锁：甲壳。灼烧能穿过去，但这一层的厚度压过了输出。'
+      if (lock !== null) {
+        return '死因：' + (LOCK_NAMES[lock] ?? lock) + ' · 重试保底给解卡'
       }
       return TIME_LIMIT + ' 秒内没清完：输出不够。'
     }
@@ -2741,6 +2899,7 @@ window.__ModuleLoader__.load({
       const unlocked = unlockedCores(entry.stats)
       const result = entry.phase === 'result' ? entry.lastResult : null
       const lockName = battle !== null && battle.def.locks.length > 0 ? battle.def.locks[0] : '—'
+      const modifier = battle !== null ? battle.modifier : floorModifier(entry.floor)
 
       return h('div', { className: 'dsh-pet' },
         h('style', { key: 'style' }, CSS),
@@ -2749,6 +2908,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsh-pet-muted' }, 'Lv.' + (battle === null ? 1 : battle.level)),
           h('span', { className: 'dsh-pet-muted' }, '最佳 ' + entry.best),
           h('span', { className: 'dsh-pet-muted' }, '锁 ' + lockName),
+          modifier !== null ? h('span', { className: 'dsh-pet-hot' }, MODIFIERS[modifier].name) : null,
           h('span', { className: 'dsh-pet-spacer' }),
           h('span', { className: 'dsh-pet-muted' }, build.label),
           h('span', { className: 'dsh-pet-dot' + (entry.online ? ' on' : '') }),
@@ -2761,6 +2921,7 @@ window.__ModuleLoader__.load({
                   className: 'dsh-pet-overlay-title ' + (result.kind === 'cleared' ? 'good' : 'bad'),
                 }, result.kind === 'cleared' ? '清层' : result.kind === 'dead' ? '阵亡' : '超时'),
                 h('div', { className: 'dsh-pet-overlay-sub' }, diagnose(entry)),
+                h('div', { className: 'dsh-pet-overlay-sub' }, damageReport(entry)),
               )
             : null,
           result === null && battle !== null && battle.offer !== null
@@ -2839,6 +3000,7 @@ window.__ModuleLoader__.load({
           h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
           h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
           h('span', null, '压力 +' + (battle === null ? 0 : battle.extra)),
+          battle !== null && battle.surge ? h('span', { className: 'dsh-pet-hot' }, '过载') : null,
           battle !== null && battle.player.shield > 0
             ? h('span', null, '盾 ' + Math.ceil(battle.player.shield))
             : null,
@@ -2905,7 +3067,22 @@ window.__ModuleLoader__.load({
         )
       },
       // 供 node --test 验证接入路径；运行时不使用。
-      __debug: { createEntry, tick, startFloor, draw, BUILDS, pickCard, awardXp, chooseCard, spend, pushTokens, toggleCore, unlockedCores },
+      __debug: {
+        createEntry,
+        tick,
+        startFloor,
+        draw,
+        BUILDS,
+        pickCard,
+        awardXp,
+        chooseCard,
+        spend,
+        pushTokens,
+        toggleCore,
+        unlockedCores,
+        advance,
+        damageReport,
+      },
     }
   },
 })

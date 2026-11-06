@@ -678,8 +678,12 @@ export function unlockedCores(stats) {
 
 export function cardsById(ids) {
   return ids.map((id) => {
-    const card = CARDS[id] ?? CORE_CARDS[id];
+    const card = cardById(id);
     if (card === undefined) throw new Error(`unknown card: ${id}`);
     return card;
   });
+}
+
+export function cardById(id) {
+  return CARDS[id] ?? CORE_CARDS[id];
 }

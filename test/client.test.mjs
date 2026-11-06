@@ -197,3 +197,29 @@ test('核心槽：未解锁拒绝，通关后解锁并能装备', () => {
   const again = createEntry('core-key', 7);
   assert.ok(again.cores.includes('core_anchor'), 'equipped core must persist');
 });
+
+test('失败后停在原层重试，并保底给解卡', () => {
+  const { createEntry, startFloor, advance } = loadModule().__debug;
+  const entry = createEntry('retry-key', 7);
+  entry.floor = 6;
+  startFloor(entry, 6);
+  entry.drafted = ['orb_fire'];
+  entry.battle.pending = 1;
+  entry.lastResult = { kind: 'dead', floor: 6 };
+  entry.phase = 'result';
+  advance(entry);
+  assert.equal(entry.floor, 6);
+  assert.equal(entry.battle.floor, 6);
+  assert.ok(entry.drafted.includes('orb_fire'));
+  assert.ok(entry.battle.offer !== null, 'expected the pity offer');
+  const solvers = ['orb_fire', 'field_fire', 'summon_fire', 'self_fire'];
+  assert.ok(entry.battle.offer.some((id) => solvers.includes(id)));
+});
+
+test('token 过载潮：攒满触发', () => {
+  const { createEntry, pushTokens } = loadModule().__debug;
+  const entry = createEntry('surge-key', 7);
+  assert.equal(entry.battle.surge, false);
+  pushTokens(entry, 3000);
+  assert.equal(entry.battle.surge, true);
+});

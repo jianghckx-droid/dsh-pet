@@ -8,6 +8,20 @@
 
 export const FLOOR_SECONDS = 26;
 
+/** 层修饰符：让同一套 build 在不同层表现不同。 */
+export const MODIFIERS = Object.freeze({
+  crowded: Object.freeze({ name: '拥挤', desc: '敌人 +50%，血量 −30%' }),
+  frenzy: Object.freeze({ name: '狂暴', desc: '敌人移速 +30%，伤害 +1' }),
+  silent: Object.freeze({ name: '静默', desc: '领域类卡失效' }),
+  elite: Object.freeze({ name: '精英', desc: '最后一只怪带双锁，击杀给一次三选一' }),
+});
+
+const FLOOR_MODIFIERS = Object.freeze({ 4: 'crowded', 7: 'frenzy', 10: 'silent', 13: 'elite' });
+
+export function floorModifier(floor) {
+  return FLOOR_MODIFIERS[floor] ?? null;
+}
+
 /** 锁对格数的倍率。一只怪带多个锁时相乘。 */
 export const LOCK_CELLS = Object.freeze({
   carapace: 2,
