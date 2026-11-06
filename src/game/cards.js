@@ -143,9 +143,125 @@ export const FIRE_PACK = Object.freeze([
 /** 灼烧包的开局 build（模拟器与单测用）。 */
 export const FIRE_BUILD = Object.freeze(['orb_phys', 'orb_fire', 'field_fire', 'summon_fire']);
 
+// ---- 核心卡（跨包、跨轮，永久槽）----
+// 与普通卡不同：核心不占抽卡槽，进战斗时直接挂上，改变的是"规则"。
+
+export const CORE_CARDS = Object.freeze({
+  core_anchor: Object.freeze({
+    id: 'core_anchor',
+    name: '时锚',
+    carrier: 'core',
+    effect: 'control',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['core', 'control']),
+    desc: '开局 3 秒内刷出的敌人被冻结 3 秒',
+  }),
+  core_ember: Object.freeze({
+    id: 'core_ember',
+    name: '余烬之种',
+    carrier: 'core',
+    effect: 'fire',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['core', 'fire']),
+    desc: '灼烧上限 +2；灼烧目标死亡时传给 3 个敌人',
+  }),
+  core_echo: Object.freeze({
+    id: 'core_echo',
+    name: '回响',
+    carrier: 'core',
+    effect: 'time',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['core', 'cooldown']),
+    desc: '每击杀 8 个敌人，立刻刷新所有冷却',
+  }),
+  core_siphon: Object.freeze({
+    id: 'core_siphon',
+    name: '汲取',
+    carrier: 'core',
+    effect: 'life',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['core', 'heal']),
+    desc: '每次击杀回复 1 格生命',
+  }),
+  core_hunter: Object.freeze({
+    id: 'core_hunter',
+    name: '猎手',
+    carrier: 'core',
+    effect: 'mind',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['core', 'target']),
+    desc: '优先攻击当前格数最低的敌人',
+  }),
+  core_pierce: Object.freeze({
+    id: 'core_pierce',
+    name: '磁力',
+    carrier: 'core',
+    effect: 'phys',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['core', 'pierce']),
+    desc: '弹丸命中后额外穿透 1 个目标',
+  }),
+});
+
+/** 解锁条件是行为式的；stats 由客户端累计。 */
+export const CORES = Object.freeze([
+  Object.freeze({
+    id: 'core_anchor',
+    cond: (s) => s.bestFloor >= 2,
+    condText: '到达第 2 层',
+  }),
+  Object.freeze({
+    id: 'core_pierce',
+    cond: (s) => s.drafts >= 2,
+    condText: '累计抽到 2 张卡',
+  }),
+  Object.freeze({
+    id: 'core_siphon',
+    cond: (s) => s.kills >= 50,
+    condText: '累计击杀 50',
+  }),
+  Object.freeze({
+    id: 'core_ember',
+    cond: (s) => s.bestFloor >= 5,
+    condText: '到达第 5 层',
+  }),
+  Object.freeze({
+    id: 'core_echo',
+    cond: (s) => s.maxFloorKills >= 12,
+    condText: '单层击杀 12',
+  }),
+  Object.freeze({
+    id: 'core_hunter',
+    cond: (s) => s.bestFloor >= 6,
+    condText: '到达第 6 层',
+  }),
+]);
+
+export function unlockedCores(stats) {
+  return CORES.filter((core) => core.cond(stats)).map((core) => core.id);
+}
+
 export function cardsById(ids) {
   return ids.map((id) => {
-    const card = CARDS[id];
+    const card = CARDS[id] ?? CORE_CARDS[id];
     if (card === undefined) throw new Error(`unknown card: ${id}`);
     return card;
   });

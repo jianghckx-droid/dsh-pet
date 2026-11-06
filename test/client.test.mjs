@@ -187,6 +187,27 @@ test('token 驱动：输出 token 换成额外敌人', () => {
   assert.equal(entry.tokenQueue, 0);
 });
 
+test('核心槽：未解锁拒绝，通关后解锁并能装备', () => {
+  const { createEntry, tick, unlockedCores, toggleCore } = loadModule().__debug;
+  const entry = createEntry('core-key', 7);
+  assert.equal(toggleCore(entry, 'core_anchor'), false, 'locked core must be rejected');
+
+  let guard = 0;
+  while (entry.floor < 2 && guard < 60 * 60) {
+    tick(entry, 1 / 60);
+    guard += 1;
+  }
+  assert.ok(entry.floor >= 2, 'expected floor 2');
+  assert.ok(unlockedCores(entry.stats).includes('core_anchor'), 'anchor should unlock');
+
+  assert.equal(toggleCore(entry, 'core_anchor'), true);
+  assert.ok(entry.cores.includes('core_anchor'));
+  assert.ok(entry.battle.cards.some((card) => card.id === 'core_anchor'));
+
+  const again = createEntry('core-key', 7);
+  assert.ok(again.cores.includes('core_anchor'), 'equipped core must persist');
+});
+
 test('纯数值在第 6 层会被挡住（客户端同一套规则）', () => {
   const { createEntry, startFloor, tick } = loadModule().__debug;
   const entry = createEntry('test', 7);

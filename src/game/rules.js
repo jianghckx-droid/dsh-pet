@@ -105,9 +105,9 @@ export function createStatus() {
   return { burn: 0, burnLeft: 0, burnTick: BURN.tickSeconds };
 }
 
-export function applyBurn(status, stacks) {
+export function applyBurn(status, stacks, cap = BURN.cap) {
   if (stacks <= 0) return;
-  status.burn = Math.min(BURN.cap, status.burn + stacks);
+  status.burn = Math.min(cap, status.burn + stacks);
   status.burnLeft = BURN.durationSeconds;
 }
 

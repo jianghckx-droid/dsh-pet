@@ -18,6 +18,7 @@
 import { cardsById } from './cards.js';
 import {
   ATTRIBUTES,
+  BURN,
   advanceStatus,
   applyBurn,
   attackCells,
@@ -85,6 +86,7 @@ function spawnPoint(rng) {
 }
 
 const hasRule = (battle, id) => battle.rules.some((rule) => rule.id === id);
+const hasCore = (battle, id) => battle.cards.some((card) => card.id === id);
 const orbRange = (battle) => ORB_RANGE * visionScale(battle.attrs);
 const fieldRadius = (battle) => FIELD_RADIUS * visionScale(battle.attrs);
 const selfRadius = (battle) => SELF_RADIUS * visionScale(battle.attrs);
@@ -96,6 +98,9 @@ export function addCard(battle, id) {
   battle.cards.push(card);
   if (card.carrier === 'rule') {
     battle.rules.push(card);
+    return card;
+  }
+  if (card.carrier === 'core') {
     return card;
   }
   if (card.carrier === 'self') {
@@ -168,6 +173,7 @@ export function createBattle({
   xpNext = 6,
   pending = 0,
   extra = 0,
+  cores = [],
 }) {
   const def = floorDef(floor);
   const normalized = normalizeAttrs(attrs);
@@ -201,6 +207,9 @@ export function createBattle({
     xpNext,
     pending,
     extra: Math.min(MAX_EXTRA, Math.max(0, extra)),
+    burnCap: BURN.cap,
+    emberSpread: 1,
+    echoKills: 0,
     offer: null,
     hitCount: 0,
     anchorTimer: 0,
@@ -211,17 +220,39 @@ export function createBattle({
     seed,
   };
   for (const id of build) addCard(battle, id);
+  for (const id of cores) addCard(battle, id);
+  battle.burnCap = hasCore(battle, 'core_ember') ? BURN.cap + 2 : BURN.cap;
+  battle.emberSpread = hasCore(battle, 'core_ember') ? 3 : 1;
   return battle;
 }
 
-function nearestEnemy(battle, from, range = Infinity) {
+function nearestEnemy(battle, from, range = Infinity, excludeId = -1) {
   let best = null;
   let bestD = range;
   for (const e of battle.enemies) {
-    if (e.cells <= 0) continue;
+    if (e.cells <= 0 || e.id === excludeId) continue;
     const d = dist(from, e);
     if (d < bestD) {
       best = e;
+      bestD = d;
+    }
+  }
+  return best;
+}
+
+/** 猎手核心：优先打格数最低的，而不是最近的。 */
+function pickTarget(battle, from, range, excludeId = -1) {
+  if (!hasCore(battle, 'core_hunter')) return nearestEnemy(battle, from, range, excludeId);
+  let best = null;
+  let bestCells = Infinity;
+  let bestD = Infinity;
+  for (const e of battle.enemies) {
+    if (e.cells <= 0 || e.id === excludeId) continue;
+    const d = dist(from, e);
+    if (d > range) continue;
+    if (e.cells < bestCells || (e.cells === bestCells && d < bestD)) {
+      best = e;
+      bestCells = e.cells;
       bestD = d;
     }
   }
@@ -256,6 +287,9 @@ function spawnTick(battle) {
       flash: 0,
     });
     battle.spawned += 1;
+    if (hasCore(battle, 'core_anchor') && battle.time < 3) {
+      battle.enemies[battle.enemies.length - 1].freeze = 3;
+    }
   }
 }
 
@@ -296,7 +330,7 @@ function rawHit(battle, enemy, cells, burn = 0) {
   const dealt = resolveHit(enemy, cells, { main: true });
   enemy.cells -= dealt;
   enemy.flash = 0.12;
-  if (burn) applyBurn(enemy.status, burn);
+  if (burn) applyBurn(enemy.status, burn, battle.burnCap);
   battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
   return dealt;
 }
@@ -312,8 +346,8 @@ function hitEnemy(battle, enemy, card) {
   if (hasRule(battle, 'rule_combo')) {
     battle.hitCount += 1;
     if (battle.hitCount % COMBO_EVERY === 0) {
-      const extra = nearestEnemy(battle, battle.player, orbRange(battle));
-      if (extra && extra !== enemy && extra.cells > 0) rawHit(battle, extra, 1);
+      const extra = pickTarget(battle, battle.player, orbRange(battle), enemy.id);
+      if (extra !== null && extra.cells > 0) rawHit(battle, extra, 1);
     }
   }
 }
@@ -324,8 +358,10 @@ function fireBullet(battle, from, card, target) {
     x: from.x,
     y: from.y,
     targetId: target.id,
-    cells: attackCells(card, battle.attrs),
+    // 存基础格数：命中时 hitEnemy 会再走一次 attackCells，否则锋锐会被加成两次
+    cells: card.cells ?? 1,
     burn: card.burn ?? 0,
+    pierce: hasCore(battle, 'core_pierce') ? 1 : 0,
     life: 1.2,
   });
   battle.events.push({ type: 'shot', x: from.x, y: from.y, card: card.id });
@@ -350,7 +386,7 @@ function attackTick(battle, dt) {
       pulse(battle, source.card);
       continue;
     }
-    const target = nearestEnemy(battle, battle.player, orbRange(battle));
+    const target = pickTarget(battle, battle.player, orbRange(battle));
     if (target) fireBullet(battle, battle.player, source.card, target);
   }
 
@@ -362,7 +398,7 @@ function attackTick(battle, dt) {
     summon.timer -= dt;
     if (summon.timer > 0) continue;
     summon.timer += cooldown(summon.card.cd, battle.attrs);
-    const target = nearestEnemy(battle, summon, summonRange(battle));
+    const target = pickTarget(battle, summon, summonRange(battle));
     if (target) fireBullet(battle, summon, summon.card, target);
   }
 }
@@ -408,6 +444,14 @@ function bulletsTick(battle, dt) {
     const travel = BULLET_SPEED * dt;
     if (d <= travel + BULLET_HIT_RADIUS) {
       hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn });
+      if (bullet.pierce > 0) {
+        const next = pickTarget(battle, bullet, orbRange(battle), target.id);
+        if (next !== null) {
+          bullet.pierce -= 1;
+          bullet.targetId = next.id;
+          alive.push(bullet);
+        }
+      }
       continue;
     }
     bullet.x += (dx / d) * travel;
@@ -462,9 +506,16 @@ function statusTick(battle, dt) {
   }
 }
 
+function refreshCooldowns(battle) {
+  for (const source of battle.sources) source.timer = 0;
+  for (const summon of battle.summons) summon.timer = 0;
+  for (const self of battle.selfs) self.timer = 0;
+}
+
 function resolveDeaths(battle) {
   const alive = [];
   const booms = [];
+  const embers = [];
   for (const e of battle.enemies) {
     if (e.cells > 0) {
       alive.push(e);
@@ -475,6 +526,14 @@ function resolveDeaths(battle) {
     if (e.primary) {
       awardXp(battle, Math.max(1, Math.round(e.maxCells / XP_PER_CELL)));
       if (hasRule(battle, 'rule_boom')) booms.push({ x: e.x, y: e.y });
+      if (hasCore(battle, 'core_siphon')) {
+        battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + 1);
+      }
+      if (e.status.burn > 0) embers.push({ x: e.x, y: e.y, burn: e.status.burn });
+      if (hasCore(battle, 'core_echo')) {
+        battle.echoKills += 1;
+        if (battle.echoKills % 8 === 0) refreshCooldowns(battle);
+      }
     }
     if (e.canSplit && e.primary) {
       const child = Math.max(1, Math.ceil(e.maxCells * 0.5));
@@ -496,6 +555,18 @@ function resolveDeaths(battle) {
     }
   }
   battle.enemies = alive;
+
+  // 余烬：灼烧目标死亡时把层数传给最近的敌人（核心把 1 个变成 3 个）
+  for (const ember of embers) {
+    const targets = alive
+      .filter((other) => other.cells > 0)
+      .sort(
+        (a, b) =>
+          Math.hypot(a.x - ember.x, a.y - ember.y) - Math.hypot(b.x - ember.x, b.y - ember.y),
+      )
+      .slice(0, battle.emberSpread);
+    for (const target of targets) applyBurn(target.status, ember.burn, battle.burnCap);
+  }
 
   for (const at of booms) {
     for (const e of alive) {

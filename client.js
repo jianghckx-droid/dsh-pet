@@ -114,9 +114,9 @@ window.__ModuleLoader__.load({
       return { burn: 0, burnLeft: 0, burnTick: BURN.tickSeconds };
     }
 
-    function applyBurn(status, stacks) {
+    function applyBurn(status, stacks, cap = BURN.cap) {
       if (stacks <= 0) return;
-      status.burn = Math.min(BURN.cap, status.burn + stacks);
+      status.burn = Math.min(cap, status.burn + stacks);
       status.burnLeft = BURN.durationSeconds;
     }
 
@@ -300,9 +300,125 @@ window.__ModuleLoader__.load({
     /** 灼烧包的开局 build（模拟器与单测用）。 */
     const FIRE_BUILD = Object.freeze(['orb_phys', 'orb_fire', 'field_fire', 'summon_fire']);
 
+    // ---- 核心卡（跨包、跨轮，永久槽）----
+    // 与普通卡不同：核心不占抽卡槽，进战斗时直接挂上，改变的是"规则"。
+
+    const CORE_CARDS = Object.freeze({
+      core_anchor: Object.freeze({
+        id: 'core_anchor',
+        name: '时锚',
+        carrier: 'core',
+        effect: 'control',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['core', 'control']),
+        desc: '开局 3 秒内刷出的敌人被冻结 3 秒',
+      }),
+      core_ember: Object.freeze({
+        id: 'core_ember',
+        name: '余烬之种',
+        carrier: 'core',
+        effect: 'fire',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['core', 'fire']),
+        desc: '灼烧上限 +2；灼烧目标死亡时传给 3 个敌人',
+      }),
+      core_echo: Object.freeze({
+        id: 'core_echo',
+        name: '回响',
+        carrier: 'core',
+        effect: 'time',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['core', 'cooldown']),
+        desc: '每击杀 8 个敌人，立刻刷新所有冷却',
+      }),
+      core_siphon: Object.freeze({
+        id: 'core_siphon',
+        name: '汲取',
+        carrier: 'core',
+        effect: 'life',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['core', 'heal']),
+        desc: '每次击杀回复 1 格生命',
+      }),
+      core_hunter: Object.freeze({
+        id: 'core_hunter',
+        name: '猎手',
+        carrier: 'core',
+        effect: 'mind',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['core', 'target']),
+        desc: '优先攻击当前格数最低的敌人',
+      }),
+      core_pierce: Object.freeze({
+        id: 'core_pierce',
+        name: '磁力',
+        carrier: 'core',
+        effect: 'phys',
+        cells: 0,
+        cd: 0,
+        burn: 0,
+        aoe: 0,
+        tags: Object.freeze(['core', 'pierce']),
+        desc: '弹丸命中后额外穿透 1 个目标',
+      }),
+    });
+
+    /** 解锁条件是行为式的；stats 由客户端累计。 */
+    const CORES = Object.freeze([
+      Object.freeze({
+        id: 'core_anchor',
+        cond: (s) => s.bestFloor >= 2,
+        condText: '到达第 2 层',
+      }),
+      Object.freeze({
+        id: 'core_pierce',
+        cond: (s) => s.drafts >= 2,
+        condText: '累计抽到 2 张卡',
+      }),
+      Object.freeze({
+        id: 'core_siphon',
+        cond: (s) => s.kills >= 50,
+        condText: '累计击杀 50',
+      }),
+      Object.freeze({
+        id: 'core_ember',
+        cond: (s) => s.bestFloor >= 5,
+        condText: '到达第 5 层',
+      }),
+      Object.freeze({
+        id: 'core_echo',
+        cond: (s) => s.maxFloorKills >= 12,
+        condText: '单层击杀 12',
+      }),
+      Object.freeze({
+        id: 'core_hunter',
+        cond: (s) => s.bestFloor >= 6,
+        condText: '到达第 6 层',
+      }),
+    ]);
+
+    function unlockedCores(stats) {
+      return CORES.filter((core) => core.cond(stats)).map((core) => core.id);
+    }
+
     function cardsById(ids) {
       return ids.map((id) => {
-        const card = CARDS[id];
+        const card = CARDS[id] ?? CORE_CARDS[id];
         if (card === undefined) throw new Error(`unknown card: ${id}`);
         return card;
       });
@@ -445,6 +561,7 @@ window.__ModuleLoader__.load({
     }
 
     const hasRule = (battle, id) => battle.rules.some((rule) => rule.id === id);
+    const hasCore = (battle, id) => battle.cards.some((card) => card.id === id);
     const orbRange = (battle) => ORB_RANGE * visionScale(battle.attrs);
     const fieldRadius = (battle) => FIELD_RADIUS * visionScale(battle.attrs);
     const selfRadius = (battle) => SELF_RADIUS * visionScale(battle.attrs);
@@ -456,6 +573,9 @@ window.__ModuleLoader__.load({
       battle.cards.push(card);
       if (card.carrier === 'rule') {
         battle.rules.push(card);
+        return card;
+      }
+      if (card.carrier === 'core') {
         return card;
       }
       if (card.carrier === 'self') {
@@ -528,6 +648,7 @@ window.__ModuleLoader__.load({
       xpNext = 6,
       pending = 0,
       extra = 0,
+      cores = [],
     }) {
       const def = floorDef(floor);
       const normalized = normalizeAttrs(attrs);
@@ -561,6 +682,9 @@ window.__ModuleLoader__.load({
         xpNext,
         pending,
         extra: Math.min(MAX_EXTRA, Math.max(0, extra)),
+        burnCap: BURN.cap,
+        emberSpread: 1,
+        echoKills: 0,
         offer: null,
         hitCount: 0,
         anchorTimer: 0,
@@ -571,17 +695,39 @@ window.__ModuleLoader__.load({
         seed,
       };
       for (const id of build) addCard(battle, id);
+      for (const id of cores) addCard(battle, id);
+      battle.burnCap = hasCore(battle, 'core_ember') ? BURN.cap + 2 : BURN.cap;
+      battle.emberSpread = hasCore(battle, 'core_ember') ? 3 : 1;
       return battle;
     }
 
-    function nearestEnemy(battle, from, range = Infinity) {
+    function nearestEnemy(battle, from, range = Infinity, excludeId = -1) {
       let best = null;
       let bestD = range;
       for (const e of battle.enemies) {
-        if (e.cells <= 0) continue;
+        if (e.cells <= 0 || e.id === excludeId) continue;
         const d = dist(from, e);
         if (d < bestD) {
           best = e;
+          bestD = d;
+        }
+      }
+      return best;
+    }
+
+    /** 猎手核心：优先打格数最低的，而不是最近的。 */
+    function pickTarget(battle, from, range, excludeId = -1) {
+      if (!hasCore(battle, 'core_hunter')) return nearestEnemy(battle, from, range, excludeId);
+      let best = null;
+      let bestCells = Infinity;
+      let bestD = Infinity;
+      for (const e of battle.enemies) {
+        if (e.cells <= 0 || e.id === excludeId) continue;
+        const d = dist(from, e);
+        if (d > range) continue;
+        if (e.cells < bestCells || (e.cells === bestCells && d < bestD)) {
+          best = e;
+          bestCells = e.cells;
           bestD = d;
         }
       }
@@ -616,6 +762,9 @@ window.__ModuleLoader__.load({
           flash: 0,
         });
         battle.spawned += 1;
+        if (hasCore(battle, 'core_anchor') && battle.time < 3) {
+          battle.enemies[battle.enemies.length - 1].freeze = 3;
+        }
       }
     }
 
@@ -656,7 +805,7 @@ window.__ModuleLoader__.load({
       const dealt = resolveHit(enemy, cells, { main: true });
       enemy.cells -= dealt;
       enemy.flash = 0.12;
-      if (burn) applyBurn(enemy.status, burn);
+      if (burn) applyBurn(enemy.status, burn, battle.burnCap);
       battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
       return dealt;
     }
@@ -672,8 +821,8 @@ window.__ModuleLoader__.load({
       if (hasRule(battle, 'rule_combo')) {
         battle.hitCount += 1;
         if (battle.hitCount % COMBO_EVERY === 0) {
-          const extra = nearestEnemy(battle, battle.player, orbRange(battle));
-          if (extra && extra !== enemy && extra.cells > 0) rawHit(battle, extra, 1);
+          const extra = pickTarget(battle, battle.player, orbRange(battle), enemy.id);
+          if (extra !== null && extra.cells > 0) rawHit(battle, extra, 1);
         }
       }
     }
@@ -684,8 +833,10 @@ window.__ModuleLoader__.load({
         x: from.x,
         y: from.y,
         targetId: target.id,
-        cells: attackCells(card, battle.attrs),
+        // 存基础格数：命中时 hitEnemy 会再走一次 attackCells，否则锋锐会被加成两次
+        cells: card.cells ?? 1,
         burn: card.burn ?? 0,
+        pierce: hasCore(battle, 'core_pierce') ? 1 : 0,
         life: 1.2,
       });
       battle.events.push({ type: 'shot', x: from.x, y: from.y, card: card.id });
@@ -710,7 +861,7 @@ window.__ModuleLoader__.load({
           pulse(battle, source.card);
           continue;
         }
-        const target = nearestEnemy(battle, battle.player, orbRange(battle));
+        const target = pickTarget(battle, battle.player, orbRange(battle));
         if (target) fireBullet(battle, battle.player, source.card, target);
       }
 
@@ -722,7 +873,7 @@ window.__ModuleLoader__.load({
         summon.timer -= dt;
         if (summon.timer > 0) continue;
         summon.timer += cooldown(summon.card.cd, battle.attrs);
-        const target = nearestEnemy(battle, summon, summonRange(battle));
+        const target = pickTarget(battle, summon, summonRange(battle));
         if (target) fireBullet(battle, summon, summon.card, target);
       }
     }
@@ -768,6 +919,14 @@ window.__ModuleLoader__.load({
         const travel = BULLET_SPEED * dt;
         if (d <= travel + BULLET_HIT_RADIUS) {
           hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn });
+          if (bullet.pierce > 0) {
+            const next = pickTarget(battle, bullet, orbRange(battle), target.id);
+            if (next !== null) {
+              bullet.pierce -= 1;
+              bullet.targetId = next.id;
+              alive.push(bullet);
+            }
+          }
           continue;
         }
         bullet.x += (dx / d) * travel;
@@ -822,9 +981,16 @@ window.__ModuleLoader__.load({
       }
     }
 
+    function refreshCooldowns(battle) {
+      for (const source of battle.sources) source.timer = 0;
+      for (const summon of battle.summons) summon.timer = 0;
+      for (const self of battle.selfs) self.timer = 0;
+    }
+
     function resolveDeaths(battle) {
       const alive = [];
       const booms = [];
+      const embers = [];
       for (const e of battle.enemies) {
         if (e.cells > 0) {
           alive.push(e);
@@ -835,6 +1001,14 @@ window.__ModuleLoader__.load({
         if (e.primary) {
           awardXp(battle, Math.max(1, Math.round(e.maxCells / XP_PER_CELL)));
           if (hasRule(battle, 'rule_boom')) booms.push({ x: e.x, y: e.y });
+          if (hasCore(battle, 'core_siphon')) {
+            battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + 1);
+          }
+          if (e.status.burn > 0) embers.push({ x: e.x, y: e.y, burn: e.status.burn });
+          if (hasCore(battle, 'core_echo')) {
+            battle.echoKills += 1;
+            if (battle.echoKills % 8 === 0) refreshCooldowns(battle);
+          }
         }
         if (e.canSplit && e.primary) {
           const child = Math.max(1, Math.ceil(e.maxCells * 0.5));
@@ -856,6 +1030,18 @@ window.__ModuleLoader__.load({
         }
       }
       battle.enemies = alive;
+
+      // 余烬：灼烧目标死亡时把层数传给最近的敌人（核心把 1 个变成 3 个）
+      for (const ember of embers) {
+        const targets = alive
+          .filter((other) => other.cells > 0)
+          .sort(
+            (a, b) =>
+              Math.hypot(a.x - ember.x, a.y - ember.y) - Math.hypot(b.x - ember.x, b.y - ember.y),
+          )
+          .slice(0, battle.emberSpread);
+        for (const target of targets) applyBurn(target.status, ember.burn, battle.burnCap);
+      }
 
       for (const at of booms) {
         for (const e of alive) {
@@ -1024,6 +1210,13 @@ window.__ModuleLoader__.load({
       '.dsh-pet-attr:hover:not(:disabled){background:#16222e;border-color:#3a5470}',
       '.dsh-pet-attr:disabled{opacity:.45;cursor:default}',
       '.dsh-pet-attr-val{color:#8fa4b5}',
+      '.dsh-pet-cores{display:flex;flex-direction:column;gap:3px}',
+      '.dsh-pet-cores-head{display:flex;justify-content:space-between;font-size:10px;color:#7f93a3}',
+      '.dsh-pet-core-pool{display:flex;flex-wrap:wrap;gap:3px}',
+      '.dsh-pet-core{font:inherit;font-size:9px;color:#8fa4b5;background:#111a24;',
+      'border:1px solid #1f2a36;border-radius:4px;padding:2px 5px;cursor:pointer}',
+      '.dsh-pet-core.on{color:#0a0d12;background:#ffd166;border-color:#ffd166}',
+      '.dsh-pet-core:disabled{opacity:.35;cursor:default}',
     ].join('')
 
     // ---- 进度 ----
@@ -1031,18 +1224,33 @@ window.__ModuleLoader__.load({
     const SAVE_PREFIX = 'dsh.pet.v3.'
 
     function loadAccount(key) {
+      const empty = {
+        attrs: {},
+        points: 0,
+        cores: [],
+        stats: { kills: 0, bestFloor: 1, maxFloorKills: 0, drafts: 0 },
+      }
       try {
         const store = window.localStorage
-        if (store === undefined || store === null) return { attrs: {}, points: 0 }
+        if (store === undefined || store === null) return empty
         const raw = store.getItem(SAVE_PREFIX + key)
-        if (raw === null) return { attrs: {}, points: 0 }
+        if (raw === null) return empty
         const parsed = JSON.parse(raw)
+        const src = parsed !== null && typeof parsed === 'object' ? parsed : {}
+        const stats = src.stats !== null && typeof src.stats === 'object' ? src.stats : {}
         return {
-          attrs: normalizeAttrs(parsed !== null && typeof parsed === 'object' ? parsed.attrs : {}),
-          points: Math.max(0, Math.floor(Number(parsed.points) || 0)),
+          attrs: normalizeAttrs(src.attrs),
+          points: Math.max(0, Math.floor(Number(src.points) || 0)),
+          cores: Array.isArray(src.cores) ? src.cores.filter((id) => CORE_CARDS[id]) : [],
+          stats: {
+            kills: Math.max(0, Math.floor(Number(stats.kills) || 0)),
+            bestFloor: Math.max(1, Math.floor(Number(stats.bestFloor) || 1)),
+            maxFloorKills: Math.max(0, Math.floor(Number(stats.maxFloorKills) || 0)),
+            drafts: Math.max(0, Math.floor(Number(stats.drafts) || 0)),
+          },
         }
       } catch {
-        return { attrs: {}, points: 0 }
+        return empty
       }
     }
 
@@ -1052,7 +1260,12 @@ window.__ModuleLoader__.load({
         if (store === undefined || store === null) return
         store.setItem(
           SAVE_PREFIX + entry.key,
-          JSON.stringify({ attrs: entry.attrs, points: entry.points }),
+          JSON.stringify({
+            attrs: entry.attrs,
+            points: entry.points,
+            cores: entry.cores,
+            stats: entry.stats,
+          }),
         )
       } catch {
         // 存档失败不能打断战斗
@@ -1088,6 +1301,11 @@ window.__ModuleLoader__.load({
       entry.xp = battle.xp
       entry.xpNext = battle.xpNext
       entry.pending = battle.pending
+      entry.stats.kills += battle.kills
+      entry.stats.maxFloorKills = Math.max(entry.stats.maxFloorKills, battle.kills)
+      if (battle.state === 'cleared') {
+        entry.stats.bestFloor = Math.max(entry.stats.bestFloor, entry.floor + 1)
+      }
       saveAccount(entry)
     }
 
@@ -1103,6 +1321,7 @@ window.__ModuleLoader__.load({
         build: [...build.cards, ...entry.drafted],
         attrs: entry.attrs,
         points: entry.points,
+        cores: entry.cores,
         level: entry.level,
         xp: entry.xp,
         xpNext: entry.xpNext,
@@ -1124,6 +1343,8 @@ window.__ModuleLoader__.load({
         buildId: 'fire',
         attrs: account.attrs,
         points: account.points,
+        cores: account.cores,
+        stats: account.stats,
         level: 1,
         xp: 0,
         xpNext: 6,
@@ -1184,6 +1405,19 @@ window.__ModuleLoader__.load({
       if (battle === null) return false
       if (!chooseCard(battle, id)) return false
       entry.drafted.push(id)
+      entry.stats.drafts += 1
+      saveAccount(entry)
+      return true
+    }
+
+    function toggleCore(entry, id) {
+      if (!unlockedCores(entry.stats).includes(id)) return false
+      const index = entry.cores.indexOf(id)
+      if (index >= 0) entry.cores.splice(index, 1)
+      else if (entry.cores.length < 3) entry.cores.push(id)
+      else return false
+      saveAccount(entry)
+      resetRun(entry, 1)
       return true
     }
 
@@ -1501,6 +1735,7 @@ window.__ModuleLoader__.load({
       const build = BUILDS[entry.buildId]
       const attrs = battle !== null ? battle.attrs : entry.attrs
       const points = battle !== null ? battle.points : entry.points
+      const unlocked = unlockedCores(entry.stats)
       const result = entry.phase === 'result' ? entry.lastResult : null
       const lockName = battle !== null && battle.def.locks.length > 0 ? battle.def.locks[0] : '—'
 
@@ -1581,6 +1816,31 @@ window.__ModuleLoader__.load({
             ),
           ),
         ),
+        unlocked.length > 0
+          ? h('div', { className: 'dsh-pet-cores' },
+              h('div', { className: 'dsh-pet-cores-head' },
+                h('span', null, '核心'),
+                h('span', { className: 'dsh-pet-muted' }, entry.cores.length + '/3'),
+              ),
+              h('div', { className: 'dsh-pet-core-pool' },
+                CORES.map((core) => {
+                  const def = CORE_CARDS[core.id]
+                  const ready = unlocked.includes(core.id)
+                  const on = entry.cores.includes(core.id)
+                  return h('button', {
+                    key: core.id,
+                    type: 'button',
+                    className: 'dsh-pet-core' + (on ? ' on' : ''),
+                    title: ready ? def.desc : '未解锁：' + core.condText,
+                    disabled: !ready,
+                    onClick: () => {
+                      if (toggleCore(entry, core.id)) bump()
+                    },
+                  }, def.name)
+                }),
+              ),
+            )
+          : null,
         h('div', { className: 'dsh-pet-bottom' },
           h('span', null, '格 ' + Math.max(0, cells) + '/' + maxCells),
           h('span', null, '槽 ' + (battle === null ? 0 : battle.slots.length) + '/' + MAX_SLOTS),
@@ -1650,7 +1910,7 @@ window.__ModuleLoader__.load({
         )
       },
       // 供 node --test 验证接入路径；运行时不使用。
-      __debug: { createEntry, tick, startFloor, draw, BUILDS, pickCard, awardXp, chooseCard, spend, pushTokens },
+      __debug: { createEntry, tick, startFloor, draw, BUILDS, pickCard, awardXp, chooseCard, spend, pushTokens, toggleCore, unlockedCores },
     }
   },
 })
