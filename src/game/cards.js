@@ -390,7 +390,63 @@ export const CARDS = Object.freeze({
     solves: Object.freeze(['carapace', 'summon']),
     desc: '击杀后，下次攻击额外发射 1 发（最多叠 3）',
   }),
+  // ---- P4 风险家族 ----
+  desperate: Object.freeze({
+    id: 'desperate',
+    name: '破釜',
+    carrier: 'rule',
+    effect: 'life',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['rule', 'risk']),
+    solves: Object.freeze(['carapace']),
+    desc: '生命低于 30% 时，所有冷却减半',
+  }),
+  shield_burst: Object.freeze({
+    id: 'shield_burst',
+    name: '护盾爆',
+    carrier: 'rule',
+    effect: 'life',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['rule', 'risk']),
+    solves: Object.freeze(['bomb']),
+    desc: '每 6 秒获得 2 格护盾；护盾破碎时对周围造成 3 格',
+  }),
+  blood_debt: Object.freeze({
+    id: 'blood_debt',
+    name: '血偿',
+    carrier: 'rule',
+    effect: 'life',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['rule', 'risk']),
+    solves: Object.freeze(['carapace']),
+    desc: '每次受伤，下一次攻击 +1 格（最多 +3）',
+  }),
+  overdraft: Object.freeze({
+    id: 'overdraft',
+    name: '透支',
+    carrier: 'rule',
+    effect: 'life',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['rule', 'risk']),
+    solves: Object.freeze(['summon']),
+    desc: '每层开始扣 3 格生命，立刻刷新一次所有冷却',
+  }),
 });
+
+/** P4 风险包。 */
+export const RISK_PACK = Object.freeze(['desperate', 'shield_burst', 'blood_debt', 'overdraft']);
 
 /** P3 时间包。 */
 export const TIME_PACK = Object.freeze(['time_stop', 'rewind', 'delay', 'chain']);

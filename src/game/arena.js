@@ -88,6 +88,15 @@ function spawnPoint(rng) {
 
 const hasRule = (battle, id) => battle.rules.some((rule) => rule.id === id);
 const hasCore = (battle, id) => battle.cards.some((card) => card.id === id);
+
+/** 破釜：残血时冷却减半。所有出手机制都要走这里。 */
+function cardCooldown(battle, cd) {
+  let value = cooldown(cd, battle.attrs);
+  if (hasRule(battle, 'desperate') && battle.player.cells < battle.player.maxCells * 0.3) {
+    value *= 0.5;
+  }
+  return value;
+}
 const orbRange = (battle) => ORB_RANGE * visionScale(battle.attrs);
 const fieldRadius = (battle) => FIELD_RADIUS * visionScale(battle.attrs);
 const selfRadius = (battle) => SELF_RADIUS * visionScale(battle.attrs);
@@ -103,7 +112,7 @@ function makeSummon(battle, card) {
     cells: hp,
     maxCells: hp,
     mode: card.mode ?? 'turret',
-    timer: cooldown(card.cd, battle.attrs) * 0.5,
+    timer: cardCooldown(battle, card.cd) * 0.5,
   };
 }
 
@@ -152,14 +161,14 @@ export function addCard(battle, id) {
     return card;
   }
   if (card.carrier === 'self') {
-    battle.selfs.push({ card, timer: cooldown(card.cd, battle.attrs) });
+    battle.selfs.push({ card, timer: cardCooldown(battle, card.cd) });
     return card;
   }
   if (card.carrier === 'summon') {
     battle.summons.push(makeSummon(battle, card));
     return card;
   }
-  battle.sources.push({ card, timer: cooldown(card.cd, battle.attrs) * 0.5 });
+  battle.sources.push({ card, timer: cardCooldown(battle, card.cd) * 0.5 });
   return card;
 }
 
@@ -245,6 +254,7 @@ export function createBattle({
       cells: maxCells,
       maxCells,
       speed: PLAYER_SPEED,
+      shield: 0,
     },
     level,
     xp,
@@ -265,6 +275,8 @@ export function createBattle({
     rewindCd: 0,
     rewindUsed: false,
     chainStacks: 0,
+    shieldTimer: 6,
+    bloodStacks: 0,
     spawned: 0,
     kills: 0,
     events: [],
@@ -275,6 +287,10 @@ export function createBattle({
   for (const id of cores) addCard(battle, id);
   battle.burnCap = hasCore(battle, 'core_ember') ? BURN.cap + 2 : BURN.cap;
   battle.emberSpread = hasCore(battle, 'core_ember') ? 3 : 1;
+  if (hasRule(battle, 'overdraft')) {
+    battle.player.cells = Math.max(1, battle.player.cells - 3);
+    refreshCooldowns(battle);
+  }
   return battle;
 }
 
@@ -424,7 +440,12 @@ function addMark(enemy, stacks) {
 }
 
 function hitEnemy(battle, enemy, card) {
-  rawHit(battle, enemy, attackCells(card, battle.attrs), card.burn ?? 0);
+  let cells = attackCells(card, battle.attrs);
+  if (hasRule(battle, 'blood_debt') && battle.bloodStacks > 0) {
+    cells += battle.bloodStacks;
+    battle.bloodStacks = 0;
+  }
+  rawHit(battle, enemy, cells, card.burn ?? 0);
 
   if (card.mark) addMark(enemy, card.mark);
   if (hasRule(battle, 'mark_hunter')) addMark(enemy, 1);
@@ -488,7 +509,7 @@ function attackTick(battle, dt) {
   for (const source of battle.sources) {
     source.timer -= dt;
     if (source.timer > 0) continue;
-    source.timer += cooldown(source.card.cd, battle.attrs);
+    source.timer += cardCooldown(battle, source.card.cd);
     if (source.card.carrier === 'field') {
       pulse(battle, source.card);
       continue;
@@ -529,7 +550,7 @@ function summonsTick(battle, dt) {
     if (summon.mode === 'totem') {
       summon.timer -= dt;
       if (summon.timer > 0) continue;
-      summon.timer += cooldown(summon.card.cd, battle.attrs);
+      summon.timer += cardCooldown(battle, summon.card.cd);
       for (const other of battle.summons) {
         if (other === summon) continue;
         if (dist(summon, other) > 30) continue;
@@ -563,7 +584,7 @@ function summonsTick(battle, dt) {
     summon.y += (ty - summon.y) * Math.min(1, dt * 3);
     summon.timer -= dt;
     if (summon.timer > 0) continue;
-    summon.timer += cooldown(summon.card.cd, battle.attrs);
+    summon.timer += cardCooldown(battle, summon.card.cd);
     const target = pickTarget(battle, summon, summonRange(battle));
     if (target !== null) fireBullet(battle, summon, summon.card, target);
   }
@@ -573,7 +594,7 @@ function selfTick(battle, dt) {
   for (const self of battle.selfs) {
     self.timer -= dt;
     if (self.timer > 0) continue;
-    self.timer += cooldown(self.card.cd, battle.attrs);
+    self.timer += cardCooldown(battle, self.card.cd);
     const targets = battle.enemies.filter(
       (e) => e.cells > 0 && dist(battle.player, e) <= selfRadius(battle) + e.r,
     );
@@ -608,6 +629,24 @@ function rulesTick(battle, dt) {
   }
 }
 
+function burstShield(battle) {
+  for (const e of battle.enemies) {
+    if (e.cells <= 0) continue;
+    if (dist(battle.player, e) > 24) continue;
+    rawHit(battle, e, 3);
+  }
+  battle.events.push({ type: 'burst', x: battle.player.x, y: battle.player.y });
+}
+
+function riskTick(battle, dt) {
+  if (!hasRule(battle, 'shield_burst')) return;
+  battle.shieldTimer -= dt;
+  if (battle.shieldTimer > 0) return;
+  battle.shieldTimer += 6;
+  battle.player.shield = Math.min(4, battle.player.shield + 2);
+  battle.events.push({ type: 'shield', x: battle.player.x, y: battle.player.y });
+}
+
 function bulletsTick(battle, dt) {
   const alive = [];
   for (const bullet of battle.bullets) {
@@ -623,6 +662,10 @@ function bulletsTick(battle, dt) {
     const travel = BULLET_SPEED * dt;
     if (d <= travel + BULLET_HIT_RADIUS) {
       hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn, mark: bullet.mark });
+      if (target.locks.includes('reflect')) {
+        battle.player.cells -= 1;
+        battle.events.push({ type: 'reflect', x: battle.player.x, y: battle.player.y });
+      }
       if (bullet.pierce > 0) {
         const next = pickTarget(battle, bullet, orbRange(battle), target.id);
         if (next !== null) {
@@ -772,11 +815,21 @@ function enemiesTick(battle, dt) {
         if (linked.cells <= 0) killSummon(battle, linked);
       }
     }
+    if (battle.player.shield > 0 && dmg > 0) {
+      const absorbed = Math.min(battle.player.shield, dmg);
+      battle.player.shield -= absorbed;
+      dmg -= absorbed;
+      if (battle.player.shield <= 0 && hasRule(battle, 'shield_burst')) burstShield(battle);
+    }
+    if (dmg <= 0) continue;
     if (hasRule(battle, 'delay')) {
       battle.delayQueue.push({ due: battle.time + 2, amount: dmg, sourceId: e.id });
       battle.events.push({ type: 'delay', x: p.x, y: p.y, cells: dmg });
     } else {
       p.cells -= dmg;
+      if (hasRule(battle, 'blood_debt')) {
+        battle.bloodStacks = Math.min(3, battle.bloodStacks + 1);
+      }
       battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
     }
     if (p.cells <= 0) {
@@ -986,6 +1039,7 @@ export function step(battle, dt) {
   if (battle.pinCd > 0) battle.pinCd -= dt;
   selfTick(battle, dt);
   rulesTick(battle, dt);
+  riskTick(battle, dt);
   bulletsTick(battle, dt);
   enemiesTick(battle, dt);
   statusTick(battle, dt);
