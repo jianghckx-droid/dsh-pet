@@ -2109,18 +2109,6 @@ window.__ModuleLoader__.load({
     const KIND = 'pet'
 
     const BUILDS = {
-      fire: {
-        id: 'fire',
-        label: '灼烧',
-        cards: [...FIRE_BUILD],
-        pool: [...FIRE_PACK],
-      },
-      pure: {
-        id: 'pure',
-        label: '纯数值',
-        cards: ['orb_phys'],
-        pool: [],
-      },
       lab: {
         id: 'lab',
         label: '实验',
@@ -2128,8 +2116,6 @@ window.__ModuleLoader__.load({
         pool: [...LAB_PACK],
       },
     }
-
-    const BUILD_ORDER = ['fire', 'pure', 'lab']
 
     const COLORS = {
       bg: '#0a0d12',
@@ -2316,7 +2302,7 @@ window.__ModuleLoader__.load({
         battle: null,
         floor: 1,
         best: 1,
-        buildId: 'fire',
+        buildId: 'lab',
         attrs: account.attrs,
         points: account.points,
         cores: account.cores,
@@ -2761,19 +2747,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsh-pet-muted' }, '最佳 ' + entry.best),
           h('span', { className: 'dsh-pet-muted' }, '锁 ' + lockName),
           h('span', { className: 'dsh-pet-spacer' }),
-          h('button', {
-            type: 'button',
-            className: 'dsh-pet-btn',
-            title: '切换 build 并重新开始',
-            onClick: () => {
-              const e = entryRef.current
-              if (e === null) return
-              const next = BUILD_ORDER[(BUILD_ORDER.indexOf(e.buildId) + 1) % BUILD_ORDER.length]
-              e.buildId = next
-              resetRun(e, 1)
-              bump()
-            },
-          }, build.label),
+          h('span', { className: 'dsh-pet-muted' }, build.label),
           h('span', { className: 'dsh-pet-dot' + (entry.online ? ' on' : '') }),
         ),
         h('div', { className: 'dsh-pet-stage' },

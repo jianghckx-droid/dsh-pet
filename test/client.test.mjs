@@ -124,16 +124,6 @@ test('接入路径：建角色 → 打层 → 自动进入下一层', () => {
   assert.ok(Number.isFinite(entry.battle.player.cells));
 });
 
-test('切换 build 后重开第 1 层，卡片数随之变化', () => {
-  const { createEntry, startFloor, BUILDS } = loadModule().__debug;
-  const entry = createEntry('test', 7);
-  assert.equal(entry.battle.cards.length, BUILDS.fire.cards.length);
-  entry.buildId = 'pure';
-  startFloor(entry, 1);
-  assert.equal(entry.battle.cards.length, 1);
-  assert.equal(entry.battle.player.maxCells, 12);
-});
-
 test('三选一：选卡进槽，并在下一层保留', () => {
   const { createEntry, startFloor, pickCard, awardXp } = loadModule().__debug;
   const entry = createEntry('test', 7);
@@ -206,18 +196,4 @@ test('核心槽：未解锁拒绝，通关后解锁并能装备', () => {
 
   const again = createEntry('core-key', 7);
   assert.ok(again.cores.includes('core_anchor'), 'equipped core must persist');
-});
-
-test('纯数值在第 6 层会被挡住（客户端同一套规则）', () => {
-  const { createEntry, startFloor, tick } = loadModule().__debug;
-  const entry = createEntry('test', 7);
-  entry.buildId = 'pure';
-  startFloor(entry, 6);
-  let guard = 0;
-  while (entry.lastResult === null && guard < 60 * 60) {
-    tick(entry, 1 / 60);
-    guard += 1;
-  }
-  assert.ok(entry.lastResult !== null, 'expected a result');
-  assert.notEqual(entry.lastResult.kind, 'cleared');
 });
