@@ -337,7 +337,63 @@ export const CARDS = Object.freeze({
     solves: Object.freeze(['regen']),
     desc: '不动，每 2 秒给周围召唤物回 1 格',
   }),
+  // ---- P3 时间家族 ----
+  time_stop: Object.freeze({
+    id: 'time_stop',
+    name: '时停',
+    carrier: 'rule',
+    effect: 'time',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['rule', 'time']),
+    solves: Object.freeze(['bomb']),
+    desc: '每 12 秒冻结全场 1.5 秒',
+  }),
+  rewind: Object.freeze({
+    id: 'rewind',
+    name: '回溯',
+    carrier: 'rule',
+    effect: 'time',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['rule', 'time']),
+    solves: Object.freeze(['carapace']),
+    desc: '生命低于 50% 时，回到 3 秒前的位置与生命（每层 1 次）',
+  }),
+  delay: Object.freeze({
+    id: 'delay',
+    name: '延迟',
+    carrier: 'rule',
+    effect: 'time',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['rule', 'time']),
+    solves: Object.freeze(['reflect']),
+    desc: '受到的伤害延迟 2 秒结算；期间击杀来源则取消',
+  }),
+  chain: Object.freeze({
+    id: 'chain',
+    name: '连锁',
+    carrier: 'rule',
+    effect: 'time',
+    cells: 0,
+    cd: 0,
+    burn: 0,
+    aoe: 0,
+    tags: Object.freeze(['rule', 'time']),
+    solves: Object.freeze(['carapace', 'summon']),
+    desc: '击杀后，下次攻击额外发射 1 发（最多叠 3）',
+  }),
 });
+
+/** P3 时间包。 */
+export const TIME_PACK = Object.freeze(['time_stop', 'rewind', 'delay', 'chain']);
 
 /** P2 召唤包。 */
 export const SUMMON_PACK = Object.freeze(['bomber', 'link', 'merge', 'sacrifice', 'totem']);

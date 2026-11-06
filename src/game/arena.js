@@ -258,6 +258,13 @@ export function createBattle({
     hitCount: 0,
     anchorTimer: 0,
     pinCd: 0,
+    timeStopTimer: 0,
+    delayQueue: [],
+    snapshots: [],
+    snapshotTimer: 0,
+    rewindCd: 0,
+    rewindUsed: false,
+    chainStacks: 0,
     spawned: 0,
     kills: 0,
     events: [],
@@ -354,6 +361,8 @@ function spawnTick(battle) {
       markLeft: 0,
       cleanseCd: 3,
       devourCd: 6,
+      phaseCd: 4,
+      invuln: 0,
       flash: 0,
     });
     battle.spawned += 1;
@@ -397,6 +406,10 @@ function playerMove(battle, dt) {
 }
 
 function rawHit(battle, enemy, cells, burn = 0) {
+  if ((enemy.invuln ?? 0) > 0) {
+    battle.events.push({ type: 'phase', x: enemy.x, y: enemy.y });
+    return 0;
+  }
   const dealt = resolveHit(enemy, cells, { main: true });
   enemy.cells -= dealt;
   enemy.flash = 0.12;
@@ -480,8 +493,13 @@ function attackTick(battle, dt) {
       pulse(battle, source.card);
       continue;
     }
-    const target = pickTarget(battle, battle.player, orbRange(battle));
-    if (target) fireBullet(battle, battle.player, source.card, target);
+    const extra = hasRule(battle, 'chain') ? battle.chainStacks : 0;
+    if (extra > 0) battle.chainStacks = 0;
+    for (let shot = 0; shot < 1 + extra; shot += 1) {
+      const target = pickTarget(battle, battle.player, orbRange(battle));
+      if (target === null) break;
+      fireBullet(battle, battle.player, source.card, target);
+    }
   }
 
 }
@@ -566,15 +584,28 @@ function selfTick(battle, dt) {
   }
 }
 
-function rulesTick(battle, dt) {
-  if (!hasRule(battle, 'rule_anchor')) return;
-  battle.anchorTimer += dt;
-  if (battle.anchorTimer < ANCHOR_SECONDS) return;
-  battle.anchorTimer -= ANCHOR_SECONDS;
+function freezeAll(battle, seconds) {
   for (const e of battle.enemies) {
-    if (e.cells > 0) e.freeze = Math.max(e.freeze, FREEZE_SECONDS);
+    if (e.cells > 0) e.freeze = Math.max(e.freeze, seconds);
   }
   battle.events.push({ type: 'freeze' });
+}
+
+function rulesTick(battle, dt) {
+  if (hasRule(battle, 'rule_anchor')) {
+    battle.anchorTimer += dt;
+    if (battle.anchorTimer >= ANCHOR_SECONDS) {
+      battle.anchorTimer -= ANCHOR_SECONDS;
+      freezeAll(battle, FREEZE_SECONDS);
+    }
+  }
+  if (hasRule(battle, 'time_stop')) {
+    battle.timeStopTimer += dt;
+    if (battle.timeStopTimer >= 12) {
+      battle.timeStopTimer -= 12;
+      freezeAll(battle, 1.5);
+    }
+  }
 }
 
 function bulletsTick(battle, dt) {
@@ -741,8 +772,13 @@ function enemiesTick(battle, dt) {
         if (linked.cells <= 0) killSummon(battle, linked);
       }
     }
-    p.cells -= dmg;
-    battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
+    if (hasRule(battle, 'delay')) {
+      battle.delayQueue.push({ due: battle.time + 2, amount: dmg, sourceId: e.id });
+      battle.events.push({ type: 'delay', x: p.x, y: p.y, cells: dmg });
+    } else {
+      p.cells -= dmg;
+      battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
+    }
     if (p.cells <= 0) {
       p.cells = 0;
       battle.state = 'dead';
@@ -764,6 +800,17 @@ function statusTick(battle, dt) {
         e.cleanseCd += 3;
         e.status.burn = 0;
         e.mark = 0;
+      }
+    }
+    if (e.locks.includes('phase')) {
+      e.phaseCd = (e.phaseCd ?? 4) - dt;
+      if (e.phaseCd <= 0) {
+        e.phaseCd += 4;
+        e.invuln = 1.5;
+      }
+      if (e.invuln > 0) {
+        e.invuln = Math.max(0, e.invuln - dt);
+        continue;
       }
     }
     const burn = advanceStatus(e.status, dt);
@@ -803,6 +850,12 @@ function resolveDeaths(battle) {
       if (hasCore(battle, 'core_echo')) {
         battle.echoKills += 1;
         if (battle.echoKills % 8 === 0) refreshCooldowns(battle);
+      }
+      if (hasRule(battle, 'chain')) {
+        battle.chainStacks = Math.min(3, battle.chainStacks + 1);
+      }
+      if (battle.delayQueue.length > 0) {
+        battle.delayQueue = battle.delayQueue.filter((item) => item.sourceId !== e.id);
       }
     }
     if (e.canSplit && e.primary) {
@@ -940,6 +993,46 @@ export function step(battle, dt) {
   if (regen > 0 && battle.player.cells > 0 && battle.player.cells < battle.player.maxCells) {
     battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + regen * dt);
   }
+
+  for (let i = battle.delayQueue.length - 1; i >= 0; i -= 1) {
+    const item = battle.delayQueue[i];
+    if (battle.time < item.due) continue;
+    battle.delayQueue.splice(i, 1);
+    battle.player.cells -= item.amount;
+    battle.events.push({ type: 'hurt', x: battle.player.x, y: battle.player.y, cells: item.amount });
+  }
+
+  battle.snapshotTimer -= dt;
+  if (battle.snapshotTimer <= 0) {
+    battle.snapshotTimer += 0.25;
+    battle.snapshots.push({
+      t: battle.time,
+      x: battle.player.x,
+      y: battle.player.y,
+      cells: battle.player.cells,
+    });
+    if (battle.snapshots.length > 16) battle.snapshots.shift();
+  }
+  if (hasRule(battle, 'rewind')) {
+    battle.rewindCd -= dt;
+    const half = battle.player.maxCells * 0.5;
+    if (
+      !battle.rewindUsed &&
+      battle.rewindCd <= 0 &&
+      battle.player.cells > 0 &&
+      battle.player.cells < half
+    ) {
+      const target = battle.snapshots.find((snap) => snap.t <= battle.time - 3);
+      if (target !== undefined) {
+        battle.player.x = target.x;
+        battle.player.y = target.y;
+        battle.player.cells = Math.max(battle.player.cells, target.cells);
+        battle.rewindUsed = true;
+        battle.events.push({ type: 'rewind', x: target.x, y: target.y });
+      }
+    }
+  }
+
   resolveDeaths(battle);
   checkEnd(battle);
   return battle.events;
