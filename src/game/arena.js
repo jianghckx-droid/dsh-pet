@@ -160,6 +160,14 @@ export function addCard(battle, id) {
     battle.verbs.push({ card, timer: card.cd * 0.5 });
     return card;
   }
+  if (card.carrier === 'trap') {
+    battle.trapSources.push({ card, timer: card.cd * 0.5 });
+    return card;
+  }
+  if (card.carrier === 'trail') {
+    battle.trailSources.push({ card, timer: 0 });
+    return card;
+  }
   if (card.carrier === 'self') {
     battle.selfs.push({ card, timer: cardCooldown(battle, card.cd) });
     return card;
@@ -243,6 +251,10 @@ export function createBattle({
     sources: [],
     summons: [],
     respawns: [],
+    traps: [],
+    trails: [],
+    trapSources: [],
+    trailSources: [],
     enemies: [],
     bullets: [],
     rng: mulberry32(seed),
@@ -379,6 +391,8 @@ function spawnTick(battle) {
       devourCd: 6,
       phaseCd: 4,
       invuln: 0,
+      shield: 0,
+      genCd: 3,
       flash: 0,
     });
     battle.spawned += 1;
@@ -421,13 +435,25 @@ function playerMove(battle, dt) {
   p.y = clamp(p.y + (vy / len) * p.speed * dt, 6, ARENA.h - 6);
 }
 
+/** 敌方护盾先吸收，再扣格。所有伤害都走这里。 */
+function applyDamage(enemy, amount) {
+  let left = amount;
+  if ((enemy.shield ?? 0) > 0) {
+    const absorbed = Math.min(enemy.shield, left);
+    enemy.shield -= absorbed;
+    left -= absorbed;
+  }
+  enemy.cells -= left;
+  return left;
+}
+
 function rawHit(battle, enemy, cells, burn = 0) {
   if ((enemy.invuln ?? 0) > 0) {
     battle.events.push({ type: 'phase', x: enemy.x, y: enemy.y });
     return 0;
   }
   const dealt = resolveHit(enemy, cells, { main: true });
-  enemy.cells -= dealt;
+  applyDamage(enemy, dealt);
   enemy.flash = 0.12;
   if (burn) applyBurn(enemy.status, burn, battle.burnCap);
   battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
@@ -647,6 +673,61 @@ function riskTick(battle, dt) {
   battle.events.push({ type: 'shield', x: battle.player.x, y: battle.player.y });
 }
 
+function trapTick(battle, dt) {
+  const p = battle.player;
+
+  for (const source of battle.trapSources) {
+    source.timer -= dt;
+    if (source.timer > 0) continue;
+    source.timer += cardCooldown(battle, source.card.cd);
+    battle.traps.push({ card: source.card, x: p.x, y: p.y, ttl: source.card.ttl });
+  }
+
+  for (let i = battle.traps.length - 1; i >= 0; i -= 1) {
+    const trap = battle.traps[i];
+    trap.ttl -= dt;
+    const triggered = battle.enemies.some(
+      (e) => e.cells > 0 && dist(trap, e) <= trap.card.radius + e.r,
+    );
+    if (triggered) {
+      for (const e of battle.enemies) {
+        if (e.cells <= 0) continue;
+        if (dist(trap, e) > trap.card.radius + e.r) continue;
+        if (trap.card.cells) rawHit(battle, e, trap.card.cells);
+        if (trap.card.burn) applyBurn(e.status, trap.card.burn, battle.burnCap);
+        if (trap.card.freeze) e.freeze = Math.max(e.freeze, trap.card.freeze);
+      }
+      battle.events.push({ type: 'trap', x: trap.x, y: trap.y });
+      battle.traps.splice(i, 1);
+      continue;
+    }
+    if (trap.ttl <= 0) battle.traps.splice(i, 1);
+  }
+
+  for (const source of battle.trailSources) {
+    source.timer -= dt;
+    if (source.timer > 0) continue;
+    source.timer += source.card.cd;
+    battle.trails.push({ card: source.card, x: p.x, y: p.y, ttl: source.card.ttl, tick: 0 });
+  }
+
+  for (let i = battle.trails.length - 1; i >= 0; i -= 1) {
+    const trail = battle.trails[i];
+    trail.ttl -= dt;
+    trail.tick -= dt;
+    if (trail.tick <= 0) {
+      trail.tick += 0.5;
+      for (const e of battle.enemies) {
+        if (e.cells <= 0) continue;
+        if (dist(trail, e) > trail.card.radius + e.r) continue;
+        rawHit(battle, e, trail.card.cells);
+        if (trail.card.burn) applyBurn(e.status, trail.card.burn, battle.burnCap);
+      }
+    }
+    if (trail.ttl <= 0) battle.trails.splice(i, 1);
+  }
+}
+
 function bulletsTick(battle, dt) {
   const alive = [];
   for (const bullet of battle.bullets) {
@@ -697,7 +778,7 @@ function wallSlam(battle, enemy) {
   if (!hasRule(battle, 'rule_wall_slam')) return;
   if (enemy.wallCd > 0) return;
   enemy.wallCd = 1;
-  enemy.cells -= 2;
+  applyDamage(enemy, 2);
   battle.events.push({ type: 'wall', x: enemy.x, y: enemy.y });
 }
 
@@ -847,6 +928,17 @@ function statusTick(battle, dt) {
       e.markLeft = (e.markLeft ?? 0) - dt;
       if (e.markLeft <= 0) e.mark = 0;
     }
+    if (e.locks.includes('generator')) {
+      e.genCd = (e.genCd ?? 3) - dt;
+      if (e.genCd <= 0) {
+        e.genCd += 3;
+        for (const ally of battle.enemies) {
+          if (ally === e || ally.cells <= 0) continue;
+          if (dist(e, ally) > 20) continue;
+          ally.shield = Math.min(4, (ally.shield ?? 0) + 2);
+        }
+      }
+    }
     if (e.locks.includes('cleanse')) {
       e.cleanseCd = (e.cleanseCd ?? 3) - dt;
       if (e.cleanseCd <= 0) {
@@ -869,7 +961,7 @@ function statusTick(battle, dt) {
     const burn = advanceStatus(e.status, dt);
     if (burn <= 0) continue;
     const dealt = resolveHit(e, burn, { main: false });
-    e.cells -= dealt;
+    applyDamage(e, dealt);
     battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: dealt });
   }
 }
@@ -950,7 +1042,7 @@ function resolveDeaths(battle) {
       for (const other of alive) {
         if (other.cells <= 0) continue;
         if (Math.hypot(other.x - mark.x, other.y - mark.y) > 18) continue;
-        other.cells -= mark.stacks;
+        applyDamage(other, mark.stacks);
         battle.events.push({ type: 'burn', x: other.x, y: other.y, cells: mark.stacks });
       }
     }
@@ -970,8 +1062,8 @@ function resolveDeaths(battle) {
     for (const e of alive) {
       if (e.cells <= 0) continue;
       if (dist(e, at) > BOOM_RADIUS) continue;
-      e.cells -= 1;
-      e.cells -= 1;
+      applyDamage(e, 1);
+      applyDamage(e, 1);
       e.flash = 0.1;
       battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: 2 });
     }
@@ -1040,6 +1132,7 @@ export function step(battle, dt) {
   selfTick(battle, dt);
   rulesTick(battle, dt);
   riskTick(battle, dt);
+  trapTick(battle, dt);
   bulletsTick(battle, dt);
   enemiesTick(battle, dt);
   statusTick(battle, dt);
