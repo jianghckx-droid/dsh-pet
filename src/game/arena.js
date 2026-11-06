@@ -247,8 +247,24 @@ function nearestEnemy(battle, from, range = Infinity, excludeId = -1) {
   return best;
 }
 
-/** 猎手核心：优先打格数最低的，而不是最近的。 */
+/** 猎手核心：优先打格数最低的；标记规则：优先打带标记的。 */
 function pickTarget(battle, from, range, excludeId = -1) {
+  if (hasRule(battle, 'mark_hunter')) {
+    let marked = null;
+    let bestMark = 0;
+    let bestD = Infinity;
+    for (const e of battle.enemies) {
+      if (e.cells <= 0 || e.id === excludeId || (e.mark ?? 0) <= 0) continue;
+      const d = dist(from, e);
+      if (d > range) continue;
+      if (e.mark > bestMark || (e.mark === bestMark && d < bestD)) {
+        marked = e;
+        bestMark = e.mark;
+        bestD = d;
+      }
+    }
+    if (marked !== null) return marked;
+  }
   if (!hasCore(battle, 'core_hunter')) return nearestEnemy(battle, from, range, excludeId);
   let best = null;
   let bestCells = Infinity;
@@ -296,6 +312,9 @@ function spawnTick(battle) {
       root: 0,
       vortex: 0,
       wallCd: 0,
+      mark: 0,
+      markLeft: 0,
+      cleanseCd: 3,
       flash: 0,
     });
     battle.spawned += 1;
@@ -347,8 +366,16 @@ function rawHit(battle, enemy, cells, burn = 0) {
   return dealt;
 }
 
+function addMark(enemy, stacks) {
+  enemy.mark = Math.min(3, (enemy.mark ?? 0) + stacks);
+  enemy.markLeft = 6;
+}
+
 function hitEnemy(battle, enemy, card) {
   rawHit(battle, enemy, attackCells(card, battle.attrs), card.burn ?? 0);
+
+  if (card.mark) addMark(enemy, card.mark);
+  if (hasRule(battle, 'mark_hunter')) addMark(enemy, 1);
 
   if (hasRule(battle, 'rule_pin') && battle.pinCd <= 0) {
     enemy.root = Math.max(enemy.root, 1);
@@ -356,6 +383,16 @@ function hitEnemy(battle, enemy, card) {
   }
 
   if (hasRule(battle, 'rule_execute') && enemy.cells > 0 && enemy.cells <= EXECUTE_THRESHOLD) {
+    enemy.cells = 0;
+    battle.events.push({ type: 'execute', x: enemy.x, y: enemy.y });
+  }
+
+  if (
+    hasRule(battle, 'execute_mark') &&
+    (enemy.mark ?? 0) >= 3 &&
+    enemy.cells > 0 &&
+    enemy.cells <= 4
+  ) {
     enemy.cells = 0;
     battle.events.push({ type: 'execute', x: enemy.x, y: enemy.y });
   }
@@ -378,6 +415,7 @@ function fireBullet(battle, from, card, target) {
     // 存基础格数：命中时 hitEnemy 会再走一次 attackCells，否则锋锐会被加成两次
     cells: card.cells ?? 1,
     burn: card.burn ?? 0,
+    mark: card.mark ?? 0,
     pierce: hasCore(battle, 'core_pierce') ? 1 : 0,
     life: 1.2,
   });
@@ -460,7 +498,7 @@ function bulletsTick(battle, dt) {
     const d = Math.hypot(dx, dy) || 1;
     const travel = BULLET_SPEED * dt;
     if (d <= travel + BULLET_HIT_RADIUS) {
-      hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn });
+      hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn, mark: bullet.mark });
       if (bullet.pierce > 0) {
         const next = pickTarget(battle, bullet, orbRange(battle), target.id);
         if (next !== null) {
@@ -603,6 +641,18 @@ function enemiesTick(battle, dt) {
 function statusTick(battle, dt) {
   for (const e of battle.enemies) {
     if (e.cells <= 0) continue;
+    if ((e.mark ?? 0) > 0) {
+      e.markLeft = (e.markLeft ?? 0) - dt;
+      if (e.markLeft <= 0) e.mark = 0;
+    }
+    if (e.locks.includes('cleanse')) {
+      e.cleanseCd = (e.cleanseCd ?? 3) - dt;
+      if (e.cleanseCd <= 0) {
+        e.cleanseCd += 3;
+        e.status.burn = 0;
+        e.mark = 0;
+      }
+    }
     const burn = advanceStatus(e.status, dt);
     if (burn <= 0) continue;
     const dealt = resolveHit(e, burn, { main: false });
@@ -621,6 +671,7 @@ function resolveDeaths(battle) {
   const alive = [];
   const booms = [];
   const embers = [];
+  const marks = [];
   for (const e of battle.enemies) {
     if (e.cells > 0) {
       alive.push(e);
@@ -635,6 +686,7 @@ function resolveDeaths(battle) {
         battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + 1);
       }
       if (e.status.burn > 0) embers.push({ x: e.x, y: e.y, burn: e.status.burn });
+      if ((e.mark ?? 0) > 0) marks.push({ x: e.x, y: e.y, stacks: e.mark });
       if (hasCore(battle, 'core_echo')) {
         battle.echoKills += 1;
         if (battle.echoKills % 8 === 0) refreshCooldowns(battle);
@@ -671,6 +723,28 @@ function resolveDeaths(battle) {
       )
       .slice(0, battle.emberSpread);
     for (const target of targets) applyBurn(target.status, ember.burn, battle.burnCap);
+  }
+
+  // 引信：带标记的敌人死亡时按层数爆炸；传导：标记扩散给最近的两个
+  for (const mark of marks) {
+    if (hasRule(battle, 'fuse')) {
+      for (const other of alive) {
+        if (other.cells <= 0) continue;
+        if (Math.hypot(other.x - mark.x, other.y - mark.y) > 18) continue;
+        other.cells -= mark.stacks;
+        battle.events.push({ type: 'burn', x: other.x, y: other.y, cells: mark.stacks });
+      }
+    }
+    if (hasRule(battle, 'spread')) {
+      const targets = alive
+        .filter((other) => other.cells > 0)
+        .sort(
+          (a, b) =>
+            Math.hypot(a.x - mark.x, a.y - mark.y) - Math.hypot(b.x - mark.x, b.y - mark.y),
+        )
+        .slice(0, 2);
+      for (const target of targets) addMark(target, mark.stacks);
+    }
   }
 
   for (const at of booms) {
