@@ -84,12 +84,12 @@ test('属性换算', () => {
 
 test('第 6 层标定值', () => {
   const def = floorDef(6);
-  assert.equal(def.enemies, 10);
+  assert.equal(def.enemies, 8);
   assert.deepEqual(def.locks, ['carapace']);
-  assert.equal(enemyCells(6, def.locks), 20);
-  assert.equal(spawnSeconds(def), 3);
+  assert.equal(enemyCells(6, def.locks), 24);
+  assert.equal(spawnSeconds(def), 3.25);
 });
 
-test('第 1 层是无锁的 4 格杂兵', () => {
-  assert.equal(enemyCells(1, []), 4);
+test('第 1 层是无锁的 5 格杂兵', () => {
+  assert.equal(enemyCells(1, []), 5);
 });

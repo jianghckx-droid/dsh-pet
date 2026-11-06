@@ -1,5 +1,8 @@
 # DSH Pet — 层数表与第 6 层墙 v0.4
 
+> **v0.8 已上调敌人强度与刷新频率**：杂兵 4 + 层数 × 1.35、每层 26 秒、核心层敌数上调、伤害 1–3 格。
+> 本文档 §2–§4 的数字是 v0.4 的标定记录，当前值以 [design.md](design.md) §14 与 `src/game/floors.js` 为准。
+
 > 配套 [design.md](design.md) §11、[cards.md](cards.md) §11 ｜ 2026-11-06
 > 可重跑：`node tools/balance-sim.mjs --sweep`
 

@@ -13,7 +13,7 @@ test('token 压力：额外敌人会被刷出来，且不延长层时长', () =>
   assert.equal(addPressure(battle, 5), 5);
   assert.equal(battle.extra, 5);
   runToEnd(battle);
-  assert.equal(battle.spawned, 11, '6 base + 5 pressure');
+  assert.equal(battle.spawned, 13, '8 base + 5 pressure');
 });
 
 test('压力有上限，超出部分丢弃', () => {

@@ -6,7 +6,7 @@
 // "双锁混编"的实现是：同一层的敌人轮换携带不同的单锁，而不是一只怪同时带两个锁。
 // 同时带两个锁的怪留给以后（倍率相乘已经是按这个设计的）。
 
-export const FLOOR_SECONDS = 30;
+export const FLOOR_SECONDS = 26;
 
 /** 锁对格数的倍率。一只怪带多个锁时相乘。 */
 export const LOCK_CELLS = Object.freeze({
@@ -23,7 +23,7 @@ export const LOCK_CELLS = Object.freeze({
 });
 
 export function baseCells(floor) {
-  return 3 + 1.2 * floor;
+  return 4 + 1.35 * floor;
 }
 
 export function lockMultiplier(locks = []) {
@@ -36,7 +36,9 @@ export function enemyCells(floor, locks = []) {
 }
 
 export function enemyDamage(floor) {
-  return floor >= 8 ? 2 : 1;
+  if (floor >= 10) return 3;
+  if (floor >= 5) return 2;
+  return 1;
 }
 
 export function spawnSeconds(def) {
@@ -44,21 +46,21 @@ export function spawnSeconds(def) {
 }
 
 export const FLOORS = Object.freeze([
-  Object.freeze({ floor: 1, enemies: 6, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 2, enemies: 7, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 3, enemies: 8, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 4, enemies: 9, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 5, enemies: 10, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 6, enemies: 10, locks: Object.freeze(['carapace']) }),
-  Object.freeze({ floor: 7, enemies: 10, locks: Object.freeze(['carapace']) }),
-  Object.freeze({ floor: 8, enemies: 11, locks: Object.freeze(['carapace']) }),
-  Object.freeze({ floor: 9, enemies: 10, locks: Object.freeze(['split']) }),
-  Object.freeze({ floor: 10, enemies: 11, locks: Object.freeze(['anchor']) }),
-  Object.freeze({ floor: 11, enemies: 11, locks: Object.freeze(['cleanse']) }),
-  Object.freeze({ floor: 12, enemies: 12, locks: Object.freeze(['phase']) }),
-  Object.freeze({ floor: 13, enemies: 12, locks: Object.freeze(['devour']) }),
-  Object.freeze({ floor: 14, enemies: 12, locks: Object.freeze(['generator']) }),
-  Object.freeze({ floor: 15, enemies: 13, locks: Object.freeze(['reflect']) }),
+  Object.freeze({ floor: 1, enemies: 8, locks: Object.freeze([]) }),
+  Object.freeze({ floor: 2, enemies: 9, locks: Object.freeze([]) }),
+  Object.freeze({ floor: 3, enemies: 10, locks: Object.freeze([]) }),
+  Object.freeze({ floor: 4, enemies: 12, locks: Object.freeze([]) }),
+  Object.freeze({ floor: 5, enemies: 13, locks: Object.freeze([]) }),
+  Object.freeze({ floor: 6, enemies: 8, locks: Object.freeze(['carapace']) }),
+  Object.freeze({ floor: 7, enemies: 9, locks: Object.freeze(['carapace']) }),
+  Object.freeze({ floor: 8, enemies: 10, locks: Object.freeze(['carapace']) }),
+  Object.freeze({ floor: 9, enemies: 12, locks: Object.freeze(['split']) }),
+  Object.freeze({ floor: 10, enemies: 13, locks: Object.freeze(['anchor']) }),
+  Object.freeze({ floor: 11, enemies: 13, locks: Object.freeze(['cleanse']) }),
+  Object.freeze({ floor: 12, enemies: 14, locks: Object.freeze(['phase']) }),
+  Object.freeze({ floor: 13, enemies: 14, locks: Object.freeze(['devour']) }),
+  Object.freeze({ floor: 14, enemies: 15, locks: Object.freeze(['generator']) }),
+  Object.freeze({ floor: 15, enemies: 16, locks: Object.freeze(['reflect']) }),
 ]);
 
 /** MVP 只做到第 8 层（第 6 层是墙，第 8 层是切片上限）。 */

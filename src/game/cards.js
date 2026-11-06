@@ -534,16 +534,6 @@ export const GRAVITY_PACK = Object.freeze([
   'rule_wall_slam',
 ]);
 
-/** 实验包：P0–P5 全部新机制，进游戏用的入口。 */
-export const LAB_PACK = Object.freeze([
-  ...GRAVITY_PACK,
-  ...MARK_PACK,
-  ...SUMMON_PACK,
-  ...TIME_PACK,
-  ...RISK_PACK,
-  ...ENV_PACK,
-]);
-
 /** 灼烧包的抽卡池：已拥有铁弹 + 三件套时，从这 8 张里出三选一。 */
 export const FIRE_PACK = Object.freeze([
   'orb_fire',
@@ -554,6 +544,17 @@ export const FIRE_PACK = Object.freeze([
   'rule_combo',
   'rule_execute',
   'rule_anchor',
+]);
+
+/** 实验包：灼烧包 + P0–P5 全部新机制，进游戏用的唯一入口。 */
+export const LAB_PACK = Object.freeze([
+  ...FIRE_PACK,
+  ...GRAVITY_PACK,
+  ...MARK_PACK,
+  ...SUMMON_PACK,
+  ...TIME_PACK,
+  ...RISK_PACK,
+  ...ENV_PACK,
 ]);
 
 /** 灼烧包的开局 build（模拟器与单测用）。 */
