@@ -2221,7 +2221,7 @@ window.__ModuleLoader__.load({
 
     const COLORS = {
       bg: '#0a0d12',
-      grid: '#121a24',
+      grid: '#18222e',
       frame: '#1c2733',
       player: '#cfe3ef',
       playerDark: '#7fa3b8',
@@ -2258,6 +2258,17 @@ window.__ModuleLoader__.load({
       '.dsh-pet-cells i{display:block;height:100%;background:#6ee7a8;transition:width .12s linear}',
       '.dsh-pet-bottom{display:flex;gap:8px;color:#6c8091;font-size:10px}',
       '.dsh-pet-hot{color:#e35d5d}',
+      '.dsh-pet-banner{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;',
+      'justify-content:center;gap:2px;pointer-events:none;animation:bannerIn .28s ease-out both}',
+      '.dsh-pet-banner-text{font-size:16px;letter-spacing:.18em;color:#fff;text-shadow:0 0 6px rgba(255,209,102,.85)}',
+      '.dsh-pet-banner-sub{font-size:10px;letter-spacing:.24em;color:#ffd166}',
+      '@keyframes bannerIn{from{opacity:0;transform:scale(1.35)}to{opacity:1;transform:scale(1)}}',
+      '@keyframes pointsPulse{0%,100%{opacity:1}50%{opacity:.45}}',
+      '.dsh-pet-points.ready{animation:pointsPulse 1.1s ease-in-out infinite}',
+      '.dsh-pet-card{transition:transform .12s ease,background .12s ease,border-color .12s ease}',
+      '.dsh-pet-card:hover{transform:translateY(-1px)}',
+      '.dsh-pet-overlay{animation:overlayIn .16s ease-out}',
+      '@keyframes overlayIn{from{opacity:0}to{opacity:1}}',
       '.dsh-pet-offer{position:absolute;left:5px;right:5px;bottom:5px;display:flex;flex-direction:column;gap:3px;',
       'background:rgba(10,14,20,.94);border:1px solid #2a3a4a;border-radius:5px;padding:5px}',
       '.dsh-pet-offer-title{font-size:9px;color:#ffd166;letter-spacing:.08em}',
@@ -2386,6 +2397,17 @@ window.__ModuleLoader__.load({
       entry.phase = 'fight'
       entry.fx = []
       entry.acc = 0
+      entry.particles = []
+      entry.playerTrail = []
+      entry.trailTimer = 0
+      entry.spawnAt = new Map()
+      entry.bulletPrev = new Map()
+      entry.shake = 0
+      entry.flash = 0
+      entry.muzzle = 0
+      entry.hurtT = 0
+      const mod = floorModifier(floor)
+      entry.banner = { text: '第 ' + floor + ' 层', sub: mod !== null ? MODIFIERS[mod].name : '', t: 1.3 }
       entry.battle = createBattle({
         floor,
         build: [...build.cards, ...entry.drafted],
@@ -2431,6 +2453,19 @@ window.__ModuleLoader__.load({
         lastResult: null,
         resultTimer: 0,
         fx: [],
+        particles: [],
+        playerTrail: [],
+        trailTimer: 0,
+        time: 0,
+        shake: 0,
+        flash: 0,
+        flashColor: '#ffffff',
+        banner: null,
+        spawnAt: new Map(),
+        bulletPrev: new Map(),
+        muzzle: 0,
+        hurtT: 0,
+        moving: false,
         acc: 0,
         drafted: [],
         seed: seed === undefined ? (Date.now() % 100000) + 1 : seed,
@@ -2516,7 +2551,122 @@ window.__ModuleLoader__.load({
       return true
     }
 
+    const MAX_PARTICLES = 220
+
+    function addParticles(entry, x, y, count, color, speed, life, gravity = 0) {
+      for (let i = 0; i < count; i += 1) {
+        if (entry.particles.length >= MAX_PARTICLES) entry.particles.shift()
+        const angle = Math.random() * Math.PI * 2
+        const magnitude = speed * (0.35 + Math.random() * 0.8)
+        entry.particles.push({
+          x,
+          y,
+          vx: Math.cos(angle) * magnitude,
+          vy: Math.sin(angle) * magnitude,
+          gravity,
+          life,
+          maxLife: life,
+          color,
+          size: Math.random() < 0.3 ? 2 : 1,
+        })
+      }
+    }
+
+    /** 把战斗事件翻译成场面反馈：粒子、震屏、闪白、横幅。 */
+    function juice(entry, ev) {
+      switch (ev.type) {
+        case 'hit':
+          addParticles(entry, ev.x, ev.y, ev.cells >= 3 ? 5 : 3, '#ffe9b0', 44, 0.28, 30)
+          if (ev.cells >= 3) entry.shake = Math.max(entry.shake, 1.4)
+          break
+        case 'burn':
+          addParticles(entry, ev.x, ev.y, 1, '#ff9f45', 12, 0.5, -22)
+          break
+        case 'kill':
+          addParticles(entry, ev.x, ev.y, 5, '#ffd166', 52, 0.35, 40)
+          entry.fx.push({ x: ev.x, y: ev.y, r: 2, life: 0.3 })
+          break
+        case 'shot':
+          entry.muzzle = 0.06
+          break
+        case 'pulse':
+          entry.fx.push({ x: ev.x, y: ev.y, r: 5, life: 0.45 })
+          addParticles(entry, ev.x, ev.y, 3, '#ffd166', 30, 0.3, 0)
+          break
+        case 'blast':
+          entry.fx.push({ x: ev.x, y: ev.y, r: 8, life: 0.5 })
+          addParticles(entry, ev.x, ev.y, 8, '#ffb347', 62, 0.4, 50)
+          entry.shake = Math.max(entry.shake, 3)
+          break
+        case 'hurt':
+          entry.shake = Math.max(entry.shake, 2.4)
+          entry.flash = Math.max(entry.flash, 0.35)
+          entry.flashColor = '#e35d5d'
+          entry.hurtT = 0.2
+          break
+        case 'freeze':
+          entry.flash = Math.max(entry.flash, 0.16)
+          entry.flashColor = '#9fd8ff'
+          break
+        case 'surge':
+          entry.banner = { text: '过载潮', sub: 'token 压力', t: 1.6 }
+          entry.flash = Math.max(entry.flash, 0.45)
+          entry.flashColor = '#ff9f45'
+          entry.shake = Math.max(entry.shake, 3)
+          break
+        case 'elite':
+          entry.banner = { text: '精英', sub: '双锁', t: 1.2 }
+          entry.flash = Math.max(entry.flash, 0.3)
+          entry.flashColor = '#ffd166'
+          break
+        case 'merge':
+          addParticles(entry, ev.x, ev.y, 4, '#9fd8ff', 34, 0.3, 0)
+          break
+        case 'summonDown':
+          addParticles(entry, ev.x, ev.y, 3, '#ffb347', 40, 0.3, 30)
+          break
+        case 'execute':
+          addParticles(entry, ev.x, ev.y, 6, '#ff6b6b', 55, 0.35, 30)
+          entry.shake = Math.max(entry.shake, 1.6)
+          break
+        case 'wall':
+          addParticles(entry, ev.x, ev.y, 3, '#8fa4b5', 30, 0.25, 20)
+          break
+        case 'reflect':
+          addParticles(entry, ev.x, ev.y, 2, '#9fd8ff', 28, 0.25, 0)
+          break
+        case 'phase':
+          addParticles(entry, ev.x, ev.y, 1, '#c9b3ff', 18, 0.3, 0)
+          break
+        default:
+          break
+      }
+    }
+
     function tick(entry, dt) {
+      entry.time += dt
+      if (entry.shake > 0) entry.shake = Math.max(0, entry.shake - dt * 20)
+      if (entry.flash > 0) entry.flash = Math.max(0, entry.flash - dt * 2.6)
+      if (entry.muzzle > 0) entry.muzzle = Math.max(0, entry.muzzle - dt)
+      if (entry.hurtT > 0) entry.hurtT = Math.max(0, entry.hurtT - dt)
+      if (entry.banner !== null) {
+        entry.banner.t -= dt
+        if (entry.banner.t <= 0) entry.banner = null
+      }
+      for (const p of entry.particles) {
+        p.x += p.vx * dt
+        p.y += p.vy * dt
+        p.vx *= 0.9
+        p.vy = p.vy * 0.9 + p.gravity * dt
+        p.life -= dt
+      }
+      if (entry.particles.length > 0) {
+        entry.particles = entry.particles.filter((p) => p.life > 0)
+      }
+      for (const t of entry.playerTrail) t.life -= dt
+      if (entry.playerTrail.length > 0) {
+        entry.playerTrail = entry.playerTrail.filter((t) => t.life > 0)
+      }
       for (const f of entry.fx) {
         f.life -= dt
         f.r += dt * 46
@@ -2532,11 +2682,20 @@ window.__ModuleLoader__.load({
       const battle = entry.battle
       if (battle === null) return
       drainTokens(entry)
+      const beforeX = battle.player.x
+      const beforeY = battle.player.y
       const events = step(battle, dt)
-      for (const ev of events) {
-        if (ev.type === 'pulse') entry.fx.push({ x: ev.x, y: ev.y, r: 6, life: 0.4 })
-        else if (ev.type === 'kill') entry.fx.push({ x: ev.x, y: ev.y, r: 2, life: 0.28 })
+      entry.moving = Math.hypot(battle.player.x - beforeX, battle.player.y - beforeY) > 0.2
+      entry.trailTimer -= dt
+      if (entry.moving && entry.trailTimer <= 0) {
+        entry.trailTimer += 0.06
+        entry.playerTrail.push({ x: battle.player.x, y: battle.player.y, life: 0.32 })
+        if (entry.playerTrail.length > 14) entry.playerTrail.shift()
       }
+      for (const e of battle.enemies) {
+        if (!entry.spawnAt.has(e.id)) entry.spawnAt.set(e.id, entry.time)
+      }
+      for (const ev of events) juice(entry, ev)
       if (battle.state !== 'fighting') {
         entry.lastResult = {
           kind: battle.state,
@@ -2592,8 +2751,12 @@ window.__ModuleLoader__.load({
 
     // ---- 绘制 ----
 
-    function drawEnemy(c, e) {
-      const size = Math.round(4 + Math.min(6, e.cells / 4))
+    function drawEnemy(c, e, entry) {
+      const spawn = entry.spawnAt.get(e.id)
+      const age = spawn === undefined ? 1 : entry.time - spawn
+      const grow = Math.min(1, age / 0.22)
+      const base = Math.round(5 + Math.min(7, e.cells / 4))
+      const size = Math.max(1, Math.round(base * (0.45 + grow * 0.55)))
       const half = Math.floor(size / 2)
       const x = Math.round(e.x) - half
       const y = Math.round(e.y) - half
@@ -2604,11 +2767,32 @@ window.__ModuleLoader__.load({
           : COLORS.enemy
       const lit = e.flash > 0
       const phased = (e.invuln ?? 0) > 0
-      if (phased) c.globalAlpha = 0.45
+      c.globalAlpha = (phased ? 0.45 : 1) * (0.35 + grow * 0.65)
+
+      // 落地阴影
+      c.fillStyle = '#05070a'
+      c.fillRect(x, y + size, size, 1)
+
+      if (e.freeze > 0) {
+        c.fillStyle = '#9fd8ff'
+        c.fillRect(x - 1, y - 1, size + 2, size + 2)
+      }
+
       c.fillStyle = lit ? '#ffffff' : style.rim
       c.fillRect(x, y, size, size)
       c.fillStyle = lit ? '#ffffff' : style.body
       c.fillRect(x + 1, y + 1, Math.max(1, size - 2), Math.max(1, size - 2))
+
+      if (size >= 6 && !lit) {
+        c.fillStyle = '#0a0d12'
+        c.fillRect(x + 2, y + 2, 1, 1)
+        c.fillRect(x + size - 3, y + 2, 1, 1)
+      }
+      if (e.locks.includes('carapace') && size >= 5 && !lit) {
+        c.fillStyle = '#2f4a5c'
+        c.fillRect(x + 1, y + Math.floor(size / 2), size - 2, 1)
+      }
+      c.globalAlpha = 1
 
       // 格数条
       const barW = Math.max(3, size)
@@ -2623,54 +2807,121 @@ window.__ModuleLoader__.load({
         c.fillStyle = '#8fd8ff'
         c.fillRect(x - 2, y - 2, 1, 2)
       }
-      // 灼烧标记
+      // 灼烧标记（闪烁）
       if (e.status.burn > 0) {
-        c.fillStyle = COLORS.burn
+        c.fillStyle = Math.sin(entry.time * 18 + e.id) > 0 ? '#ff9f45' : '#ffcf8a'
         c.fillRect(x + size + 1, y, 1, 1)
         if (e.status.burn >= 3) c.fillRect(x + size + 1, y + 2, 1, 1)
       }
+      // 标记（脉冲）
       if ((e.mark ?? 0) > 0) {
+        c.globalAlpha = 0.45 + 0.55 * Math.abs(Math.sin(entry.time * 8))
         c.fillStyle = '#ff6b6b'
         c.fillRect(x + Math.floor(size / 2), y - 6, 1, 1)
+        c.globalAlpha = 1
       }
-      if (phased) c.globalAlpha = 1
+      // 护盾描边（呼吸）
       if ((e.shield ?? 0) > 0) {
+        c.globalAlpha = 0.5 + 0.5 * Math.abs(Math.sin(entry.time * 5))
         c.fillStyle = '#9fd8ff'
         c.fillRect(x - 1, y - 1, size + 2, 1)
         c.fillRect(x - 1, y + size, size + 2, 1)
         c.fillRect(x - 1, y - 1, 1, size + 2)
         c.fillRect(x + size, y - 1, 1, size + 2)
+        c.globalAlpha = 1
       }
     }
 
     function drawSummon(c, s) {
       const x = Math.round(s.x) - 2
       const y = Math.round(s.y) - 2
+      c.fillStyle = '#05070a'
+      c.fillRect(x - 1, y - 1, 6, 6)
       c.fillStyle = COLORS.summon.rim
-      c.fillRect(x, y, 4, 4)
+      c.fillRect(x, y, 5, 5)
       c.fillStyle = COLORS.summon.body
-      c.fillRect(x + 1, y + 1, 2, 2)
+      c.fillRect(x + 1, y + 1, 3, 3)
     }
 
-    function drawPlayer(c, p) {
-      const x = Math.round(p.x) - 3
-      const y = Math.round(p.y) - 3
+    function drawPlayer(c, p, entry) {
+      const bob = entry.moving ? Math.round(Math.sin(entry.time * 12) * 0.5) : 0
+      const squash = entry.hurtT > 0 ? 1 : 0
+      const w = 7 + squash
+      const h = 6 - squash
+      const x = Math.round(p.x) - Math.floor(w / 2)
+      const y = Math.round(p.y) - Math.floor(h / 2) + bob
+      c.fillStyle = '#05070a'
+      c.fillRect(x - 1, y - 1, w + 2, h + 2)
       c.fillStyle = COLORS.playerDark
-      c.fillRect(x, y + 5, 6, 1)
-      c.fillStyle = COLORS.player
-      c.fillRect(x, y, 6, 5)
+      c.fillRect(x - 1, y + h, w + 2, 1)
+      c.fillStyle = entry.hurtT > 0 ? '#ffffff' : COLORS.player
+      c.fillRect(x, y, w, h)
       c.fillStyle = COLORS.eye
-      c.fillRect(x + 1, y + 2, 1, 1)
-      c.fillRect(x + 4, y + 2, 1, 1)
+      c.fillRect(x + 1, y + 2, 1, 2)
+      c.fillRect(x + w - 2, y + 2, 1, 2)
+      if (entry.muzzle > 0) {
+        c.fillStyle = '#fff2b0'
+        c.fillRect(x + w, y + 2, 2, 1)
+      }
     }
 
     function draw(c, entry) {
-      c.setTransform(2, 0, 0, 2, 0, 0)
+      const shake = entry.shake
+      const ox = shake > 0 ? Math.sin(entry.time * 130) * shake : 0
+      const oy = shake > 0 ? Math.cos(entry.time * 170) * shake : 0
+      c.setTransform(2, 0, 0, 2, Math.round(ox * 2), Math.round(oy * 2))
       c.imageSmoothingEnabled = false
       c.fillStyle = COLORS.bg
-      c.fillRect(0, 0, W, H)
+      c.fillRect(-8, -8, W + 16, H + 16)
+
+      // 环境浮尘
+      c.fillStyle = '#22303f'
+      for (let i = 0; i < 12; i += 1) {
+        const x = (i * 37 + entry.time * (4 + (i % 3))) % W
+        const y = (i * 53 + Math.sin(entry.time * 0.6 + i) * 6 + H) % H
+        c.fillRect(Math.round(x), Math.round(y), 1, 1)
+      }
+
+      // 背景余烬：缓慢上升，给空场一点呼吸
+      c.fillStyle = '#ff9f45'
+      for (let i = 0; i < 7; i += 1) {
+        const t = (entry.time * 0.28 + i * 0.143) % 1
+        const x = (i * 23 + Math.sin(entry.time * 0.4 + i) * 9 + W) % W
+        const y = H - t * H
+        c.globalAlpha = 0.22 * (1 - t)
+        c.fillRect(Math.round(x), Math.round(y), 1, 1)
+      }
+      c.globalAlpha = 1
+
+      // 网格呼吸
+      c.globalAlpha = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(entry.time * 2))
       c.fillStyle = COLORS.grid
       for (let x = 8; x < W; x += 8) for (let y = 8; y < H; y += 8) c.fillRect(x, y, 1, 1)
+      c.globalAlpha = 1
+
+      // 场地标记：中心环 + 四角括号
+      c.globalAlpha = 0.22
+      c.fillStyle = '#2a3a4a'
+      for (let i = 0; i < 28; i += 1) {
+        const a = (i / 28) * Math.PI * 2
+        c.fillRect(
+          Math.round(W / 2 + Math.cos(a) * 30),
+          Math.round(H / 2 + Math.sin(a) * 30),
+          1,
+          1,
+        )
+      }
+      c.globalAlpha = 1
+      c.fillStyle = COLORS.frame
+      c.fillRect(4, 4, 8, 1)
+      c.fillRect(4, 4, 1, 8)
+      c.fillRect(W - 12, 4, 8, 1)
+      c.fillRect(W - 5, 4, 1, 8)
+      c.fillRect(4, H - 5, 8, 1)
+      c.fillRect(4, H - 12, 1, 8)
+      c.fillRect(W - 12, H - 5, 8, 1)
+      c.fillRect(W - 5, H - 12, 1, 8)
+
       c.fillStyle = COLORS.frame
       c.fillRect(0, 0, W, 1)
       c.fillRect(0, H - 1, W, 1)
@@ -2680,43 +2931,124 @@ window.__ModuleLoader__.load({
       const battle = entry.battle
       if (battle === null) return
 
+      // 冲击环
       for (const f of entry.fx) {
-        const alpha = Math.max(0, f.life * 2.4)
-        c.fillStyle = 'rgba(255,209,102,' + alpha.toFixed(2) + ')'
-        for (let i = 0; i < 10; i += 1) {
-          const a = (i / 10) * Math.PI * 2
-          c.fillRect(Math.round(f.x + Math.cos(a) * f.r), Math.round(f.y + Math.sin(a) * f.r), 1, 1)
-        }
-      }
-
-      for (const trail of battle.trails) {
-        c.globalAlpha = Math.max(0.15, Math.min(1, trail.ttl / 2))
-        c.fillStyle = trail.card.kind === 'shock' ? '#9fd8ff' : '#ff9f45'
-        c.fillRect(Math.round(trail.x) - 2, Math.round(trail.y) - 2, 4, 4)
-      }
-      c.globalAlpha = 1
-      for (const trap of battle.traps) {
-        c.fillStyle = trap.card.kind === 'frost' ? '#9fd8ff' : '#e35d5d'
-        c.fillRect(Math.round(trap.x) - 1, Math.round(trap.y) - 1, 3, 3)
-      }
-
-      for (const e of battle.enemies) drawEnemy(c, e)
-      for (const s of battle.summons) drawSummon(c, s)
-      c.fillStyle = COLORS.bullet
-      for (const b of battle.bullets) c.fillRect(Math.round(b.x), Math.round(b.y), 1, 1)
-      drawPlayer(c, battle.player)
-
-      if (battle.player.shield > 0) {
-        c.fillStyle = '#9fd8ff'
-        for (let i = 0; i < 8; i += 1) {
-          const a = (i / 8) * Math.PI * 2
+        c.globalAlpha = Math.max(0, Math.min(1, f.life * 2.4))
+        c.fillStyle = '#ffd166'
+        for (let i = 0; i < 12; i += 1) {
+          const a = (i / 12) * Math.PI * 2
           c.fillRect(
-            Math.round(battle.player.x + Math.cos(a) * 7),
-            Math.round(battle.player.y + Math.sin(a) * 7),
+            Math.round(f.x + Math.cos(a) * f.r),
+            Math.round(f.y + Math.sin(a) * f.r),
             1,
             1,
           )
         }
+      }
+      c.globalAlpha = 1
+
+      // 轨迹：外层柔光 + 内层实心
+      for (const trail of battle.trails) {
+        const alpha = Math.max(0.12, Math.min(1, trail.ttl / 2))
+        c.fillStyle = trail.card.kind === 'shock' ? '#9fd8ff' : '#ff9f45'
+        c.globalAlpha = alpha * 0.3
+        c.fillRect(Math.round(trail.x) - 3, Math.round(trail.y) - 3, 6, 6)
+        c.globalAlpha = alpha
+        c.fillRect(Math.round(trail.x) - 2, Math.round(trail.y) - 2, 4, 4)
+      }
+      c.globalAlpha = 1
+
+      // 陷阱：呼吸光晕
+      for (const trap of battle.traps) {
+        const pulse = 0.5 + 0.5 * Math.sin(entry.time * 6)
+        c.fillStyle = trap.card.kind === 'frost' ? '#9fd8ff' : '#e35d5d'
+        c.globalAlpha = 0.25 + pulse * 0.3
+        c.fillRect(Math.round(trap.x) - 3, Math.round(trap.y) - 3, 6, 6)
+        c.globalAlpha = 0.75
+        c.fillRect(Math.round(trap.x) - 1, Math.round(trap.y) - 1, 3, 3)
+      }
+      c.globalAlpha = 1
+
+      for (const e of battle.enemies) drawEnemy(c, e, entry)
+      for (const s of battle.summons) drawSummon(c, s)
+      for (const t of entry.playerTrail) {
+        c.globalAlpha = Math.max(0, t.life / 0.32) * 0.65
+        c.fillStyle = COLORS.playerDark
+        c.fillRect(Math.round(t.x) - 1, Math.round(t.y) - 1, 2, 2)
+      }
+      c.globalAlpha = 1
+      drawPlayer(c, battle.player, entry)
+
+      // 弹丸：拖尾
+      const next = new Map()
+      c.fillStyle = COLORS.bullet
+      for (const b of battle.bullets) {
+        const prev = entry.bulletPrev.get(b.id)
+        if (prev !== undefined) {
+          c.globalAlpha = 0.35
+          c.fillRect(Math.round((prev.x + b.x) / 2), Math.round((prev.y + b.y) / 2), 1, 1)
+          c.globalAlpha = 1
+        }
+        c.globalAlpha = 0.22
+        c.fillRect(Math.round(b.x) - 1, Math.round(b.y) - 1, 3, 3)
+        c.globalAlpha = 1
+        c.fillRect(Math.round(b.x), Math.round(b.y), 1, 2)
+        next.set(b.id, { x: b.x, y: b.y })
+      }
+      entry.bulletPrev = next
+
+      if (battle.player.shield > 0) {
+        const radius = 7 + Math.sin(entry.time * 6) * 0.8
+        c.fillStyle = '#9fd8ff'
+        for (let i = 0; i < 8; i += 1) {
+          const a = (i / 8) * Math.PI * 2 + entry.time * 1.5
+          c.fillRect(
+            Math.round(battle.player.x + Math.cos(a) * radius),
+            Math.round(battle.player.y + Math.sin(a) * radius),
+            1,
+            1,
+          )
+        }
+      }
+
+      // 粒子
+      for (const p of entry.particles) {
+        c.globalAlpha = Math.max(0, Math.min(1, p.life / p.maxLife))
+        c.fillStyle = p.color
+        c.fillRect(Math.round(p.x), Math.round(p.y), p.size, p.size)
+      }
+      c.globalAlpha = 1
+
+      // 像素暗角
+      for (let i = 0; i < 6; i += 1) {
+        c.globalAlpha = 0.055
+        c.fillStyle = '#000000'
+        c.fillRect(i, i, W - i * 2, 1)
+        c.fillRect(i, H - 1 - i, W - i * 2, 1)
+        c.fillRect(i, i, 1, H - i * 2)
+        c.fillRect(W - 1 - i, i, 1, H - i * 2)
+      }
+      c.globalAlpha = 1
+
+      // 低血预警：红色边缘呼吸
+      const hpRatio = battle.player.maxCells > 0 ? battle.player.cells / battle.player.maxCells : 1
+      if (hpRatio < 0.35) {
+        const pulse = 0.5 + 0.5 * Math.sin(entry.time * 6)
+        c.globalAlpha = 0.06 + pulse * 0.09
+        c.fillStyle = '#e35d5d'
+        c.fillRect(0, 0, W, 4)
+        c.fillRect(0, H - 4, W, 4)
+        c.fillRect(0, 0, 4, H)
+        c.fillRect(W - 4, 0, 4, H)
+        c.globalAlpha = 1
+      }
+
+      // 全屏闪
+      if (entry.flash > 0) {
+        c.globalAlpha = Math.min(0.4, entry.flash)
+        c.fillStyle = entry.flashColor
+        c.fillRect(0, 0, W, H)
+        c.globalAlpha = 1
       }
     }
 
@@ -2893,6 +3225,7 @@ window.__ModuleLoader__.load({
       const cells = battle === null ? 0 : battle.player.cells
       const maxCells = battle === null ? 1 : battle.player.maxCells
       const pct = Math.max(0, Math.min(100, (cells / maxCells) * 100))
+      const hpColor = pct > 50 ? '#6ee7a8' : pct > 25 ? '#ffd166' : '#e35d5d'
       const build = BUILDS[entry.buildId]
       const attrs = battle !== null ? battle.attrs : entry.attrs
       const points = battle !== null ? battle.points : entry.points
@@ -2915,6 +3248,14 @@ window.__ModuleLoader__.load({
         ),
         h('div', { className: 'dsh-pet-stage' },
           h('canvas', { ref: canvasRef, width: W * 2, height: H * 2, className: 'dsh-pet-canvas' }),
+          entry.banner !== null
+            ? h('div', { className: 'dsh-pet-banner' },
+                h('div', { className: 'dsh-pet-banner-text' }, entry.banner.text),
+                entry.banner.sub !== ''
+                  ? h('div', { className: 'dsh-pet-banner-sub' }, entry.banner.sub)
+                  : null,
+              )
+            : null,
           result !== null
             ? h('div', { className: 'dsh-pet-overlay' },
                 h('div', {
@@ -2945,11 +3286,11 @@ window.__ModuleLoader__.load({
               )
             : null,
         ),
-        h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%' } })),
+        h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%', background: hpColor } })),
         h('div', { className: 'dsh-pet-attrs' },
           h('div', { className: 'dsh-pet-attrs-head' },
             h('span', null, '属性'),
-            h('span', { className: 'dsh-pet-points' }, '可分配 ' + points),
+            h('span', { className: 'dsh-pet-points' + (points > 0 ? ' ready' : '') }, '可分配 ' + points),
           ),
           h('div', { className: 'dsh-pet-attr-grid' },
             ATTRIBUTES.map((attr) =>

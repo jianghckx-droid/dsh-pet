@@ -23,7 +23,8 @@
     "build": "node tools/build-client.mjs",
     "build:check": "node tools/build-client.mjs --check",
     "sim": "node tools/balance-sim.mjs --sweep",
-    "arena": "node tools/arena-report.mjs"
+    "arena": "node tools/arena-report.mjs",
+    "preview": "node tools/render-frame.mjs 25 docs/preview.png 6"
   },
   "dsh": {
     "bundle": {

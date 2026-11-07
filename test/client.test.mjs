@@ -216,6 +216,22 @@ test('失败后停在原层重试，并保底给解卡', () => {
   assert.ok(entry.battle.offer.some((id) => solvers.includes(id)));
 });
 
+test('绘制在多帧之后仍然稳定', () => {
+  const { createEntry, tick, draw } = loadModule().__debug;
+  const entry = createEntry('draw-key', 7);
+  const c = fakeContext();
+  let sawParticles = false;
+  for (let i = 0; i < 600; i += 1) {
+    tick(entry, 1 / 60);
+    draw(c, entry);
+    assert.ok(Number.isFinite(entry.shake), 'shake must stay finite');
+    assert.ok(entry.particles.length <= 220, 'particles must be capped');
+    if (entry.particles.length > 0) sawParticles = true;
+  }
+  assert.ok(sawParticles, 'expected particles during combat');
+  assert.ok(c.calls.length > 500, 'expected a lot of draw calls');
+});
+
 test('token 过载潮：攒满触发', () => {
   const { createEntry, pushTokens } = loadModule().__debug;
   const entry = createEntry('surge-key', 7);
