@@ -58,12 +58,23 @@ const BUILDS = {
     },
   },
   sword: {
-    label: '御剑',
+    label: '环身御剑',
     movement: 'approach',
     build: {
       skills: [
         { id: 'skill-1', action: 'orbitSword', element: 'fire', modifier: 'echo' },
         { id: 'skill-2', action: 'impact', element: 'frost', modifier: null },
+      ],
+      reserve: [],
+    },
+  },
+  swordArc: {
+    label: '弧光剑阵',
+    movement: 'keepDistance',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'arcSword', element: 'frost', modifier: null },
+        { id: 'skill-2', action: 'swordArray', element: 'thunder', modifier: null },
       ],
       reserve: [],
     },

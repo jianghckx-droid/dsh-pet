@@ -25,6 +25,7 @@ function makeWindow(store) {
     localStorage: {
       getItem: (key) => (store.has(key) ? store.get(key) : null),
       setItem: (key, value) => store.set(key, String(value)),
+      removeItem: (key) => store.delete(key),
     },
   };
 }
@@ -174,7 +175,7 @@ test('备用栏：替换下来的组件进入备用栏，可再装回', () => {
   }
 });
 
-test('存档：构筑与累计战绩写进 v4 存档，再进角色仍在', () => {
+test('存档：构筑与累计战绩写进 v5 存档，再进角色仍在', () => {
   const { createEntry, awardXp, pickUpgrade } = loadModule().__debug;
   const store = new Map();
   const mod = loadModule(store);
@@ -279,6 +280,37 @@ test('修复：v5 存档里的失效组件被安全清空并显示提示', () =>
   assert.ok(store.has('dsh.pet.v5.broken-key.bak'), '修复前必须保留原始存档备份');
 });
 
+test('兼容：旧剑修存档仍保留环身御剑，不静默替换为弧光飞剑', () => {
+  const store = new Map();
+  store.set(
+    'dsh.pet.v5.old-sword-key',
+    JSON.stringify({
+      version: 5,
+      style: 'sword',
+      movement: 'approach',
+      build: {
+        version: 3,
+        skills: [{ id: 'skill-1', action: 'orbitSword', element: 'fire', modifier: 'echo' }],
+        reserve: [],
+      },
+      stats: { kills: 10, bestFloor: 4, maxFloorKills: 5, drafts: 2 },
+      floor: 4,
+      best: 4,
+      level: 5,
+      xp: 1,
+      xpNext: 12,
+      pending: 0,
+      draftCount: 2,
+    }),
+  );
+  const { createEntry } = loadModule(store).__debug;
+  const entry = createEntry('old-sword-key', 7);
+  assert.equal(entry.style, 'sword');
+  assert.equal(entry.movement, 'approach');
+  assert.equal(entry.build.skills[0].action, 'orbitSword');
+  assert.equal(entry.battle.plans[0].action.id, 'orbitSword');
+});
+
 test('token 驱动：输出 token 换成额外敌人', () => {
   const { createEntry, pushTokens } = loadModule().__debug;
   const entry = createEntry('tok-key', 7);
@@ -348,7 +380,8 @@ test('风格与移动策略：默认远程，切换近战会按新风格重开�
   tick(entry, 1 / 60);
   assert.ok(entry.stats.bestFloor >= 3, '清层应更新累计最高层');
   assert.equal(setStyle(entry, 'sword'), true);
-  assert.equal(entry.battle.build.skills[0].action, 'orbitSword');
+  assert.equal(entry.battle.build.skills[0].action, 'arcSword');
+  assert.equal(entry.movement, 'keepDistance');
 
   assert.equal(setMovement(entry, 'auto'), true);
   assert.equal(entry.movement, 'auto');
@@ -381,7 +414,17 @@ test('新动作接入：御剑与陷阱能创建实体并完成战斗绘制', ()
     mod.__debug.draw(c, entry);
   }
   assert.ok(c.calls.length > 500);
-  assert.ok(Array.isArray(entry.battle.orbitSwords));
+  assert.ok(Array.isArray(entry.battle.arcSwords));
+  assert.ok((entry.battle.stats.casts['skill-1'] ?? 0) > 0, '剑修应发射弧光飞剑');
+
+  entry.build = {
+    version: 3,
+    skills: [{ id: 'skill-1', action: 'orbitSword', element: null, modifier: null }],
+    reserve: [],
+  };
+  mod.__debug.startFloor(entry, 1);
+  for (let i = 0; i < 120; i += 1) mod.__debug.tick(entry, 1 / 60);
+  assert.ok(entry.battle.orbitSwords.length > 0, '环身御剑仍可作为可获取动作使用');
 
   entry.stats.bestFloor = 5;
   assert.equal(mod.__debug.setStyle(entry, 'trapper'), true);
@@ -414,4 +457,174 @@ test('战斗报告：伤害来源与反应次数可读', () => {
   const report = damageReport(entry)
   assert.equal(typeof report, 'string')
   assert.equal(typeof reactionReport(entry), 'string')
+});
+
+test('大厅：没有存档时不开战也不写盘，继续游戏不可用', () => {
+  const store = new Map();
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('lobby-empty', 7, { autostart: false });
+  assert.equal(entry.battle, null);
+  assert.equal(entry.phase, 'menu');
+  assert.equal(store.size, 0, '只是打开面板不应创建存档');
+  assert.equal(mod.__debug.latestSlot('lobby-empty'), -1);
+  assert.equal(mod.__debug.continueGame(entry), false);
+});
+
+test('继续游戏：从最近存档开打，不清空构筑与进度', () => {
+  const store = new Map();
+  const firstMod = loadModule(store);
+  const first = firstMod.__debug.createEntry('lobby-save', 7);
+  first.floor = 4;
+  first.best = 4;
+  first.stats.bestFloor = 4;
+  firstMod.__debug.startFloor(first, 4);
+
+  const mod = loadModule(store);
+  const second = mod.__debug.createEntry('lobby-save', 7, { autostart: false });
+  assert.equal(second.battle, null);
+  assert.equal(second.floor, 4);
+  assert.equal(mod.__debug.continueGame(second), true);
+  assert.equal(second.battle.floor, 4);
+  assert.equal(second.phase, 'fight');
+});
+
+test('存档槽位：新游戏写进指定槽位，读取后恢复该槽构筑', () => {
+  const store = new Map();
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('slots-key', 7);
+  mod.__debug.awardXp(entry.battle, 8);
+  const id = entry.battle.offer[0];
+  assert.equal(mod.__debug.pickUpgrade(entry, id), true);
+  assert.equal(entry.build.skills[0].element, id);
+
+  entry.stats.bestFloor = 5;
+  entry.best = 5;
+  assert.equal(mod.__debug.startNewGame(entry, 1, 'sword'), true);
+  assert.equal(entry.slot, 1);
+  assert.equal(entry.floor, 1);
+  assert.equal(entry.battle.floor, 1);
+  assert.equal(entry.battle.build.skills[0].action, 'arcSword');
+  assert.equal(entry.stats.kills, 0);
+  assert.ok(store.has('dsh.pet.v5.slots-key.slot2'), '第二个槽位应写入独立键');
+
+  const restored = mod.__debug.createEntry('slots-key', 7, { autostart: false });
+  assert.equal(restored.slot, 1);
+  assert.equal(mod.__debug.loadSlot(restored, 0), true);
+  assert.equal(restored.slot, 0);
+  assert.equal(restored.build.skills[0].element, id);
+  assert.equal(restored.battle.build.skills[0].element, id);
+});
+
+test('新游戏：只重置本轮，累计战绩与风格解锁保留', () => {
+  const { createEntry, startNewGame } = loadModule().__debug;
+  const entry = createEntry('new-run-key', 7);
+  entry.stats = { kills: 12, bestFloor: 6, maxFloorKills: 3, drafts: 4 };
+  entry.best = 6;
+  assert.equal(startNewGame(entry, 0, 'trapper'), true);
+  assert.equal(entry.floor, 1);
+  assert.equal(entry.level, 1);
+  assert.equal(entry.pending, 0);
+  assert.equal(entry.draftCount, 0);
+  assert.equal(entry.style, 'trapper');
+  assert.equal(entry.battle.build.skills[0].action, 'trap');
+  assert.equal(entry.stats.kills, 12);
+  assert.equal(entry.stats.bestFloor, 6);
+  assert.ok(entry.notice.includes('新游戏'));
+});
+
+test('删除存档：当前槽位被清空，战斗回到大厅', () => {
+  const store = new Map();
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('delete-key', 7);
+  assert.ok(store.has('dsh.pet.v5.delete-key'));
+  mod.__debug.openMenu(entry);
+  assert.equal(mod.__debug.deleteSave(entry, 0), true);
+  assert.equal(store.has('dsh.pet.v5.delete-key'), false);
+  assert.equal(entry.battle, null);
+  assert.ok(entry.menu !== null, '删除后应留在大厅');
+  assert.equal(mod.__debug.listSaveSlots('delete-key')[0].empty, true);
+});
+
+test('手动保存：战斗内等级、经验与待选会同步进存档', () => {
+  const store = new Map();
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('manual-save', 7);
+  mod.__debug.awardXp(entry.battle, 30);
+  assert.ok(entry.battle.level > 1);
+  assert.equal(entry.level, 1, '未结算前账户字段仍是旧的');
+  mod.__debug.saveProgress(entry);
+  const saved = JSON.parse(store.get('dsh.pet.v5.manual-save'));
+  assert.equal(saved.level, entry.battle.level);
+  assert.equal(saved.xp, entry.battle.xp);
+  assert.equal(saved.pending, entry.battle.pending);
+  assert.equal(saved.draftCount, entry.battle.draftCount);
+});
+
+test('大厅预读损坏存档不写盘，继续时再备份并修复', () => {
+  const store = new Map();
+  store.set(
+    'dsh.pet.v5.broken-lobby',
+    JSON.stringify({
+      version: 5,
+      style: 'ranged',
+      movement: 'keepDistance',
+      build: {
+        version: 3,
+        skills: [{ id: 'skill-1', action: 'projectile', element: 'poison', modifier: null }],
+        reserve: [],
+      },
+      stats: { kills: 1, bestFloor: 2, maxFloorKills: 1, drafts: 1 },
+      floor: 2,
+      best: 2,
+      level: 3,
+      xp: 1,
+      xpNext: 10,
+      pending: 0,
+      draftCount: 1,
+    }),
+  );
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('broken-lobby', 7, { autostart: false });
+  assert.ok(entry.notice.includes('已移除'));
+  assert.equal(store.has('dsh.pet.v5.broken-lobby.bak'), false, '大厅预读不应写备份');
+  assert.equal(mod.__debug.continueGame(entry), true);
+  assert.ok(store.has('dsh.pet.v5.broken-lobby.bak'), '开始游戏前应备份原存档');
+  assert.equal(entry.battle.build.skills[0].element, null);
+});
+
+test('删除槽位 1 会连同 v4 源档清理，避免旧档复活', () => {
+  const store = new Map();
+  store.set(
+    'dsh.pet.v4.delete-legacy',
+    JSON.stringify({
+      version: 4,
+      build: { version: 2, skills: [{ id: 'skill-1', action: 'aura', element: 'fire', modifier: null }], reserve: [] },
+      stats: { kills: 5, bestFloor: 3, maxFloorKills: 2, drafts: 2 },
+      floor: 3,
+      best: 3,
+      level: 4,
+      xp: 2,
+      xpNext: 14,
+      pending: 0,
+      draftCount: 2,
+    }),
+  );
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('delete-legacy', 7);
+  assert.ok(store.has('dsh.pet.v5.delete-legacy'));
+  mod.__debug.openMenu(entry);
+  assert.equal(mod.__debug.deleteSave(entry, 0), true);
+  assert.equal(store.has('dsh.pet.v5.delete-legacy'), false);
+  assert.equal(store.has('dsh.pet.v4.delete-legacy'), false);
+  assert.equal(mod.__debug.listSaveSlots('delete-legacy')[0].empty, true);
+});
+
+test('菜单渲染：大厅与新建页面都能生成元素', () => {
+  const mod = loadModule();
+  const entry = mod.__debug.createEntry('menu-key', 7, { autostart: false });
+  mod.__debug.openMenu(entry);
+  assert.equal(mod.__debug.menuPanel(entry, () => {}).type, 'div');
+  mod.__debug.openNewGameMenu(entry, 1);
+  assert.equal(entry.menu.screen, 'new');
+  assert.equal(mod.__debug.menuPanel(entry, () => {}).type, 'div');
 });

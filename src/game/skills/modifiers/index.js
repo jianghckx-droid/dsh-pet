@@ -87,14 +87,15 @@ export const MODIFIER_HANDLERS = Object.freeze({
       if (!ctx.command.tags.includes('primary') || ctx.payload.noEcho === true) return;
       const key = ctx.payload.castId ?? ctx.command.eventId;
       if (!ctx.once('echoCasts', key)) return;
-      const tags = [...ctx.command.tags.filter((tag) => tag !== 'primary'), 'echo'];
+      const tags = [...ctx.command.tags.filter((tag) => tag !== 'primary' && tag !== 'echo'), 'echo'];
       const payload = {
         ...ctx.payload,
         damageScale: (ctx.payload.damageScale ?? 1) * transform.damageScale,
         noEcho: true,
         noSplit: true,
       };
-      if (ctx.payload.action === 'projectile') {
+      // 单目标飞剑沿用弹体的同目标延迟命中语义；不复制飞剑实体。
+      if (ctx.payload.action === 'projectile' || ctx.payload.action === 'arcSword') {
         ctx.scheduleLater(transform.delay, {
           type: 'hit',
           targetId: ctx.target.id,

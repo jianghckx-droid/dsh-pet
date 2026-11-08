@@ -30,10 +30,10 @@ export const STYLE_DEFS = [
     kind: 'style',
     label: '剑修',
     visualTheme: 'sword',
-    movementPreference: 'approach',
+    movementPreference: 'keepDistance',
     unlockedBy: { bestFloor: 3 },
-    startingBuild: [{ id: 'skill-1', action: 'orbitSword', element: null, modifier: null }],
-    desc: '驭使飞剑环身护体，凭站位持续剑击。',
+    startingBuild: [{ id: 'skill-1', action: 'arcSword', element: null, modifier: null }],
+    desc: '驭使飞剑从中距离划出弧线追击，敌人贴近时后撤；也可改装穿敌、剑阵或环身御剑。',
   },
   {
     id: 'trapper',

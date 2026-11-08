@@ -115,6 +115,7 @@ export function createBattle({
     entities: [],
     projectiles: [],
     orbitSwords: [],
+    arcSwords: [],
     piercingSwords: [],
     swordArrays: [],
     traps: [],

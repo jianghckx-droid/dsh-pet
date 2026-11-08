@@ -168,10 +168,10 @@ const { createEntry, startFloor, tick, draw } = mod.__debug;
 const DEMO_BUILD = {
   version: 3,
   skills: [
-    { id: 'skill-1', action: 'swordPierce', element: 'fire', modifier: null },
-    { id: 'skill-2', action: 'swordArray', element: 'frost', modifier: 'echo' },
+    { id: 'skill-1', action: 'arcSword', element: 'frost', modifier: null },
+    { id: 'skill-2', action: 'swordArray', element: 'thunder', modifier: null },
   ],
-  reserve: ['thunder', 'detonate', 'pull'],
+  reserve: ['fire', 'detonate', 'pull'],
 };
 
 const floor = Number(process.argv[4] ?? 1);

@@ -96,6 +96,27 @@ export const ACTION_CONTRACTS = Object.freeze({
     },
   }),
 
+  arcSword: Object.freeze({
+    id: 'arcSword',
+    capabilities: ['hit', 'projectile', 'targeted', 'sword', 'homing'],
+    validate(def) {
+      const errors = baseErrors(def);
+      requireNumbers(def, ['range', 'flightTime', 'life', 'hitRadius', 'maxCorrection'], errors);
+      requireInteger(def, ['maxHits', 'maxActive'], errors);
+      if (
+        isPositiveNumber(def.params?.flightTime) &&
+        isPositiveNumber(def.params?.life) &&
+        def.params.life < def.params.flightTime
+      ) {
+        errors.push(`${def.id}: params.life 不能小于 params.flightTime`);
+      }
+      return errors;
+    },
+    describe(plan) {
+      return `每 ${fmtNumber(plan.cooldown)} 秒向 ${fmtNumber(plan.range)} 范围内最近的敌人放出弧光飞剑，仅命中首个目标；弧线追踪有限，可被其他敌人拦截`;
+    },
+  }),
+
   orbitSword: Object.freeze({
     id: 'orbitSword',
     capabilities: ['hit', 'orbit', 'melee'],

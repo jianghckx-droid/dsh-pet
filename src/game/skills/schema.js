@@ -20,6 +20,7 @@ export const CAPABILITIES = Object.freeze([
   'sword', // 共享剑器表现与兼容语义
   'trigger', // 等待敌人进入触发范围
   'heavy', // 强力命中，可触发碎裂
+  'homing', // 飞行轨迹会有限度地修正向锁定目标
 ]);
 
 export const EFFECT_TYPES = Object.freeze(['applyStatus']);
@@ -45,6 +46,7 @@ export const RUNTIME_LIMITS = Object.freeze({
   maxTicksPerStep: 8,
   maxProjectiles: 64,
   maxOrbitSwords: 3,
+  maxArcSwords: 3,
   maxTraps: 4,
   maxSwordPieces: 12,
   maxSwordArrays: 2,

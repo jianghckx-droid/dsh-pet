@@ -7,6 +7,7 @@ import { createEntityContext } from '../world.js';
 import { diagnose } from '../resolve.js';
 import { projectileEntity } from './projectile.js';
 import { orbitSwordEntity } from './orbitSword.js';
+import { arcSwordEntity } from './arcSword.js';
 import { piercingSwordEntity } from './piercingSword.js';
 import { swordArrayEntity } from './swordArray.js';
 import { trapEntity } from './trap.js';
@@ -14,6 +15,7 @@ import { trapEntity } from './trap.js';
 export const ENTITY_HANDLERS = Object.freeze({
   projectile: projectileEntity,
   orbitSword: orbitSwordEntity,
+  arcSword: arcSwordEntity,
   piercingSword: piercingSwordEntity,
   swordArray: swordArrayEntity,
   trap: trapEntity,
@@ -36,6 +38,7 @@ export function updateEntities(world, dt) {
   // 客户端和既有测试使用只读分类视图；权威列表仍是 world.entities。
   world.projectiles = world.entities.filter((entity) => entity.kind === 'projectile');
   world.orbitSwords = world.entities.filter((entity) => entity.kind === 'orbitSword');
+  world.arcSwords = world.entities.filter((entity) => entity.kind === 'arcSword');
   world.piercingSwords = world.entities.filter((entity) => entity.kind === 'piercingSword');
   world.swordArrays = world.entities.filter((entity) => entity.kind === 'swordArray');
   world.traps = world.entities.filter((entity) => entity.kind === 'trap');

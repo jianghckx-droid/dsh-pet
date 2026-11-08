@@ -8,6 +8,7 @@ import { projectileAction } from './projectile.js';
 import { auraAction } from './aura.js';
 import { impactAction } from './impact.js';
 import { swingAction } from './swing.js';
+import { arcSwordAction } from './arcSword.js';
 import { orbitSwordAction } from './orbitSword.js';
 import { swordPierceAction } from './swordPierce.js';
 import { swordArrayAction } from './swordArray.js';
@@ -18,6 +19,7 @@ const HANDLERS = Object.freeze({
   aura: auraAction,
   impact: impactAction,
   swing: swingAction,
+  arcSword: arcSwordAction,
   orbitSword: orbitSwordAction,
   swordPierce: swordPierceAction,
   swordArray: swordArrayAction,

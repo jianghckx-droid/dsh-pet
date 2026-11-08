@@ -62,11 +62,22 @@ const BUILDS = {
     },
   },
   sword: {
-    label: '御剑',
+    label: '环身御剑',
     build: {
       skills: [
         { id: 'skill-1', action: 'orbitSword', element: 'fire', modifier: 'echo' },
         { id: 'skill-2', action: 'impact', element: 'frost', modifier: null },
+      ],
+      reserve: [],
+    },
+  },
+  swordArc: {
+    label: '弧光剑阵',
+    movement: 'keepDistance',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'arcSword', element: 'frost', modifier: null },
+        { id: 'skill-2', action: 'swordArray', element: 'thunder', modifier: null },
       ],
       reserve: [],
     },
@@ -192,7 +203,7 @@ function main() {
 function sweep() {
   console.log('\n## 修饰取舍：同一动作装不同修饰的 DPS\n');
   const modifiers = ['', 'split', 'echo', 'expand', 'pull'];
-  for (const action of ['projectile', 'aura', 'impact', 'swing', 'orbitSword', 'swordPierce', 'swordArray', 'trap']) {
+  for (const action of ['projectile', 'aura', 'impact', 'swing', 'arcSword', 'orbitSword', 'swordPierce', 'swordArray', 'trap']) {
     const cells = [];
     for (const modifier of modifiers) {
       const compiled = compileBuild({

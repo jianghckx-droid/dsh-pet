@@ -49,6 +49,14 @@ const BUILDS = {
       { id: 'skill-2', action: 'swordArray', element: 'frost', modifier: 'echo' },
     ],
   },
+  swordArc: {
+    label: '弧光飞剑 + 雷电剑阵',
+    movement: 'keepDistance',
+    skills: [
+      { id: 'skill-1', action: 'arcSword', element: 'frost', modifier: null },
+      { id: 'skill-2', action: 'swordArray', element: 'thunder', modifier: null },
+    ],
+  },
 };
 
 function toBuild(entry) {

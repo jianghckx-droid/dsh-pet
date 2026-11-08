@@ -254,12 +254,10 @@ function applyModifier(world, command, target, payload) {
       }),
     scheduleLater: (delay, later) =>
       scheduleDelayed(world, {
+        ...later,
         delay,
-        command: {
-          ...later,
-          rootEventId: command.rootEventId,
-          depth: command.depth + 1,
-        },
+        rootEventId: command.rootEventId,
+        depth: command.depth + 1,
       }),
     queryTargets: (center, radius, count, excludeId) =>
       targetsInRadius(world, center, radius, count, excludeId),

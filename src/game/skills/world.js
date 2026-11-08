@@ -10,6 +10,7 @@ import { ensureResolutionState, enqueue, diagnose, scheduleDelayed } from './res
 const ENTITY_LIMITS = Object.freeze({
   projectile: RUNTIME_LIMITS.maxProjectiles,
   orbitSword: RUNTIME_LIMITS.maxOrbitSwords,
+  arcSword: RUNTIME_LIMITS.maxArcSwords,
   trap: RUNTIME_LIMITS.maxTraps,
   piercingSword: RUNTIME_LIMITS.maxSwordPieces,
   swordArray: RUNTIME_LIMITS.maxSwordArrays,
@@ -35,7 +36,7 @@ export function nearestEnemy(world, from, range, excludeId = -1) {
   for (const enemy of livingEnemies(world)) {
     if (enemy.id === excludeId) continue;
     const d = Math.hypot(enemy.x - from.x, enemy.y - from.y) - enemy.r;
-    if (d < bestD) {
+    if (d < bestD || (d === bestD && best !== null && enemy.id < best.id)) {
       best = enemy;
       bestD = d;
     }
@@ -46,6 +47,45 @@ export function nearestEnemy(world, from, range, excludeId = -1) {
 export function countEntities(world, kind) {
   if (!Array.isArray(world.entities)) return 0;
   return world.entities.filter((entity) => entity.kind === kind && !entity.dead).length;
+}
+
+/** 同一诊断码只记录一次，避免每帧重试把诊断环填满。 */
+export function diagnoseOnce(world, code, detail) {
+  if (!Array.isArray(world.diagnostics)) world.diagnostics = [];
+  if (world.diagnostics.some((entry) => entry.code === code)) return;
+  diagnose(world, code, detail);
+}
+
+function segmentCircleEntry(x0, y0, x1, y1, cx, cy, radius) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const fx = x0 - cx;
+  const fy = y0 - cy;
+  const c = fx * fx + fy * fy - radius * radius;
+  if (c <= 0) return 0;
+  const a = dx * dx + dy * dy;
+  if (a <= 1e-12) return null;
+  const b = 2 * (fx * dx + fy * dy);
+  const discriminant = b * b - 4 * a * c;
+  if (discriminant < 0) return null;
+  const root = Math.sqrt(discriminant);
+  const t = (-b - root) / (2 * a);
+  if (t < 0 || t > 1) return null;
+  return t;
+}
+
+/**
+ * 线段扫掠：返回沿途接触的敌人，按最早交点、再按敌人 ID 排序。
+ * 供弧光飞剑这类高速实体使用，避免按点判定时穿过敌人。
+ */
+export function sweepEnemies(world, x0, y0, x1, y1, radius) {
+  const hits = [];
+  for (const enemy of livingEnemies(world)) {
+    const t = segmentCircleEntry(x0, y0, x1, y1, enemy.x, enemy.y, enemy.r + radius);
+    if (t !== null) hits.push({ enemy, t });
+  }
+  hits.sort((a, b) => a.t - b.t || a.enemy.id - b.enemy.id);
+  return hits;
 }
 
 export function spawnEntity(world, spec) {
@@ -123,10 +163,13 @@ export function createWorldContext(world) {
     queryTargets: (center, radius, count, excludeId) =>
       enemiesInRadius(world, center, radius, count, excludeId),
     queryNearest: (from, range, excludeId) => nearestEnemy(world, from, range, excludeId),
+    sweepEnemies: (x0, y0, x1, y1, radius) => sweepEnemies(world, x0, y0, x1, y1, radius),
     entityCount: (kind) => countEntities(world, kind),
+    diagnose: (code, detail) => diagnose(world, code, detail),
+    diagnoseOnce: (code, detail) => diagnoseOnce(world, code, detail),
     spawnEntity: (spec) => spawnEntity(world, spec),
     emitVisual: (event) => emitVisual(world, event),
-    scheduleLater: (delay, command) => scheduleDelayed(world, { delay, command }),
+    scheduleLater: (delay, command) => scheduleDelayed(world, { ...command, delay }),
     enqueue: (command) => enqueue(world, command),
     bounds: ARENA,
   };

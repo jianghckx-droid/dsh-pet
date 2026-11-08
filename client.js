@@ -29,6 +29,7 @@ window.__ModuleLoader__.load({
       'sword', // 共享剑器表现与兼容语义
       'trigger', // 等待敌人进入触发范围
       'heavy', // 强力命中，可触发碎裂
+      'homing', // 飞行轨迹会有限度地修正向锁定目标
     ]);
 
     const EFFECT_TYPES = Object.freeze(['applyStatus']);
@@ -54,6 +55,7 @@ window.__ModuleLoader__.load({
       maxTicksPerStep: 8,
       maxProjectiles: 64,
       maxOrbitSwords: 3,
+      maxArcSwords: 3,
       maxTraps: 4,
       maxSwordPieces: 12,
       maxSwordArrays: 2,
@@ -202,6 +204,27 @@ window.__ModuleLoader__.load({
         },
         movement: { preferredRange: 14 },
         desc: '靠近目标后挥出扇形攻击。',
+      },
+      {
+        id: 'arcSword',
+        kind: 'action',
+        handler: 'arcSword',
+        label: '弧光飞剑',
+        color: '#b6f0d2',
+        capabilities: ['hit', 'projectile', 'targeted', 'sword', 'homing'],
+        params: {
+          cooldown: 1.2,
+          damage: 2,
+          range: 104,
+          flightTime: 0.55,
+          life: 0.9,
+          hitRadius: 6,
+          maxHits: 1,
+          maxActive: 3,
+          maxCorrection: 18,
+        },
+        movement: { preferredRange: 78 },
+        desc: '从侧后方划出弧线，追击射程内最近的敌人。',
       },
       {
         id: 'orbitSword',
@@ -465,10 +488,10 @@ window.__ModuleLoader__.load({
         kind: 'style',
         label: '剑修',
         visualTheme: 'sword',
-        movementPreference: 'approach',
+        movementPreference: 'keepDistance',
         unlockedBy: { bestFloor: 3 },
-        startingBuild: [{ id: 'skill-1', action: 'orbitSword', element: null, modifier: null }],
-        desc: '驭使飞剑环身护体，凭站位持续剑击。',
+        startingBuild: [{ id: 'skill-1', action: 'arcSword', element: null, modifier: null }],
+        desc: '驭使飞剑从中距离划出弧线追击，敌人贴近时后撤；也可改装穿敌、剑阵或环身御剑。',
       },
       {
         id: 'trapper',
@@ -576,6 +599,27 @@ window.__ModuleLoader__.load({
         },
         describe(plan) {
           return `每 ${fmtNumber(plan.cooldown)} 秒朝目标方向挥出 ${fmtNumber(plan.angle)}° 扇形，命中 ${fmtNumber(plan.radius)} 范围内至多 ${plan.maxTargets} 个敌人`;
+        },
+      }),
+
+      arcSword: Object.freeze({
+        id: 'arcSword',
+        capabilities: ['hit', 'projectile', 'targeted', 'sword', 'homing'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['range', 'flightTime', 'life', 'hitRadius', 'maxCorrection'], errors);
+          requireInteger(def, ['maxHits', 'maxActive'], errors);
+          if (
+            isPositiveNumber(def.params?.flightTime) &&
+            isPositiveNumber(def.params?.life) &&
+            def.params.life < def.params.flightTime
+          ) {
+            errors.push(`${def.id}: params.life 不能小于 params.flightTime`);
+          }
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒向 ${fmtNumber(plan.range)} 范围内最近的敌人放出弧光飞剑，仅命中首个目标；弧线追踪有限，可被其他敌人拦截`;
         },
       }),
 
@@ -730,14 +774,15 @@ window.__ModuleLoader__.load({
           if (!ctx.command.tags.includes('primary') || ctx.payload.noEcho === true) return;
           const key = ctx.payload.castId ?? ctx.command.eventId;
           if (!ctx.once('echoCasts', key)) return;
-          const tags = [...ctx.command.tags.filter((tag) => tag !== 'primary'), 'echo'];
+          const tags = [...ctx.command.tags.filter((tag) => tag !== 'primary' && tag !== 'echo'), 'echo'];
           const payload = {
             ...ctx.payload,
             damageScale: (ctx.payload.damageScale ?? 1) * transform.damageScale,
             noEcho: true,
             noSplit: true,
           };
-          if (ctx.payload.action === 'projectile') {
+          // 单目标飞剑沿用弹体的同目标延迟命中语义；不复制飞剑实体。
+          if (ctx.payload.action === 'projectile' || ctx.payload.action === 'arcSword') {
             ctx.scheduleLater(transform.delay, {
               type: 'hit',
               targetId: ctx.target.id,
@@ -1379,6 +1424,118 @@ window.__ModuleLoader__.load({
       },
     });
 
+    // ---- skills/actions/arcSword.js ----
+    // 弧光飞剑：从角色背侧沿弧线飞向锁定目标，末段有限追踪，单目标命中。
+    //
+    // 施放瞬间锁定方向与目标位置；角色与目标重合时沿用该技能上一次有效朝向，
+    // 从未有过朝向时固定向右。左右交替由成功施放次数决定，不额外保存随机状态。
+
+    const START_BACK = 8;
+    const START_SIDE = 5;
+    const CONTROL1_BACK = 18;
+    const CONTROL1_SIDE = 20;
+    const CONTROL2_BACK = 18;
+    const CONTROL2_SIDE = 12;
+
+    function normalize(x, y) {
+      const length = Math.hypot(x, y);
+      if (length < 1e-6) return null;
+      return { x: x / length, y: y / length };
+    }
+
+    const arcSwordAction = Object.freeze({
+      canCast(context) {
+        return context.queryNearest(context.world.player, context.plan.range) !== null;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        const limit = Math.min(plan.maxActive, RUNTIME_LIMITS.maxArcSwords);
+        if (context.entityCount('arcSword') >= limit) {
+          context.diagnoseOnce('arc-sword-limit', { limit });
+          return false;
+        }
+        const target = context.queryNearest(player, plan.range);
+        if (target === null) return false;
+
+        const direct = normalize(target.x - player.x, target.y - player.y);
+        let aimX;
+        let aimY;
+        if (direct !== null) {
+          aimX = direct.x;
+          aimY = direct.y;
+          context.skill.lastAimX = aimX;
+          context.skill.lastAimY = aimY;
+        } else if (
+          Number.isFinite(context.skill.lastAimX) &&
+          Number.isFinite(context.skill.lastAimY)
+        ) {
+          aimX = context.skill.lastAimX;
+          aimY = context.skill.lastAimY;
+        } else {
+          aimX = 1;
+          aimY = 0;
+        }
+
+        const sideX = -aimY;
+        const sideY = aimX;
+        const side = context.skill.castCount % 2 === 0 ? 1 : -1;
+        const startX = player.x - aimX * START_BACK + sideX * START_SIDE * side;
+        const startY = player.y - aimY * START_BACK + sideY * START_SIDE * side;
+        const control1X = player.x - aimX * CONTROL1_BACK + sideX * CONTROL1_SIDE * side;
+        const control1Y = player.y - aimY * CONTROL1_BACK + sideY * CONTROL1_SIDE * side;
+        const endX = target.x;
+        const endY = target.y;
+        const control2X = endX - aimX * CONTROL2_BACK + sideX * CONTROL2_SIDE * side;
+        const control2Y = endY - aimY * CONTROL2_BACK + sideY * CONTROL2_SIDE * side;
+        const initial = normalize(control1X - startX, control1Y - startY) ?? { x: aimX, y: aimY };
+
+        const entity = context.spawnEntity({
+          kind: 'arcSword',
+          x: startX,
+          y: startY,
+          plan,
+          skillInstanceId: plan.id,
+          castId: context.castId,
+          targetId: target.id,
+          startX,
+          startY,
+          control1X,
+          control1Y,
+          baseEndX: endX,
+          baseEndY: endY,
+          baseControl2X: control2X,
+          baseControl2Y: control2Y,
+          endX,
+          endY,
+          control2X,
+          control2Y,
+          elapsed: 0,
+          flightTime: plan.flightTime,
+          life: plan.life,
+          hitRadius: plan.hitRadius,
+          maxHits: plan.maxHits,
+          maxCorrection: plan.maxCorrection,
+          hitCount: 0,
+          dirX: initial.x,
+          dirY: initial.y,
+          side,
+        });
+        if (entity === null) return false;
+        context.emitVisual({
+          type: 'arcSwordCast',
+          x: startX,
+          y: startY,
+          angle: Math.atan2(initial.y, initial.x),
+          side,
+          skillId: plan.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        return true;
+      },
+    });
+
     // ---- skills/actions/orbitSword.js ----
     // 御剑：召唤环绕自身的飞剑实体。环绕、碰撞与命中间隔由 entities/orbitSword.js 推进。
 
@@ -1562,6 +1719,7 @@ window.__ModuleLoader__.load({
       aura: auraAction,
       impact: impactAction,
       swing: swingAction,
+      arcSword: arcSwordAction,
       orbitSword: orbitSwordAction,
       swordPierce: swordPierceAction,
       swordArray: swordArrayAction,
@@ -1824,6 +1982,8 @@ window.__ModuleLoader__.load({
         speed: numbers.speed ?? 0,
         range: numbers.range ?? 0,
         radius: numbers.radius ?? 0,
+        flightTime: numbers.flightTime ?? 0,
+        maxCorrection: numbers.maxCorrection ?? 0,
         maxTargets: numbers.maxTargets ?? 1,
         life: numbers.life ?? 0,
         angle: numbers.angle ?? 0,
@@ -2503,12 +2663,10 @@ window.__ModuleLoader__.load({
           }),
         scheduleLater: (delay, later) =>
           scheduleDelayed(world, {
+            ...later,
             delay,
-            command: {
-              ...later,
-              rootEventId: command.rootEventId,
-              depth: command.depth + 1,
-            },
+            rootEventId: command.rootEventId,
+            depth: command.depth + 1,
           }),
         queryTargets: (center, radius, count, excludeId) =>
           targetsInRadius(world, center, radius, count, excludeId),
@@ -2687,6 +2845,7 @@ window.__ModuleLoader__.load({
     const ENTITY_LIMITS = Object.freeze({
       projectile: RUNTIME_LIMITS.maxProjectiles,
       orbitSword: RUNTIME_LIMITS.maxOrbitSwords,
+      arcSword: RUNTIME_LIMITS.maxArcSwords,
       trap: RUNTIME_LIMITS.maxTraps,
       piercingSword: RUNTIME_LIMITS.maxSwordPieces,
       swordArray: RUNTIME_LIMITS.maxSwordArrays,
@@ -2712,7 +2871,7 @@ window.__ModuleLoader__.load({
       for (const enemy of livingEnemies(world)) {
         if (enemy.id === excludeId) continue;
         const d = Math.hypot(enemy.x - from.x, enemy.y - from.y) - enemy.r;
-        if (d < bestD) {
+        if (d < bestD || (d === bestD && best !== null && enemy.id < best.id)) {
           best = enemy;
           bestD = d;
         }
@@ -2723,6 +2882,45 @@ window.__ModuleLoader__.load({
     function countEntities(world, kind) {
       if (!Array.isArray(world.entities)) return 0;
       return world.entities.filter((entity) => entity.kind === kind && !entity.dead).length;
+    }
+
+    /** 同一诊断码只记录一次，避免每帧重试把诊断环填满。 */
+    function diagnoseOnce(world, code, detail) {
+      if (!Array.isArray(world.diagnostics)) world.diagnostics = [];
+      if (world.diagnostics.some((entry) => entry.code === code)) return;
+      diagnose(world, code, detail);
+    }
+
+    function segmentCircleEntry(x0, y0, x1, y1, cx, cy, radius) {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const fx = x0 - cx;
+      const fy = y0 - cy;
+      const c = fx * fx + fy * fy - radius * radius;
+      if (c <= 0) return 0;
+      const a = dx * dx + dy * dy;
+      if (a <= 1e-12) return null;
+      const b = 2 * (fx * dx + fy * dy);
+      const discriminant = b * b - 4 * a * c;
+      if (discriminant < 0) return null;
+      const root = Math.sqrt(discriminant);
+      const t = (-b - root) / (2 * a);
+      if (t < 0 || t > 1) return null;
+      return t;
+    }
+
+    /**
+     * 线段扫掠：返回沿途接触的敌人，按最早交点、再按敌人 ID 排序。
+     * 供弧光飞剑这类高速实体使用，避免按点判定时穿过敌人。
+     */
+    function sweepEnemies(world, x0, y0, x1, y1, radius) {
+      const hits = [];
+      for (const enemy of livingEnemies(world)) {
+        const t = segmentCircleEntry(x0, y0, x1, y1, enemy.x, enemy.y, enemy.r + radius);
+        if (t !== null) hits.push({ enemy, t });
+      }
+      hits.sort((a, b) => a.t - b.t || a.enemy.id - b.enemy.id);
+      return hits;
     }
 
     function spawnEntity(world, spec) {
@@ -2800,10 +2998,13 @@ window.__ModuleLoader__.load({
         queryTargets: (center, radius, count, excludeId) =>
           enemiesInRadius(world, center, radius, count, excludeId),
         queryNearest: (from, range, excludeId) => nearestEnemy(world, from, range, excludeId),
+        sweepEnemies: (x0, y0, x1, y1, radius) => sweepEnemies(world, x0, y0, x1, y1, radius),
         entityCount: (kind) => countEntities(world, kind),
+        diagnose: (code, detail) => diagnose(world, code, detail),
+        diagnoseOnce: (code, detail) => diagnoseOnce(world, code, detail),
         spawnEntity: (spec) => spawnEntity(world, spec),
         emitVisual: (event) => emitVisual(world, event),
-        scheduleLater: (delay, command) => scheduleDelayed(world, { delay, command }),
+        scheduleLater: (delay, command) => scheduleDelayed(world, { ...command, delay }),
         enqueue: (command) => enqueue(world, command),
         bounds: ARENA,
       };
@@ -2928,6 +3129,115 @@ window.__ModuleLoader__.load({
       },
     });
 
+    // ---- skills/entities/arcSword.js ----
+    // 弧光飞剑实体：三次贝塞尔弧线 + 末段有限追踪 + 线段扫掠碰撞。
+    //
+    // 进度按时间归一化：0→1 对应 flightTime。前 70% 锁定施放时终点，后 30%
+    // 把终点向目标当前位置修正，累计位移不超过 maxCorrection，控制点二同步平移。
+    // 目标失效后保留最后有效终点，不重新索敌。命中只提交一次共享命中并结束。
+
+    const TRACK_START = 0.7;
+    const MAX_PARAM_STEP = 0.08;
+
+    function arcSwordPoint(entity, t) {
+      const u = 1 - t;
+      const a = u * u * u;
+      const b = 3 * u * u * t;
+      const c = 3 * u * t * t;
+      const d = t * t * t;
+      return {
+        x: a * entity.startX + b * entity.control1X + c * entity.control2X + d * entity.endX,
+        y: a * entity.startY + b * entity.control1Y + c * entity.control2Y + d * entity.endY,
+      };
+    }
+
+    function arcSwordTarget(world, targetId) {
+      for (const enemy of world.enemies) {
+        if (enemy.id !== targetId) continue;
+        if (enemy.cells <= 0 || enemy.dead || enemy.deathHandled) return null;
+        return enemy;
+      }
+      return null;
+    }
+
+    function arcSwordUpdateEnd(context, entity) {
+      const target = arcSwordTarget(context.world, entity.targetId);
+      if (target === null) return;
+      const dx = target.x - entity.baseEndX;
+      const dy = target.y - entity.baseEndY;
+      const distance = Math.hypot(dx, dy);
+      const cap = Number.isFinite(entity.maxCorrection) ? entity.maxCorrection : 18;
+      const scale = distance > cap ? cap / distance : 1;
+      const offsetX = dx * scale;
+      const offsetY = dy * scale;
+      entity.endX = entity.baseEndX + offsetX;
+      entity.endY = entity.baseEndY + offsetY;
+      entity.control2X = entity.baseControl2X + offsetX;
+      entity.control2Y = entity.baseControl2Y + offsetY;
+    }
+
+    const arcSwordEntity = Object.freeze({
+      update(context, dt) {
+        const entity = context.entity;
+        const flightTime = entity.flightTime > 0 ? entity.flightTime : 0.55;
+        const previousElapsed = Math.max(0, entity.elapsed);
+        entity.elapsed += dt;
+        entity.life -= dt;
+        const tPrev = Math.min(1, previousElapsed / flightTime);
+        const tNext = Math.min(1, entity.elapsed / flightTime);
+
+        if (tNext > TRACK_START) arcSwordUpdateEnd(context, entity);
+
+        const delta = tNext - tPrev;
+        const steps = Math.max(1, Math.ceil(delta / MAX_PARAM_STEP));
+        let fromX = entity.x;
+        let fromY = entity.y;
+        let toX = fromX;
+        let toY = fromY;
+
+        for (let index = 1; index <= steps; index += 1) {
+          const t = tPrev + (delta * index) / steps;
+          const point = arcSwordPoint(entity, t);
+          toX = point.x;
+          toY = point.y;
+          const moveX = toX - fromX;
+          const moveY = toY - fromY;
+          const moved = Math.hypot(moveX, moveY);
+          if (moved > 1e-6) {
+            entity.dirX = moveX / moved;
+            entity.dirY = moveY / moved;
+          }
+          const contacts = context.sweepEnemies(fromX, fromY, toX, toY, entity.hitRadius);
+          if (contacts.length > 0) {
+            const contact = contacts[0];
+            const hitX = fromX + moveX * contact.t;
+            const hitY = fromY + moveY * contact.t;
+            entity.x = hitX;
+            entity.y = hitY;
+            context.hit({
+              targetId: contact.enemy.id,
+              center: { x: hitX, y: hitY },
+              extraTags: ['arcSword'],
+              primary: true,
+            });
+            entity.hitCount += 1;
+            entity.dead = true;
+            break;
+          }
+          fromX = toX;
+          fromY = toY;
+        }
+
+        if (!entity.dead) {
+          entity.x = toX;
+          entity.y = toY;
+        }
+        if (entity.hitCount >= entity.maxHits) entity.dead = true;
+        if (entity.life <= 0) entity.dead = true;
+        if (tNext >= 1) entity.dead = true;
+      },
+    });
+
     // ---- skills/entities/piercingSword.js ----
     // 穿透飞剑实体：直线飞行，沿途每个目标至多命中一次，达到命中数或射程后清理。
 
@@ -3044,6 +3354,7 @@ window.__ModuleLoader__.load({
     const ENTITY_HANDLERS = Object.freeze({
       projectile: projectileEntity,
       orbitSword: orbitSwordEntity,
+      arcSword: arcSwordEntity,
       piercingSword: piercingSwordEntity,
       swordArray: swordArrayEntity,
       trap: trapEntity,
@@ -3066,6 +3377,7 @@ window.__ModuleLoader__.load({
       // 客户端和既有测试使用只读分类视图；权威列表仍是 world.entities。
       world.projectiles = world.entities.filter((entity) => entity.kind === 'projectile');
       world.orbitSwords = world.entities.filter((entity) => entity.kind === 'orbitSword');
+      world.arcSwords = world.entities.filter((entity) => entity.kind === 'arcSword');
       world.piercingSwords = world.entities.filter((entity) => entity.kind === 'piercingSword');
       world.swordArrays = world.entities.filter((entity) => entity.kind === 'swordArray');
       world.traps = world.entities.filter((entity) => entity.kind === 'trap');
@@ -3878,6 +4190,7 @@ window.__ModuleLoader__.load({
         entities: [],
         projectiles: [],
         orbitSwords: [],
+        arcSwords: [],
         piercingSwords: [],
         swordArrays: [],
         traps: [],
@@ -4327,6 +4640,7 @@ window.__ModuleLoader__.load({
       '.dsh-pet-overlay-title.good{color:#6ee7a8}',
       '.dsh-pet-overlay-sub{font-size:10px;color:#9fb2c2;line-height:1.5}',
       '.dsh-pet-cells{height:4px;background:#18212b;border-radius:2px;overflow:hidden}',
+      '.dsh-pet-body-rest{display:flex;flex-direction:column;gap:6px}',
       '.dsh-pet-cells i{display:block;height:100%;background:#6ee7a8;transition:width .12s linear}',
       '.dsh-pet-bottom{display:flex;gap:8px;color:#6c8091;font-size:10px;flex-wrap:wrap}',
       '.dsh-pet-hot{color:#e35d5d}',
@@ -4379,18 +4693,70 @@ window.__ModuleLoader__.load({
       '.dsh-pet-style.on{color:#0a0d12;background:#ffd166;border-color:#ffd166}',
       '.dsh-pet-style:disabled{opacity:.35;cursor:default}',
       '.dsh-pet-reactions{color:#a0e7c8;font-size:9px}',
+      '.dsh-pet-menu{flex:1;min-height:0;display:flex;flex-direction:column;gap:5px;',
+      'padding:8px;background:rgba(6,10,16,.95);overflow-y:auto;text-align:left;animation:overlayIn .16s ease-out}',
+      '.dsh-pet-menu-title{font-size:16px;letter-spacing:.18em;color:#ffd166;text-align:center;margin-top:2px}',
+      '.dsh-pet-menu-sub{font-size:9px;color:#8fa4b5;text-align:center;line-height:1.5;margin-bottom:2px}',
+      '.dsh-pet-menu-actions{display:flex;gap:4px;flex-wrap:wrap}',
+      '.dsh-pet-menu-btn{font:inherit;font-size:10px;color:#cfe3ef;background:#111a24;border:1px solid #2a3a4a;',
+      'border-radius:4px;padding:4px 7px;cursor:pointer}',
+      '.dsh-pet-menu-btn:hover{background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-menu-btn.primary{color:#0a0d12;background:#ffd166;border-color:#ffd166;font-weight:700}',
+      '.dsh-pet-menu-btn.primary:hover{background:#ffe08a}',
+      '.dsh-pet-menu-btn.danger{color:#ffb4b4;border-color:#573030}',
+      '.dsh-pet-menu-btn:disabled{opacity:.35;cursor:default}',
+      '.dsh-pet-menu-head{font-size:9px;color:#7f93a3;letter-spacing:.08em;margin-top:1px}',
+      '.dsh-pet-menu-slot{background:#0e151d;border:1px solid #1d2935;border-radius:4px;padding:4px 5px;',
+      'display:flex;flex-direction:column;gap:3px}',
+      '.dsh-pet-menu-slot.on{border-color:#3f5a36;background:#111b16}',
+      '.dsh-pet-menu-slot.empty{opacity:.72}',
+      '.dsh-pet-menu-slot-head{display:flex;align-items:center;gap:5px}',
+      '.dsh-pet-menu-slot-name{color:#ffd166;font-weight:700;font-size:10px}',
+      '.dsh-pet-menu-slot-time{margin-left:auto;color:#6c8091;font-size:9px}',
+      '.dsh-pet-menu-tag{font-size:8px;color:#0a0d12;background:#6ee7a8;border-radius:3px;padding:0 3px}',
+      '.dsh-pet-menu-slot-desc{font-size:9px;color:#9fb2c2;line-height:1.45}',
+      '.dsh-pet-menu-slot-actions{display:flex;gap:3px;flex-wrap:wrap;align-items:center}',
+      '.dsh-pet-menu-slot-actions .dsh-pet-menu-btn{font-size:9px;padding:2px 6px}',
+      '.dsh-pet-menu-warn{font-size:9px;color:#ffb4b4;line-height:1.35}',
+      '.dsh-pet-menu-msg{font-size:9px;color:#a0e7c8;line-height:1.4}',
+      '.dsh-pet-menu-label{font-size:9px;color:#7f93a3;margin-top:2px}',
+      '.dsh-pet-menu-slotpick{font:inherit;font-size:9px;color:#cfe3ef;background:#111a24;border:1px solid #24313d;',
+      'border-radius:3px;padding:3px 5px;cursor:pointer;text-align:left;line-height:1.4}',
+      '.dsh-pet-menu-slotpick:hover{background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-menu-slotpick.on{color:#ffd166;border-color:#ffd166;background:#1a1d16}',
+      '.dsh-pet-menu-slotpick:disabled{opacity:.35;cursor:default}',
+      '.dsh-pet-menu-foot{font-size:8px;color:#5f7282;line-height:1.45;margin-top:auto;padding-top:2px}',
     ].join('')
 
     // ---- 存档 ----
 
+    // 一个工作区三个存档槽位。槽位 1 沿用 v5 原键，额外槽位加后缀，
+    // 因此旧版存档仍能直接读取，不需要破坏性迁移。
     const SAVE_PREFIX = 'dsh.pet.v5.'
     const PREVIOUS_PREFIX = 'dsh.pet.v4.'
     const LEGACY_PREFIX = 'dsh.pet.v3.'
     const BACKUP_SUFFIX = '.bak'
+    const ACTIVE_SUFFIX = '.active'
+    const SLOT_SUFFIX = '.slot'
+    const SAVE_SLOTS = 3
 
     const toInt = (value, min, fallback) => {
       const n = Math.floor(Number(value))
       return Number.isFinite(n) && n >= min ? n : fallback
+    }
+
+    function normalizeSlot(value) {
+      const n = Math.floor(Number(value))
+      return Number.isFinite(n) && n >= 0 && n < SAVE_SLOTS ? n : 0
+    }
+
+    function saveKey(key, slot) {
+      const index = normalizeSlot(slot)
+      return SAVE_PREFIX + key + (index === 0 ? '' : SLOT_SUFFIX + (index + 1))
+    }
+
+    function activeSlotKey(key) {
+      return SAVE_PREFIX + key + ACTIVE_SUFFIX
     }
 
     function emptyStats() {
@@ -4427,11 +4793,23 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function backupSave(key, saved) {
+    function removeStore(key) {
+      try {
+        const store = window.localStorage
+        if (store === undefined || store === null) return false
+        if (typeof store.removeItem === 'function') store.removeItem(key)
+        else if (typeof store.setItem === 'function') store.setItem(key, '')
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    function backupSave(key, slot, saved) {
       try {
         const store = window.localStorage
         if (store === undefined || store === null) return
-        store.setItem(SAVE_PREFIX + key + BACKUP_SUFFIX, JSON.stringify(saved))
+        store.setItem(saveKey(key, slot) + BACKUP_SUFFIX, JSON.stringify(saved))
       } catch {
         // 备份失败不能阻止读档；原存档在修复前仍未被覆盖
       }
@@ -4441,14 +4819,14 @@ window.__ModuleLoader__.load({
       return MOVEMENT_STRATEGIES.includes(value) ? value : style.movementPreference
     }
 
-    function applyOwnedBuild(key, account, saved, style, { backup } = {}) {
+    function applyOwnedBuild(key, slot, account, saved, style, { backup } = {}) {
       const hasBuild =
         saved.build !== null && typeof saved.build === 'object' && Array.isArray(saved.build.skills)
       if (hasBuild) {
         const pruned = pruneBuild(saved.build)
         account.build = pruned.build
         if (pruned.removed.length > 0) {
-          if (backup === true) backupSave(key, saved)
+          if (backup === true) backupSave(key, slot, saved)
           account.notice = '旧构筑里有已移除的组件，已安全清空：' + pruned.removed.join('、')
         }
       } else {
@@ -4466,9 +4844,22 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function loadAccount(key) {
+    function mergeStats(a, b) {
+      const left = normalizeStats(a)
+      const right = normalizeStats(b)
+      return {
+        kills: Math.max(left.kills, right.kills),
+        bestFloor: Math.max(left.bestFloor, right.bestFloor),
+        maxFloorKills: Math.max(left.maxFloorKills, right.maxFloorKills),
+        drafts: Math.max(left.drafts, right.drafts),
+      }
+    }
+
+    function loadAccount(key, slot = 0, options = {}) {
+      const index = normalizeSlot(slot)
+      const backup = options === null || options === undefined || options.backup !== false
       const account = emptyAccount()
-      const saved = readStore(SAVE_PREFIX + key)
+      const saved = readStore(saveKey(key, index))
       if (saved !== null && typeof saved === 'object') {
         account.stats = normalizeStats(saved.stats)
         const style = resolveStyle(saved.style, account.stats)
@@ -4482,9 +4873,12 @@ window.__ModuleLoader__.load({
         account.xpNext = Math.max(1, toInt(saved.xpNext, 1, 8))
         account.pending = toInt(saved.pending, 0, 0)
         account.draftCount = toInt(saved.draftCount, 0, 0)
-        applyOwnedBuild(key, account, saved, style, { backup: true })
+        applyOwnedBuild(key, index, account, saved, style, { backup })
         return account
       }
+
+      // 旧版迁移只发生在第一个槽位，额外槽位永远是干净的新存档。
+      if (index !== 0) return account
 
       const previous = readStore(PREVIOUS_PREFIX + key)
       if (previous !== null && typeof previous === 'object') {
@@ -4501,7 +4895,7 @@ window.__ModuleLoader__.load({
         account.xpNext = Math.max(1, toInt(previous.xpNext, 1, 8))
         account.pending = toInt(previous.pending, 0, 0)
         account.draftCount = toInt(previous.draftCount, 0, 0)
-        applyOwnedBuild(key, account, previous, style, { backup: false })
+        applyOwnedBuild(key, index, account, previous, style, { backup: false })
         const pruneNotice = account.notice
         account.notice =
           'v4 存档已迁移到 v5：构筑与进度保留，新增风格/移动策略使用默认值。' +
@@ -4523,10 +4917,14 @@ window.__ModuleLoader__.load({
       try {
         const store = window.localStorage
         if (store === undefined || store === null) return
+        const slot = normalizeSlot(entry.slot)
+        entry.slot = slot
         store.setItem(
-          SAVE_PREFIX + entry.key,
+          saveKey(entry.key, slot),
           JSON.stringify({
             version: 5,
+            slot,
+            savedAt: Date.now(),
             style: entry.style,
             movement: entry.movement,
             build: entry.build,
@@ -4540,8 +4938,141 @@ window.__ModuleLoader__.load({
             draftCount: entry.draftCount,
           }),
         )
+        store.setItem(activeSlotKey(entry.key), String(slot))
       } catch {
         // 存档失败不能打断战斗
+      }
+    }
+
+    /** 手动保存前把战斗内已经结算的成长同步到账户字段。 */
+    function saveProgress(entry) {
+      const battle = entry.battle
+      if (battle !== null) {
+        entry.build = battle.build
+        entry.level = battle.level
+        entry.xp = battle.xp
+        entry.xpNext = battle.xpNext
+        entry.pending = battle.pending
+        entry.draftCount = battle.draftCount
+      }
+      saveAccount(entry)
+    }
+
+    function slotHasSave(key, slot) {
+      const index = normalizeSlot(slot)
+      if (readStore(saveKey(key, index)) !== null) return true
+      if (index !== 0) return false
+      return readStore(PREVIOUS_PREFIX + key) !== null || readStore(LEGACY_PREFIX + key) !== null
+    }
+
+    function makeSaveInfo(key, slot, saved, legacyLabel) {
+      const stats = normalizeStats(saved.stats)
+      const style = resolveStyle(saved.style, stats)
+      const floor = Math.min(MAX_FLOOR, toInt(saved.floor, 1, 1))
+      const best = Math.max(floor, toInt(saved.best, 1, Math.max(1, stats.bestFloor)))
+      return {
+        slot,
+        empty: false,
+        legacy: legacyLabel !== '',
+        legacyLabel,
+        style: style.id,
+        styleLabel: style.label,
+        floor,
+        best,
+        level: toInt(saved.level, 1, 1),
+        kills: stats.kills,
+        drafts: stats.drafts,
+        skills: saved.build !== null && typeof saved.build === 'object' && Array.isArray(saved.build.skills)
+          ? saved.build.skills.length
+          : 0,
+        savedAt: Number.isFinite(Number(saved.savedAt)) ? Number(saved.savedAt) : 0,
+      }
+    }
+
+    /** 只读摘要：列表与开局界面不触发构筑修复或写盘。 */
+    function saveInfo(key, slot) {
+      const index = normalizeSlot(slot)
+      const saved = readStore(saveKey(key, index))
+      if (saved !== null && typeof saved === 'object' && !Array.isArray(saved)) {
+        return makeSaveInfo(key, index, saved, '')
+      }
+      if (index !== 0) return { slot: index, empty: true, savedAt: 0 }
+      const previous = readStore(PREVIOUS_PREFIX + key)
+      if (previous !== null && typeof previous === 'object') {
+        return makeSaveInfo(key, 0, previous, 'v4')
+      }
+      const legacy = readStore(LEGACY_PREFIX + key)
+      if (legacy !== null && typeof legacy === 'object') {
+        const stats = normalizeStats(legacy.stats)
+        return {
+          slot: 0,
+          empty: false,
+          legacy: true,
+          legacyLabel: 'v3',
+          style: defaultStyle().id,
+          styleLabel: defaultStyle().label,
+          floor: 1,
+          best: Math.max(1, stats.bestFloor),
+          level: 1,
+          kills: stats.kills,
+          drafts: stats.drafts,
+          skills: 0,
+          savedAt: 0,
+        }
+      }
+      return { slot: 0, empty: true, savedAt: 0 }
+    }
+
+    function listSaveSlots(key) {
+      const slots = []
+      for (let slot = 0; slot < SAVE_SLOTS; slot += 1) slots.push(saveInfo(key, slot))
+      return slots
+    }
+
+    function latestSlot(key) {
+      let best = -1
+      let bestAt = -1
+      for (let slot = 0; slot < SAVE_SLOTS; slot += 1) {
+        const info = saveInfo(key, slot)
+        if (info.empty) continue
+        if (best < 0 || info.savedAt >= bestAt) {
+          best = slot
+          bestAt = info.savedAt
+        }
+      }
+      return best
+    }
+
+    function activeSlot(key) {
+      const value = readStore(activeSlotKey(key))
+      const slot = Number(value)
+      return Number.isInteger(slot) && slot >= 0 && slot < SAVE_SLOTS ? slot : -1
+    }
+
+    /** 自动保存目标优先；标记丢失或指向空槽时退回最近存档。 */
+    function preferredSlot(key) {
+      const active = activeSlot(key)
+      if (active >= 0 && slotHasSave(key, active)) return active
+      return latestSlot(key)
+    }
+
+    function removeSave(key, slot) {
+      const index = normalizeSlot(slot)
+      try {
+        const store = window.localStorage
+        if (store === undefined || store === null) return false
+        removeStore(saveKey(key, index))
+        removeStore(saveKey(key, index) + BACKUP_SUFFIX)
+        if (index === 0) {
+          // 明确删除存档时，连同旧版源档一起清理，避免删除后旧档又“复活”。
+          removeStore(PREVIOUS_PREFIX + key)
+          removeStore(LEGACY_PREFIX + key)
+        }
+        const active = readStore(activeSlotKey(key))
+        if (active !== null && Number(active) === index) removeStore(activeSlotKey(key))
+        return true
+      } catch {
+        return false
       }
     }
 
@@ -4596,6 +5127,7 @@ window.__ModuleLoader__.load({
       entry.trailTimer = 0
       entry.spawnAt = new Map()
       entry.bulletPrev = new Map()
+      entry.arcTrail = new Map()
       entry.shake = 0
       entry.flash = 0
       entry.muzzle = 0
@@ -4638,10 +5170,16 @@ window.__ModuleLoader__.load({
       saveAccount(entry)
     }
 
-    function createEntry(key, seed) {
-      const account = loadAccount(key)
+    function createEntry(key, seed, options = {}) {
+      // 传 autostart:false 时只准备账户数据，等玩家在大厅选择继续或新游戏；
+      // 测试与无头模拟仍默认直接开打。
+      const autostart = options === null || options === undefined || options.autostart !== false
+      const found = preferredSlot(key)
+      const slot = found < 0 ? 0 : found
+      const account = loadAccount(key, slot, { backup: autostart })
       const entry = {
         key,
+        slot,
         battle: null,
         floor: account.floor,
         best: account.best,
@@ -4658,7 +5196,8 @@ window.__ModuleLoader__.load({
         tokenQueue: 0,
         tokenSeen: new Map(),
         surgeMeter: 0,
-        phase: 'fight',
+        phase: autostart ? 'fight' : 'menu',
+        menu: null,
         lastResult: null,
         resultTimer: 0,
         choosing: null,
@@ -4674,6 +5213,7 @@ window.__ModuleLoader__.load({
         banner: null,
         spawnAt: new Map(),
         bulletPrev: new Map(),
+        arcTrail: new Map(),
         muzzle: 0,
         hurtT: 0,
         moving: false,
@@ -4686,7 +5226,7 @@ window.__ModuleLoader__.load({
         last: 0,
         subs: 0,
       }
-      startFloor(entry, entry.floor)
+      if (autostart) startFloor(entry, entry.floor)
       return entry
     }
 
@@ -4702,6 +5242,136 @@ window.__ModuleLoader__.load({
       entry.choosing = null
       entry.battle = null
       startFloor(entry, 1)
+    }
+
+    function applyAccount(entry, account) {
+      entry.floor = account.floor
+      entry.best = account.best
+      entry.build = account.build
+      entry.style = account.style
+      entry.movement = account.movement
+      entry.stats = account.stats
+      entry.level = account.level
+      entry.xp = account.xp
+      entry.xpNext = account.xpNext
+      entry.pending = account.pending
+      entry.draftCount = account.draftCount
+      entry.notice = account.notice
+    }
+
+    /** 新游戏继承当前与目标存档的累计战绩，只重置本轮进度。 */
+    function startNewGame(entry, slot, styleId) {
+      const index = normalizeSlot(slot)
+      const target = loadAccount(entry.key, index)
+      const merged = mergeStats(entry.stats, target.stats)
+      const best = Math.max(1, entry.best, target.best, merged.bestFloor)
+      merged.bestFloor = best
+      const wanted = styleById(styleId) ?? styleById(entry.style) ?? defaultStyle()
+      const style = isStyleUnlocked(wanted, merged) ? wanted : defaultStyle()
+      entry.slot = index
+      entry.stats = merged
+      entry.best = best
+      entry.style = style.id
+      entry.movement = style.movementPreference
+      entry.tokenQueue = 0
+      entry.surgeMeter = 0
+      entry.choosing = null
+      entry.menu = null
+      entry.battle = null
+      resetRun(entry)
+      entry.notice = '新游戏开始：' + style.label + ' · 第 1 层'
+      return true
+    }
+
+    function loadSlot(entry, slot) {
+      const index = normalizeSlot(slot)
+      if (!slotHasSave(entry.key, index)) return false
+      const account = loadAccount(entry.key, index)
+      const merged = mergeStats(entry.stats, account.stats)
+      const best = Math.max(1, entry.best, account.best, merged.bestFloor)
+      merged.bestFloor = best
+      account.stats = merged
+      account.best = best
+      entry.slot = index
+      entry.battle = null
+      entry.phase = 'menu'
+      entry.lastResult = null
+      entry.resultTimer = 0
+      entry.choosing = null
+      entry.menu = null
+      entry.tokenQueue = 0
+      entry.surgeMeter = 0
+      applyAccount(entry, account)
+      const notice = account.notice
+      startFloor(entry, entry.floor)
+      if (notice !== '') entry.notice = notice
+      return true
+    }
+
+    function continueGame(entry) {
+      if (entry.battle !== null) {
+        entry.menu = null
+        if (entry.phase === 'menu') entry.phase = 'fight'
+        return true
+      }
+      const slot = preferredSlot(entry.key)
+      if (slot < 0) return false
+      return loadSlot(entry, slot)
+    }
+
+    function resetPreview(entry) {
+      const account = emptyAccount()
+      entry.battle = null
+      entry.phase = 'menu'
+      entry.slot = 0
+      entry.tokenQueue = 0
+      entry.surgeMeter = 0
+      entry.lastResult = null
+      entry.resultTimer = 0
+      entry.choosing = null
+      entry.banner = null
+      entry.menu = null
+      applyAccount(entry, account)
+    }
+
+    function deleteSave(entry, slot) {
+      const index = normalizeSlot(slot)
+      const wasCurrent = normalizeSlot(entry.slot) === index
+      if (!removeSave(entry.key, index)) return false
+      const menu = entry.menu
+      if (wasCurrent) resetPreview(entry)
+      if (menu !== null) {
+        entry.menu = menu
+        menu.screen = 'home'
+        menu.confirmDelete = -1
+        menu.newSlot = null
+        menu.newStyle = null
+        menu.message = wasCurrent ? '已删除当前存档，本轮进度已放弃' : '已删除存档 ' + (index + 1)
+      }
+      return true
+    }
+
+    function openMenu(entry) {
+      if (entry.menu === null) {
+        entry.menu = { screen: 'home', newSlot: null, newStyle: null, confirmDelete: -1, message: '' }
+      } else {
+        entry.menu.screen = 'home'
+        entry.menu.confirmDelete = -1
+      }
+    }
+
+    function openNewGameMenu(entry, slot) {
+      if (entry.menu === null) openMenu(entry)
+      const menu = entry.menu
+      const slots = listSaveSlots(entry.key)
+      const empty = slots.find((info) => info.empty)
+      menu.screen = 'new'
+      menu.newSlot = slot === undefined || slot === null
+        ? (empty === undefined ? normalizeSlot(entry.slot) : empty.slot)
+        : normalizeSlot(slot)
+      menu.newStyle = entry.style
+      menu.confirmDelete = -1
+      menu.message = ''
     }
 
     function setStyle(entry, id) {
@@ -4845,6 +5515,11 @@ window.__ModuleLoader__.load({
           entry.muzzle = 0.06
           addParticles(entry, ev.x, ev.y, 2, ev.color ?? '#9fd8ff', 30, 0.22, 0)
           break
+        case 'arcSwordCast':
+          entry.muzzle = 0.06
+          ring(entry, ev.x, ev.y, 5, 0.2, ev.color ?? '#b6f0d2')
+          addParticles(entry, ev.x, ev.y, 2, ev.color ?? '#b6f0d2', 24, 0.2, 0)
+          break
         case 'swordArray':
           ring(entry, ev.x, ev.y, ev.radius, 0.45, ev.color ?? '#c9b3ff')
           addParticles(entry, ev.x, ev.y, 5, ev.color ?? '#c9b3ff', 30, 0.32, 0)
@@ -4913,6 +5588,8 @@ window.__ModuleLoader__.load({
     }
 
     function tick(entry, dt) {
+      // 大厅 / 暂停菜单打开时冻结战斗，避免玩家看菜单时还在掉血。
+      if (entry.menu !== null) return
       entry.time += dt
       if (entry.shake > 0) entry.shake = Math.max(0, entry.shake - dt * 20)
       if (entry.flash > 0) entry.flash = Math.max(0, entry.flash - dt * 2.6)
@@ -4968,6 +5645,23 @@ window.__ModuleLoader__.load({
       for (const enemy of battle.enemies) {
         if (!entry.spawnAt.has(enemy.id)) entry.spawnAt.set(enemy.id, entry.time)
       }
+      for (const list of entry.arcTrail.values()) {
+        for (const point of list) point.life -= dt
+      }
+      for (const sword of battle.arcSwords) {
+        let list = entry.arcTrail.get(sword.id)
+        if (list === undefined) {
+          list = []
+          entry.arcTrail.set(sword.id, list)
+        }
+        list.push({ x: sword.x, y: sword.y, life: 0.18 })
+        if (list.length > 12) list.shift()
+      }
+      for (const [id, list] of entry.arcTrail) {
+        const alive = list.filter((point) => point.life > 0)
+        if (alive.length === 0) entry.arcTrail.delete(id)
+        else entry.arcTrail.set(id, alive)
+      }
       for (const ev of events) juice(entry, ev)
       if (battle.state !== 'fighting') {
         entry.lastResult = {
@@ -5008,7 +5702,8 @@ window.__ModuleLoader__.load({
     function acquireEntry(key) {
       let entry = ENTRIES.get(key)
       if (entry === undefined) {
-        entry = createEntry(key)
+        entry = createEntry(key, undefined, { autostart: false })
+        openMenu(entry)
         ENTRIES.set(key, entry)
       }
       entry.subs += 1
@@ -5239,6 +5934,31 @@ window.__ModuleLoader__.load({
         c.fillStyle = '#ffffff'
         c.fillRect(Math.round(sword.x), Math.round(sword.y), 1, 1)
       }
+
+      for (const sword of battle.arcSwords) {
+        const color = sword.plan.element === null ? sword.plan.action.color : sword.plan.element.color
+        const dx = sword.dirX ?? 1
+        const dy = sword.dirY ?? 0
+        // 剑影在 0.12 秒内加亮；尾迹只做表现，不参与判定。
+        const reveal = Math.min(1, (sword.elapsed ?? 0) / 0.12)
+        c.fillStyle = color
+        for (const point of entry.arcTrail?.get(sword.id) ?? []) {
+          c.globalAlpha = (point.life / 0.18) * 0.35
+          c.fillRect(Math.round(point.x), Math.round(point.y), 1, 1)
+        }
+        c.globalAlpha = 0.3 + reveal * 0.6
+        for (let i = 0; i < 4; i += 1) {
+          c.fillRect(Math.round(sword.x - dx * i), Math.round(sword.y - dy * i), 1, 1)
+        }
+        c.globalAlpha = 0.45 + reveal * 0.35
+        c.fillRect(Math.round(sword.x - dy), Math.round(sword.y + dx), 1, 1)
+        c.fillRect(Math.round(sword.x + dy), Math.round(sword.y - dx), 1, 1)
+        c.globalAlpha = 0.7 + reveal * 0.3
+        c.fillStyle = '#ffffff'
+        c.fillRect(Math.round(sword.x + dx), Math.round(sword.y + dy), 1, 1)
+        c.fillRect(Math.round(sword.x + dx * 2), Math.round(sword.y + dy * 2), 1, 1)
+      }
+      c.globalAlpha = 1
 
       for (const sword of battle.piercingSwords) {
         const color = sword.plan.element === null ? sword.plan.action.color : sword.plan.element.color
@@ -5574,6 +6294,209 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ---- 存档大厅 ----
+
+    function formatSaveTime(ms) {
+      if (!Number.isFinite(ms) || ms <= 0) return '旧存档'
+      const date = new Date(ms)
+      const pad = (n) => (n < 10 ? '0' + n : String(n))
+      return (date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes())
+    }
+
+    function saveSummary(info) {
+      if (info.empty) return '空存档'
+      if (info.legacy) return '旧版 ' + info.legacyLabel + ' 存档 · 第 ' + info.floor + ' 层'
+      return info.styleLabel + ' · 第 ' + info.floor + ' 层 · Lv.' + info.level + ' · 最佳 ' + info.best
+    }
+
+    function saveDetail(info) {
+      if (info.empty) return '还没有进度，可在这里新建'
+      return '击杀 ' + info.kills + ' · 抽卡 ' + info.drafts + ' · 技能 ' + info.skills
+    }
+
+    function menuButton(label, onClick, options = {}) {
+      const classes = ['dsh-pet-menu-btn']
+      if (options.primary === true) classes.push('primary')
+      if (options.danger === true) classes.push('danger')
+      return h('button', {
+        type: 'button',
+        className: classes.join(' '),
+        disabled: options.disabled === true,
+        title: options.title,
+        onClick,
+      }, label)
+    }
+
+    function statsForNewGame(entry, info) {
+      return {
+        ...entry.stats,
+        bestFloor: Math.max(1, entry.stats.bestFloor, entry.best, info.empty ? 1 : info.best),
+      }
+    }
+
+    function slotCard(entry, info, menu, bump) {
+      const current = entry.battle !== null && normalizeSlot(entry.slot) === info.slot
+      const confirming = menu.confirmDelete === info.slot
+      const actions = confirming
+        ? h('div', { className: 'dsh-pet-menu-slot-actions' },
+            h('span', { className: 'dsh-pet-menu-warn' },
+              current ? '删除当前存档会放弃本轮进度。' : '删除后不可恢复。'),
+            menuButton('确认删除', () => {
+              deleteSave(entry, info.slot)
+              bump()
+            }, { danger: true }),
+            menuButton('取消', () => {
+              menu.confirmDelete = -1
+              bump()
+            }),
+          )
+        : h('div', { className: 'dsh-pet-menu-slot-actions' },
+            info.empty ? null : menuButton('读取', () => {
+              if (loadSlot(entry, info.slot)) bump()
+            }, { title: '从该存档所在层重新开始' }),
+            menuButton(info.empty ? '在此新建' : '覆盖新建', () => {
+              openNewGameMenu(entry, info.slot)
+              bump()
+            }),
+            info.empty ? null : menuButton('删除', () => {
+              menu.confirmDelete = info.slot
+              bump()
+            }, { danger: true }),
+          )
+      return h('div', {
+        key: info.slot,
+        className: 'dsh-pet-menu-slot' + (current ? ' on' : '') + (info.empty ? ' empty' : ''),
+      },
+        h('div', { className: 'dsh-pet-menu-slot-head' },
+          h('span', { className: 'dsh-pet-menu-slot-name' }, '存档 ' + (info.slot + 1)),
+          current ? h('span', { className: 'dsh-pet-menu-tag' }, '当前') : null,
+          h('span', { className: 'dsh-pet-menu-slot-time' },
+            info.empty ? '空' : formatSaveTime(info.savedAt)),
+        ),
+        h('div', { className: 'dsh-pet-menu-slot-desc' }, saveSummary(info)),
+        info.empty ? null : h('div', { className: 'dsh-pet-menu-slot-desc' }, saveDetail(info)),
+        actions,
+      )
+    }
+
+    function menuHome(entry, bump) {
+      const menu = entry.menu
+      const slots = listSaveSlots(entry.key)
+      const preferred = preferredSlot(entry.key)
+      const latestInfo = preferred >= 0 ? slots[preferred] : null
+      const running = entry.battle !== null
+      const canContinue = running || latestInfo !== null
+      const style = styleById(entry.style) ?? defaultStyle()
+      const runLevel = entry.battle !== null ? entry.battle.level : entry.level
+      const summary = running
+        ? '本轮：' + style.label + ' · 第 ' + entry.floor + ' 层 · Lv.' + runLevel
+        : latestInfo === null
+          ? '还没有存档，开始一局新游戏吧。'
+          : '存档：' + saveSummary(latestInfo)
+      return h('div', { className: 'dsh-pet-menu' },
+        h('div', { className: 'dsh-pet-menu-title' }, 'DSH PET'),
+        h('div', { className: 'dsh-pet-menu-sub' }, running ? '暂停中 · 战斗已冻结' : '你干活，它打怪'),
+        h('div', { className: 'dsh-pet-menu-slot-desc' }, summary),
+        canContinue
+          ? menuButton('继续游戏', () => {
+              if (continueGame(entry)) bump()
+            }, { primary: true })
+          : null,
+        h('div', { className: 'dsh-pet-menu-actions' },
+          running
+            ? menuButton('保存进度', () => {
+                saveProgress(entry)
+                menu.message = '已保存到存档 ' + (normalizeSlot(entry.slot) + 1)
+                bump()
+              }, { title: '立即写入当前槽位' })
+            : null,
+          canContinue
+            ? menuButton('新游戏', () => {
+                openNewGameMenu(entry)
+                bump()
+              })
+            : menuButton('开始游戏', () => {
+                openNewGameMenu(entry)
+                bump()
+              }, { primary: true }),
+        ),
+        menu.message !== '' ? h('div', { className: 'dsh-pet-menu-msg' }, menu.message) : null,
+        h('div', { className: 'dsh-pet-menu-head' }, '存档槽位'),
+        ...slots.map((info) => slotCard(entry, info, menu, bump)),
+        h('div', { className: 'dsh-pet-menu-foot' },
+          '进入新层、升级或结算时自动保存到当前槽位；读取其他槽位会从该存档所在层开始。'),
+      )
+    }
+
+    function menuNewGame(entry, bump) {
+      const menu = entry.menu
+      const slots = listSaveSlots(entry.key)
+      const target = normalizeSlot(menu.newSlot === null ? entry.slot : menu.newSlot)
+      const info = slots[target]
+      const stats = statsForNewGame(entry, info)
+      const wanted = styleById(menu.newStyle) ?? styleById(entry.style) ?? defaultStyle()
+      const selected = isStyleUnlocked(wanted, stats) ? wanted : defaultStyle()
+      const styleButtons = listStyles().map((style) => {
+        const unlocked = isStyleUnlocked(style, stats)
+        return h('button', {
+          key: style.id,
+          type: 'button',
+          className: 'dsh-pet-style' + (selected.id === style.id ? ' on' : ''),
+          disabled: !unlocked,
+          title: unlocked ? style.desc : '未解锁：最高层达到 ' + style.unlockedBy.bestFloor,
+          onClick: () => {
+            menu.newStyle = style.id
+            bump()
+          },
+        }, style.label)
+      })
+      const slotButtons = slots.map((slotInfo) => h('button', {
+        key: slotInfo.slot,
+        type: 'button',
+        className: 'dsh-pet-menu-slotpick' + (slotInfo.slot === target ? ' on' : ''),
+        onClick: () => {
+          menu.newSlot = slotInfo.slot
+          const nextStats = statsForNewGame(entry, slotInfo)
+          const current = styleById(menu.newStyle)
+          if (current === undefined || !isStyleUnlocked(current, nextStats)) {
+            menu.newStyle = defaultStyle().id
+          }
+          bump()
+        },
+      }, '存档 ' + (slotInfo.slot + 1) + ' · ' +
+        (slotInfo.empty ? '空档' : '覆盖 · 第 ' + slotInfo.floor + ' 层')))
+      return h('div', { className: 'dsh-pet-menu' },
+        h('div', { className: 'dsh-pet-menu-title' }, '新游戏'),
+        h('div', { className: 'dsh-pet-menu-sub' }, '选择存档位置与起始风格；累计战绩与解锁保留'),
+        h('div', { className: 'dsh-pet-menu-label' }, '存档位置'),
+        h('div', { className: 'dsh-pet-menu-actions' }, ...slotButtons),
+        info.empty
+          ? null
+          : h('div', { className: 'dsh-pet-menu-warn' },
+              '将覆盖存档 ' + (target + 1) + '，重开第 1 层；该档的累计战绩会合并保留。'),
+        h('div', { className: 'dsh-pet-menu-label' }, '战斗风格'),
+        h('div', { className: 'dsh-pet-style-row' }, ...styleButtons),
+        h('div', { className: 'dsh-pet-menu-actions' },
+          menuButton('开始游戏', () => {
+            startNewGame(entry, target, selected.id)
+            bump()
+          }, { primary: true }),
+          menuButton('返回', () => {
+            menu.screen = 'home'
+            bump()
+          }),
+        ),
+        h('div', { className: 'dsh-pet-menu-foot' },
+          '新游戏只重置本轮进度；已解锁风格、最佳层与累计击杀会保留。'),
+      )
+    }
+
+    function menuPanel(entry, bump) {
+      const menu = entry.menu
+      if (menu === null) return null
+      return menu.screen === 'new' ? menuNewGame(entry, bump) : menuHome(entry, bump)
+    }
+
     function PetBody(props) {
       const sessionId = props !== null && props !== undefined && props.sessionId !== undefined
         ? String(props.sessionId)
@@ -5679,6 +6602,13 @@ window.__ModuleLoader__.load({
         )
       }
 
+      if (entry.menu !== null) {
+        return h('div', { className: 'dsh-pet' },
+          h('style', { key: 'style' }, CSS),
+          menuPanel(entry, bump),
+        )
+      }
+
       const battle = entry.battle
       const cells = battle === null ? 0 : battle.player.cells
       const maxCells = battle === null ? 1 : battle.player.maxCells
@@ -5701,9 +6631,18 @@ window.__ModuleLoader__.load({
           modifier !== null ? h('span', { className: 'dsh-pet-hot' }, MODIFIERS[modifier].name) : null,
           h('span', { className: 'dsh-pet-spacer' }),
           h('span', { className: 'dsh-pet-muted' }, '技能 ' + (battle === null ? entry.build.skills.length : battle.build.skills.length) + '/' + MAX_SKILLS),
-          h('span', { className: 'dsh-pet-dot' + (entry.online ? ' on' : '') }),
+          entry.menu === null ? h('button', {
+            type: 'button',
+            className: 'dsh-pet-btn',
+            title: '存档与菜单',
+            onClick: () => {
+              openMenu(entry)
+              bump()
+            },
+          }, '存档') : null,
+          entry.menu === null ? h('span', { className: 'dsh-pet-dot' + (entry.online ? ' on' : '') }) : null,
         ),
-        notice !== '' ? h('div', {
+        notice !== '' && entry.menu === null ? h('div', {
           className: 'dsh-pet-notice',
           title: '点击关闭',
           onClick: () => {
@@ -5732,18 +6671,22 @@ window.__ModuleLoader__.load({
               )
             : offerPanel(entry, activeChoosing, setChoosing, bump),
         ),
-        h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%', background: hpColor } })),
-        stylePanel(entry, bump),
-        buildPanel(entry, bump),
-        h('div', { className: 'dsh-pet-bottom' },
-          h('span', null, '生命 ' + Math.max(0, Math.ceil(cells)) + '/' + maxCells),
-          h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
-          h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
-          h('span', null, '压力 +' + (battle === null ? 0 : battle.extra)),
-          battle !== null && battle.surge ? h('span', { className: 'dsh-pet-hot' }, '过载') : null,
-          h('span', { className: 'dsh-pet-spacer' }),
-          h('span', null, formatTokens(entry.consumed) + ' token'),
-        ),
+        entry.menu === null
+          ? h('div', { className: 'dsh-pet-body-rest' },
+              h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%', background: hpColor } })),
+              stylePanel(entry, bump),
+              buildPanel(entry, bump),
+              h('div', { className: 'dsh-pet-bottom' },
+                h('span', null, '生命 ' + Math.max(0, Math.ceil(cells)) + '/' + maxCells),
+                h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
+                h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
+                h('span', null, '压力 +' + (battle === null ? 0 : battle.extra)),
+                battle !== null && battle.surge ? h('span', { className: 'dsh-pet-hot' }, '过载') : null,
+                h('span', { className: 'dsh-pet-spacer' }),
+                h('span', null, formatTokens(entry.consumed) + ' token'),
+              ),
+            )
+          : null,
       )
     }
 
@@ -5821,6 +6764,22 @@ window.__ModuleLoader__.load({
         setMovement,
         listStyles,
         isStyleUnlocked,
+        listSaveSlots,
+        latestSlot,
+        activeSlot,
+        preferredSlot,
+        loadSlot,
+        continueGame,
+        startNewGame,
+        deleteSave,
+        openMenu,
+        openNewGameMenu,
+        saveAccount,
+        saveProgress,
+        formatSaveTime,
+        saveSummary,
+        menuPanel,
+        css: CSS,
       },
     }
   },

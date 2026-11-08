@@ -51,11 +51,16 @@ function battleWith(actions, strategy) {
 test('移动策略：接近、保持距离、自动使用不同目标距离', () => {
   const projectile = plansFor(['projectile'])[0];
   const swing = plansFor(['swing'])[0];
+  const arc = plansFor(['arcSword'])[0];
   assert.equal(desiredRange([projectile], 'keepDistance'), 90);
   assert.equal(desiredRange([swing], 'approach'), 14);
+  assert.equal(desiredRange([arc], 'keepDistance'), 78);
   assert.equal(desiredRange([projectile, swing], 'approach'), 14);
   assert.equal(desiredRange([projectile, swing], 'keepDistance'), 90);
   assert.equal(desiredRange([projectile, swing], 'auto'), 52);
+  assert.equal(desiredRange([arc, swing], 'keepDistance'), 78);
+  assert.equal(desiredRange([arc, swing], 'approach'), 14);
+  assert.equal(desiredRange([arc, swing], 'auto'), 46);
   assert.equal(createMovementState([projectile], 'nope').strategy, 'auto');
 });
 
@@ -114,7 +119,7 @@ test('风格目录：默认风格与解锁条件可读', () => {
   const styles = listStyles();
   assert.equal(styles.length, 4);
   assert.equal(defaultStyle().id, 'ranged');
-  assert.equal(styleById('sword').movementPreference, 'approach');
+  assert.equal(styleById('sword').movementPreference, 'keepDistance');
   assert.equal(isStyleUnlocked(styleById('sword'), { bestFloor: 1 }), false);
   assert.equal(isStyleUnlocked(styleById('sword'), { bestFloor: 3 }), true);
   assert.deepEqual(
@@ -139,6 +144,8 @@ test('每种风格的起始构筑都能编译，且不共享战斗结算分支',
     assert.equal(compiled.ok, true, style.id + ': ' + JSON.stringify(compiled.errors));
     assert.equal(compiled.plans.length, 1);
   }
+  assert.equal(styleById('sword').startingBuild[0].action, 'arcSword');
+  assert.equal(styleById('sword').movementPreference, 'keepDistance');
 });
 
 test('所有起始风格在无属性、无修饰时能完成教学战斗', () => {

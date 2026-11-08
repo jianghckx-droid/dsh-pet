@@ -50,7 +50,7 @@ function seeded(seed = 7) {
 
 test('内容注册：动作、属性、修饰、状态、反应与风格都通过校验', () => {
   assert.deepEqual(validateContent(LISTS), []);
-  assert.equal(contentList('action').length, 8);
+  assert.equal(contentList('action').length, 9);
   assert.equal(contentList('element').length, 3);
   assert.equal(contentList('modifier').length, 5);
   assert.equal(contentList('reaction').length, 3);
@@ -322,6 +322,39 @@ test('原子替换：取出后仍满员才丢弃最旧组件并提示', () => {
   assert.deepEqual(installed.build.reserve, ['echo', 'pull', 'fire']);
   assert.equal(installed.warnings[0].code, 'reserve-full');
   assert.ok(installed.warnings[0].message.includes('frost'));
+});
+
+test('弧光飞剑：描述展示射程、冷却、单目标与拦截；分裂与范围修饰不开放', () => {
+  const compiled = compileBuild({
+    skills: [{ id: 'skill-1', action: 'arcSword', element: null, modifier: null }],
+    reserve: [],
+  });
+  assert.equal(compiled.ok, true);
+  const plan = compiled.plans[0];
+  assert.equal(plan.movement.preferredRange, 78);
+  assert.equal(plan.capabilities.includes('homing'), true);
+  assert.equal(plan.capabilities.includes('ranged'), false, '首版不向分裂开放');
+  assert.ok(plan.description.includes('104'), plan.description);
+  assert.ok(plan.description.includes('1.2'), plan.description);
+  assert.ok(plan.description.includes('2'), plan.description);
+  assert.ok(plan.description.includes('首个目标'), plan.description);
+  assert.ok(plan.description.includes('拦截'), plan.description);
+
+  for (const modifier of ['split', 'expand', 'pull']) {
+    const blocked = compileBuild({
+      skills: [{ id: 'skill-1', action: 'arcSword', modifier }],
+      reserve: [],
+    });
+    assert.equal(blocked.ok, false, modifier);
+    assert.equal(blocked.errors[0].code, 'capability-mismatch');
+  }
+  for (const modifier of ['echo', 'detonate']) {
+    const allowed = compileBuild({
+      skills: [{ id: 'skill-1', action: 'arcSword', modifier }],
+      reserve: [],
+    });
+    assert.equal(allowed.ok, true, modifier);
+  }
 });
 
 test('修饰能力契约：分裂只接受远程动作，近战与御剑不能分裂', () => {

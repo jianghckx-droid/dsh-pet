@@ -237,6 +237,8 @@ function compileSkill(skill, index, errors) {
     speed: numbers.speed ?? 0,
     range: numbers.range ?? 0,
     radius: numbers.radius ?? 0,
+    flightTime: numbers.flightTime ?? 0,
+    maxCorrection: numbers.maxCorrection ?? 0,
     maxTargets: numbers.maxTargets ?? 1,
     life: numbers.life ?? 0,
     angle: numbers.angle ?? 0,
