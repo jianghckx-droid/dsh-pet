@@ -1,89 +1,56 @@
-// 层数表（1–12 层，MVP 用 1–8）。
+// 层数表：敌人数量、类型与层修饰符。
 //
-// 数值来自 docs/floors.md，改动前先跑 `node tools/balance-sim.mjs --sweep`
-// 确认第 6 层那道墙还在。
-//
-// "双锁混编"的实现是：同一层的敌人轮换携带不同的单锁，而不是一只怪同时带两个锁。
-// 同时带两个锁的怪留给以后（倍率相乘已经是按这个设计的）。
+// 旧文档里的"锁"（甲壳、分裂、锚定……）已随旧卡牌系统一起舍弃。
+// 现在每一层只描述敌人构成与压力，不再要求特定卡牌组合。
 
 export const FLOOR_SECONDS = 26;
+export const TIME_LIMIT = 45;
 
 /** 层修饰符：让同一套 build 在不同层表现不同。 */
 export const MODIFIERS = Object.freeze({
-  crowded: Object.freeze({ name: '拥挤', desc: '敌人 +50%，血量 −30%' }),
+  crowded: Object.freeze({ name: '拥挤', desc: '敌人 +50%，生命 −30%' }),
   frenzy: Object.freeze({ name: '狂暴', desc: '敌人移速 +30%，伤害 +1' }),
-  silent: Object.freeze({ name: '静默', desc: '领域类卡失效' }),
-  elite: Object.freeze({ name: '精英', desc: '最后一只怪带双锁，击杀给一次三选一' }),
+  elite: Object.freeze({ name: '精英', desc: '最后一只敌人强化，清层后额外给一次三选一' }),
 });
 
-const FLOOR_MODIFIERS = Object.freeze({ 4: 'crowded', 7: 'frenzy', 10: 'silent', 13: 'elite' });
+const FLOOR_MODIFIERS = Object.freeze({ 4: 'crowded', 7: 'frenzy', 10: 'elite', 13: 'elite' });
 
 export function floorModifier(floor) {
   return FLOOR_MODIFIERS[floor] ?? null;
 }
 
-/** 锁对格数的倍率。一只怪带多个锁时相乘。 */
-export const LOCK_CELLS = Object.freeze({
-  carapace: 2,
-  split: 1.2,
-  regen: 1.5,
-  shield: 1.5,
-  anchor: 1.4,
-  cleanse: 1.2,
-  devour: 1.5,
-  phase: 1.3,
-  reflect: 1.2,
-  generator: 1.5,
-});
+export const FLOORS = Object.freeze([
+  Object.freeze({ floor: 1, count: 8, mix: Object.freeze({ swarm: 1 }) }),
+  Object.freeze({ floor: 2, count: 9, mix: Object.freeze({ swarm: 1 }) }),
+  Object.freeze({ floor: 3, count: 9, mix: Object.freeze({ swarm: 3, brute: 1 }) }),
+  Object.freeze({ floor: 4, count: 12, mix: Object.freeze({ swarm: 3, brute: 1 }) }),
+  Object.freeze({ floor: 5, count: 10, mix: Object.freeze({ swarm: 2, brute: 1 }) }),
+  Object.freeze({ floor: 6, count: 10, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 1 }) }),
+  Object.freeze({ floor: 7, count: 11, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 1 }) }),
+  Object.freeze({ floor: 8, count: 10, mix: Object.freeze({ swarm: 2, brute: 2 }) }),
+  Object.freeze({ floor: 9, count: 11, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 1 }) }),
+  Object.freeze({ floor: 10, count: 12, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 2 }) }),
+  Object.freeze({ floor: 11, count: 12, mix: Object.freeze({ swarm: 3, brute: 1, skirmisher: 1 }) }),
+  Object.freeze({ floor: 12, count: 13, mix: Object.freeze({ swarm: 2, brute: 2, skirmisher: 1 }) }),
+  Object.freeze({ floor: 13, count: 13, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 2 }) }),
+  Object.freeze({ floor: 14, count: 14, mix: Object.freeze({ swarm: 3, brute: 1, skirmisher: 2 }) }),
+  Object.freeze({ floor: 15, count: 14, mix: Object.freeze({ swarm: 2, brute: 2, skirmisher: 2 }) }),
+]);
 
-export function baseCells(floor) {
-  return 4 + 1.35 * floor;
+export const MAX_FLOOR = 15;
+
+export function floorDef(n) {
+  const def = FLOORS.find((entry) => entry.floor === n);
+  if (def === undefined) throw new Error(`floor not in table: ${n}`);
+  return def;
 }
 
-export function lockMultiplier(locks = []) {
-  return locks.reduce((m, lock) => m * (LOCK_CELLS[lock] ?? 1), 1);
-}
-
-/** 先乘倍率再取整，否则 ×2 的锁会比设计值少 1 格（第 7 层就是例子）。 */
-export function enemyCells(floor, locks = []) {
-  return Math.round(baseCells(floor) * lockMultiplier(locks));
-}
-
-export function enemyDamage(floor) {
-  if (floor >= 10) return 3;
-  if (floor >= 5) return 2;
-  return 1;
+export function enemyTotal(def, { modifier, extra = 0 } = {}) {
+  let base = def.count;
+  if (modifier === 'crowded') base = Math.round(base * 1.5);
+  return base + extra;
 }
 
 export function spawnSeconds(def) {
-  return FLOOR_SECONDS / def.enemies;
-}
-
-export const FLOORS = Object.freeze([
-  Object.freeze({ floor: 1, enemies: 8, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 2, enemies: 9, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 3, enemies: 10, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 4, enemies: 12, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 5, enemies: 13, locks: Object.freeze([]) }),
-  Object.freeze({ floor: 6, enemies: 8, locks: Object.freeze(['carapace']) }),
-  Object.freeze({ floor: 7, enemies: 9, locks: Object.freeze(['carapace']) }),
-  Object.freeze({ floor: 8, enemies: 10, locks: Object.freeze(['carapace']) }),
-  Object.freeze({ floor: 9, enemies: 12, locks: Object.freeze(['split']) }),
-  Object.freeze({ floor: 10, enemies: 13, locks: Object.freeze(['anchor']) }),
-  Object.freeze({ floor: 11, enemies: 13, locks: Object.freeze(['cleanse']) }),
-  Object.freeze({ floor: 12, enemies: 14, locks: Object.freeze(['phase']) }),
-  Object.freeze({ floor: 13, enemies: 14, locks: Object.freeze(['devour']) }),
-  Object.freeze({ floor: 14, enemies: 15, locks: Object.freeze(['generator']) }),
-  Object.freeze({ floor: 15, enemies: 16, locks: Object.freeze(['reflect']) }),
-]);
-
-/** MVP 只做到第 8 层（第 6 层是墙，第 8 层是切片上限）。 */
-export const MVP_FLOOR_COUNT = 8;
-
-export const MVP_FLOORS = Object.freeze(FLOORS.filter((f) => f.floor <= MVP_FLOOR_COUNT));
-
-export function floorDef(n) {
-  const def = FLOORS.find((f) => f.floor === n);
-  if (def === undefined) throw new Error(`floor not in table: ${n}`);
-  return def;
+  return FLOOR_SECONDS / def.count;
 }

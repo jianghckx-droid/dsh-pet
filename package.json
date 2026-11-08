@@ -19,12 +19,15 @@
     "icon.svg"
   ],
   "scripts": {
-    "test": "node --test",
+    "test": "node tools/run-tests.mjs",
+    "test:node": "node --test",
     "build": "node tools/build-client.mjs",
     "build:check": "node tools/build-client.mjs --check",
     "sim": "node tools/balance-sim.mjs --sweep",
     "arena": "node tools/arena-report.mjs",
-    "preview": "node tools/render-frame.mjs 25 docs/preview.png 6"
+    "synergy": "node tools/synergy-report.mjs",
+    "preview": "node tools/render-frame.mjs 25 docs/preview.png 6 --demo",
+    "preview:strip": "node tools/render-frame.mjs 25 docs/preview-strip.png 6 --demo --strip"
   },
   "dsh": {
     "bundle": {

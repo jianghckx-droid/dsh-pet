@@ -165,14 +165,35 @@ const mod = definition.factory((id) => {
 });
 const { createEntry, startFloor, tick, draw } = mod.__debug;
 
+const DEMO_BUILD = {
+  version: 3,
+  skills: [
+    { id: 'skill-1', action: 'swordPierce', element: 'fire', modifier: null },
+    { id: 'skill-2', action: 'swordArray', element: 'frost', modifier: 'echo' },
+  ],
+  reserve: ['thunder', 'detonate', 'pull'],
+};
+
 const floor = Number(process.argv[4] ?? 1);
+const demo = process.argv.includes('--demo');
 const entry = createEntry('preview', 7);
-if (floor !== 1) startFloor(entry, floor);
+if (demo) entry.build = DEMO_BUILD;
+if (floor !== 1 || demo) startFloor(entry, floor);
 const frames = Math.round(seconds * 60);
+let fired = false;
 for (let i = 0; i < frames; i += 1) {
   tick(entry, 1 / 60);
+  // 优先抓"刚开火且有敌人在场"的一帧：能同时看到弹体、光环与状态点。
+  if (entry.time > 6 && entry.muzzle > 0 && entry.battle.enemies.length >= 2) {
+    fired = true;
+    break;
+  }
   const calm = entry.battle.enemies.every((enemy) => enemy.flash <= 0);
   if (entry.particles.length >= 4 && entry.battle.enemies.length >= 2 && calm) break;
+}
+if (fired) {
+  // 让弹体离开玩家一两个像素，避免正好被角色盖住。
+  for (let i = 0; i < 10; i += 1) tick(entry, 1 / 60);
 }
 const ctx = new Ctx();
 draw(ctx, entry);

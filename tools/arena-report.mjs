@@ -1,27 +1,107 @@
 #!/usr/bin/env node
-// 空间状态机报告：用 src/game/arena.js 真实跑一遍，和 tools/balance-sim.mjs
-// 的抽象模型对照。两者应当给出同样的结论（谁过、谁不过），否则说明
-// 模型假设和真实走位之间有一方错了。
+// 空间状态机报告：用 src/game/arena.js 真实跑一遍全部层，和 balance-sim 的
+// 解析模型对照。两者应给出相同方向的结论；不一致说明模型假设或走位有问题。
 //
 // 用法: node tools/arena-report.mjs
 
-import { createBattle, runToEnd, TIME_LIMIT } from '../src/game/arena.js';
-import { FIRE_BUILD } from '../src/game/cards.js';
+import { TIME_LIMIT, createBattle, runToEnd } from '../src/game/arena.js';
 import { FLOORS } from '../src/game/floors.js';
 
 const BUILDS = {
-  pure: { label: '纯数值', build: ['orb_phys'], attrs: { edge: 10, body: 0 } },
-  pureTank: { label: '纯数值+体魄', build: ['orb_phys'], attrs: { edge: 5, body: 5 } },
-  fire: { label: '灼烧', build: [...FIRE_BUILD], attrs: { edge: 0, body: 10 } },
-  fireHybrid: { label: '灼烧混合', build: [...FIRE_BUILD], attrs: { edge: 6, body: 4 } },
+  starter: {
+    label: '基础飞弹',
+    build: {
+      skills: [{ id: 'skill-1', action: 'projectile', element: null, modifier: null }],
+      reserve: [],
+    },
+  },
+  fireSplit: {
+    label: '火焰分裂',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'projectile', element: 'fire', modifier: 'split' },
+        { id: 'skill-2', action: 'aura', element: 'fire', modifier: 'expand' },
+      ],
+      reserve: [],
+    },
+  },
+  frostShatter: {
+    label: '冰霜碎裂',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'aura', element: 'frost', modifier: 'pull' },
+        { id: 'skill-2', action: 'impact', element: 'frost', modifier: 'echo' },
+      ],
+      reserve: [],
+    },
+  },
+  thunderChain: {
+    label: '雷电回响',
+    movement: 'keepDistance',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'projectile', element: 'thunder', modifier: 'echo' },
+        { id: 'skill-2', action: 'aura', element: 'thunder', modifier: 'expand' },
+      ],
+      reserve: [],
+    },
+  },
+  melee: {
+    label: '近战挥斩',
+    movement: 'approach',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'swing', element: 'fire', modifier: 'expand' },
+        { id: 'skill-2', action: 'impact', element: 'frost', modifier: null },
+      ],
+      reserve: [],
+    },
+  },
+  sword: {
+    label: '御剑',
+    movement: 'approach',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'orbitSword', element: 'fire', modifier: 'echo' },
+        { id: 'skill-2', action: 'impact', element: 'frost', modifier: null },
+      ],
+      reserve: [],
+    },
+  },
+  trapper: {
+    label: '陷阱',
+    movement: 'keepDistance',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'trap', element: 'thunder', modifier: 'expand' },
+        { id: 'skill-2', action: 'projectile', element: 'thunder', modifier: null },
+      ],
+      reserve: [],
+    },
+  },
+  swordArt: {
+    label: '剑阵穿敌',
+    movement: 'auto',
+    build: {
+      skills: [
+        { id: 'skill-1', action: 'swordPierce', element: 'fire', modifier: null },
+        { id: 'skill-2', action: 'swordArray', element: 'frost', modifier: 'echo' },
+      ],
+      reserve: [],
+    },
+  },
 };
 
-const fmt = (b) => {
-  const tag = b.state === 'cleared' ? '过' : b.state === 'dead' ? '死' : '超时';
-  return `${tag} ${b.time.toFixed(0)}s/${b.player.cells}`;
+const fmt = (battle) => {
+  const tag = battle.state === 'cleared' ? '清' : battle.state === 'dead' ? '亡' : '超时';
+  const reactions = Object.entries(battle.stats.reactions)
+    .filter(([, stat]) => stat.count > 0)
+    .map(([id, stat]) => id.slice(0, 4) + stat.count)
+    .join('');
+  return `${tag} ${battle.time.toFixed(0)}s/${Math.max(0, Math.ceil(battle.player.cells))}${reactions === '' ? '' : '[' + reactions + ']'}`;
 };
 
-console.log(`| 层 | 锁 | ${Object.values(BUILDS).map((b) => b.label).join(' | ')} |`);
+console.log(`| 层 | 敌人 | ${Object.values(BUILDS).map((entry) => entry.label).join(' | ')} |`);
 console.log(`|---|---|${Object.values(BUILDS).map(() => '---').join('|')}|`);
 
 for (const def of FLOORS) {
@@ -30,13 +110,14 @@ for (const def of FLOORS) {
     const battle = createBattle({
       floor: def.floor,
       build: preset.build,
-      attrs: preset.attrs,
       seed: 7,
+      movementStrategy: preset.movement ?? 'auto',
     });
     runToEnd(battle, { maxSeconds: TIME_LIMIT + 10 });
     cells.push(fmt(battle));
   }
-  console.log(`| ${def.floor} | ${def.locks.join('+') || '—'} | ${cells.join(' | ')} |`);
+  console.log(`| ${def.floor} | ${def.count} | ${cells.join(' | ')} |`);
 }
 
-console.log('\n格式：结果 用时/剩余生命。seed 固定为 7。');
+console.log('\n格式：结果 用时/剩余生命[反应缩写+次数]。seed 固定为 7。');
+console.log('反应缩写：spre=传火，cond=导电，shat=碎裂。');

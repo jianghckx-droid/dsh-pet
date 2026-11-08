@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 把 src/game/*.js 内联进 client.js 的 `// <core>` 区域。
+// 把 src/game/ 下的核心模块内联进 client.js 的 `// <core>` 区域。
 //
 // 为什么需要这一步：client.js 是宿主的单文件 loader 格式
 // （window.__ModuleLoader__.load({ factory(require) })），第三方插件没有打包器，
@@ -11,6 +11,7 @@
 //
 // 约定:
 //   - 区域标记必须成对出现：`// <core>` 与 `// </core>`
+//   - 文件顺序就是内联后的声明顺序，被依赖的模块必须排在前面
 //   - src/game 里不要写 default export，也不要用与彼此冲突的顶层名字
 
 import fs from 'node:fs';
@@ -19,7 +20,47 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLIENT = path.join(ROOT, 'client.js');
-const FILES = ['rules.js', 'cards.js', 'floors.js', 'arena.js'];
+const FILES = [
+  'skills/schema.js',
+  'skills/constants.js',
+  'skills/format.js',
+  'skills/content/statuses.js',
+  'skills/content/actions.js',
+  'skills/content/elements.js',
+  'skills/content/modifiers.js',
+  'skills/content/reactions.js',
+  'skills/content/styles.js',
+  'skills/actions/contracts.js',
+  'skills/modifiers/index.js',
+  'skills/registry.js',
+  'skills/actions/projectile.js',
+  'skills/actions/aura.js',
+  'skills/actions/impact.js',
+  'skills/actions/swing.js',
+  'skills/actions/orbitSword.js',
+  'skills/actions/swordPierce.js',
+  'skills/actions/swordArray.js',
+  'skills/actions/trap.js',
+  'skills/actions/index.js',
+  'skills/compile.js',
+  'skills/status.js',
+  'skills/reactions.js',
+  'skills/resolve.js',
+  'skills/world.js',
+  'skills/entities/projectile.js',
+  'skills/entities/orbitSword.js',
+  'skills/entities/piercingSword.js',
+  'skills/entities/swordArray.js',
+  'skills/entities/trap.js',
+  'skills/entities/index.js',
+  'skills/runtime.js',
+  'skills/draft.js',
+  'skills/styles.js',
+  'movement.js',
+  'enemies.js',
+  'floors.js',
+  'arena.js',
+];
 const START = '// <core>';
 const END = '// </core>';
 
@@ -58,7 +99,7 @@ function render(clientSource) {
   const head = clientSource.slice(0, start + START.length);
   const tail = clientSource.slice(end);
   const banner =
-    '\n    // 由 tools/build-client.mjs 从 src/game/*.js 生成，不要手改这一段。\n';
+    '\n    // 由 tools/build-client.mjs 从 src/game/ 生成，不要手改这一段。\n';
   return `${head}${banner}${indent(buildCore(), 4)}\n${tail}`;
 }
 

@@ -5,985 +5,3793 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     // <core>
-    // 由 tools/build-client.mjs 从 src/game/*.js 生成，不要手改这一段。
-    // ---- rules.js ----
-    // 战斗规则：唯一一份。
+    // 由 tools/build-client.mjs 从 src/game/ 生成，不要手改这一段。
+    // ---- skills/schema.js ----
+    // 技能系统的静态契约：能力、效果类型、边界。
     //
-    // 游戏端（client.js）与数值模拟器（tools/balance-sim.mjs）都必须从这里取规则，
-    // 否则"设计用的数字"和"跑起来的游戏"会各算各的。
-    //
-    // 三条硬规则，改动前先看 docs/design.md §5 与 docs/cards.md §1：
-    //   1. 结算顺序固定：基础格 → +锋锐 → 锁裁决 → 扣格
-    //   2. 锁永远最后裁决，所以属性无法覆盖锁
-    //   3. 锋锐只加主攻击，不加灼烧跳/雷跳/碎冰/尸爆/斩杀
+    // 处理器名单由 actions/contracts.js 与 modifiers/index.js 提供，注册表直接读取
+    // 这些实现契约，避免"白名单里有名字、运行时却没有实现"的两份真相。
 
-    const BURN = Object.freeze({
-      cap: 5, // 每个目标最多 5 层
-      tickSeconds: 1.5, // 每层每 1.5 秒造成 1 格
-      durationSeconds: 6, // 叠层后 6 秒内没有新层就熄灭
-      damagePerStack: 1,
-    });
-
-    const PLAYER = Object.freeze({
-      baseCells: 12,
-      cellsPerBody: 2, // 体魄：+2 格/点
-      pointsPerEdgeCell: 2, // 锋锐：每 2 点 +1 格
-    });
-
-    const ATTR_MAX = 10;
-
-    const ATTRIBUTES = Object.freeze([
-      Object.freeze({ id: 'edge', label: '锋锐', max: ATTR_MAX, desc: '每 2 点 +1 格' }),
-      Object.freeze({ id: 'swift', label: '迅捷', max: ATTR_MAX, desc: '冷却 −4%/点' }),
-      Object.freeze({ id: 'body', label: '体魄', max: ATTR_MAX, desc: '生命 +2 格/点' }),
-      Object.freeze({ id: 'tough', label: '坚韧', max: ATTR_MAX, desc: '受伤 −3%/点' }),
-      Object.freeze({ id: 'recover', label: '复原', max: ATTR_MAX, desc: '每秒 +0.2 格' }),
-      Object.freeze({ id: 'vision', label: '视野', max: ATTR_MAX, desc: '射程 +6%/点' }),
+    /** 能力表示技能可承诺的行为，不是标签。 */
+    const CAPABILITIES = Object.freeze([
+      'hit', // 能造成命中，属性可以挂上去
+      'projectile', // 会产生独立弹体
+      'targeted', // 会选定一个目标
+      'ranged', // 在远处造成效果，可用于分裂等远程语义修饰
+      'area', // 有可调整的影响范围
+      'aura', // 以宠物为中心周期性生效
+      'impact', // 在目标位置产生一次爆发
+      'melee', // 需要接近目标才能生效
+      'arc', // 扇形 / 弧形覆盖
+      'orbit', // 产生环绕自身的持续实体
+      'path', // 沿路径前进并继续命中后续目标
+      'sustain', // 产生固定在场上、周期性生效的区域
+      'sword', // 共享剑器表现与兼容语义
+      'trigger', // 等待敌人进入触发范围
+      'heavy', // 强力命中，可触发碎裂
     ]);
 
-    const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number.isFinite(v) ? v : lo)));
+    const EFFECT_TYPES = Object.freeze(['applyStatus']);
 
-    function normalizeAttrs(attrs = {}) {
-      const out = {};
-      for (const attr of ATTRIBUTES) out[attr.id] = clampInt(attrs[attr.id] ?? 0, 0, attr.max);
-      return out;
+    const REACTION_EVENTS = Object.freeze(['statusApplied', 'hitResolved', 'entityDied']);
+
+    const REACTION_HANDLERS = Object.freeze(['spreadFire', 'conductive', 'shatter']);
+
+    /** 战斗风格可选的移动策略；风格只提供默认值。 */
+    const MOVEMENT_STRATEGIES = Object.freeze(['approach', 'keepDistance', 'auto']);
+
+    /** 一局内的构筑上限；第一版原型按设计稿只开放两个技能。 */
+    const BUILD_LIMITS = Object.freeze({
+      maxSkills: 2,
+      maxReserve: 3,
+    });
+
+    /** 运行时的安全护栏。超限必须可诊断，不能静默随机丢弃。 */
+    const RUNTIME_LIMITS = Object.freeze({
+      maxCommandDepth: 8,
+      maxCommandsPerRoot: 96,
+      maxCommandsPerStep: 1600,
+      maxTicksPerStep: 8,
+      maxProjectiles: 64,
+      maxOrbitSwords: 3,
+      maxTraps: 4,
+      maxSwordPieces: 12,
+      maxSwordArrays: 2,
+      maxEntities: 96,
+      maxStatusInstances: 512,
+    });
+
+    // ---- skills/constants.js ----
+    // 共享常量：场地尺寸由战斗世界、移动决策和渲染共同使用。
+    // 单独成文件避免 movement / runtime / arena 互相导入造成循环。
+
+    const ARENA = Object.freeze({ w: 160, h: 144 });
+
+    // ---- skills/format.js ----
+    // 数值格式化：编译、描述、脚本共用，避免每个模块各写一套取整规则。
+
+    function fmtNumber(value) {
+      if (!Number.isFinite(value)) return String(value);
+      return Number.isInteger(value) ? String(value) : String(Math.round(value * 100) / 100);
     }
 
-    function attrsSpent(attrs = {}) {
-      let n = 0;
-      for (const attr of ATTRIBUTES) n += attrs[attr.id] ?? 0;
-      return n;
+    function percentText(scale) {
+      return fmtNumber(Math.round(scale * 100));
     }
 
-    function playerCells(attrs = {}) {
-      return PLAYER.baseCells + (attrs.body ?? 0) * PLAYER.cellsPerBody;
+    // ---- skills/content/statuses.js ----
+    // 状态定义：层数、时长、重复施加策略与周期处理器都由定义说明，不隐式继承。
+    //
+    // 第一版原型只有三种共享状态：
+    //   burn   灼烧：持续损失生命
+    //   chill  寒冷：降低移动速度
+    //   charge 充能：可被后续雷电效果消耗
+    //
+    // 数值是原型参数，集中放在这里，便于用 tools/balance-sim.mjs 校准。
+
+    const STATUS_DEFS = [
+      {
+        id: 'burn',
+        kind: 'status',
+        label: '灼烧',
+        color: '#ff9f45',
+        cap: 5,
+        duration: 6,
+        stacking: 'add-refresh',
+        tickSeconds: 1.5,
+        damagePerStack: 1,
+        desc: '每 1.5 秒按层数损失生命，最多 5 层',
+      },
+      {
+        id: 'chill',
+        kind: 'status',
+        label: '寒冷',
+        color: '#9fd8ff',
+        cap: 5,
+        duration: 5,
+        stacking: 'add-refresh',
+        slowPerStack: 0.08,
+        maxSlow: 0.4,
+        desc: '每层降低 8% 移动速度，最多 5 层',
+      },
+      {
+        id: 'charge',
+        kind: 'status',
+        label: '充能',
+        color: '#ffe066',
+        cap: 3,
+        duration: 8,
+        stacking: 'add-refresh',
+        desc: '可被下一次雷电命中消耗，引发导电',
+      },
+    ];
+
+    // ---- skills/content/actions.js ----
+    // 动作定义：决定技能如何接触目标。
+    //
+    // handler 必须与 actions/contracts.js 的契约一致，具体行为在 actions/*.js。
+    // 动作单独存在（属性、修饰都为空）时就是可用技能。
+    // movement.preferredRange 是移动决策层的输入，不是动作自己抢夺移动控制。
+
+    const ACTION_DEFS = [
+      {
+        id: 'projectile',
+        kind: 'action',
+        handler: 'projectile',
+        label: '飞弹',
+        color: '#ffd166',
+        capabilities: ['hit', 'projectile', 'targeted', 'ranged'],
+        params: {
+          cooldown: 0.9,
+          damage: 2,
+          speed: 180,
+          range: 104,
+          radius: 3.5,
+          life: 1.4,
+          maxTargets: 1,
+        },
+        movement: { preferredRange: 90 },
+        desc: '朝射程内最近的敌人发射弹体。',
+      },
+      {
+        id: 'aura',
+        kind: 'action',
+        handler: 'aura',
+        label: '光环',
+        color: '#8fd8ff',
+        capabilities: ['hit', 'area', 'aura'],
+        params: {
+          cooldown: 1.1,
+          damage: 1,
+          radius: 30,
+          maxTargets: 3,
+        },
+        movement: { preferredRange: 24 },
+        desc: '周期性影响宠物附近的敌人。',
+      },
+      {
+        id: 'impact',
+        kind: 'action',
+        handler: 'impact',
+        label: '冲击',
+        color: '#ff8f6b',
+        capabilities: ['hit', 'area', 'impact', 'targeted', 'ranged', 'heavy'],
+        params: {
+          cooldown: 3.0,
+          damage: 5,
+          range: 84,
+          radius: 24,
+          maxTargets: 8,
+        },
+        movement: { preferredRange: 68 },
+        desc: '在敌群中心引爆一次强力范围效果。',
+      },
+      {
+        id: 'swing',
+        kind: 'action',
+        handler: 'swing',
+        label: '挥斩',
+        color: '#ffb347',
+        capabilities: ['hit', 'targeted', 'area', 'melee', 'arc', 'heavy'],
+        params: {
+          cooldown: 1.1,
+          damage: 3,
+          radius: 30,
+          angle: 110,
+          maxTargets: 3,
+        },
+        movement: { preferredRange: 14 },
+        desc: '靠近目标后挥出扇形攻击。',
+      },
+      {
+        id: 'orbitSword',
+        kind: 'action',
+        handler: 'orbitSword',
+        label: '御剑',
+        color: '#a0e7c8',
+        capabilities: ['hit', 'orbit', 'melee'],
+        params: {
+          cooldown: 3.2,
+          damage: 2,
+          orbitRadius: 12,
+          hitRadius: 8,
+          angularSpeed: 2.2,
+          duration: 7,
+          hitInterval: 0.55,
+          maxActive: 2,
+          maxTargets: 2,
+        },
+        movement: { preferredRange: 12 },
+        desc: '召唤飞剑环绕自身，接触敌人时造成伤害。',
+      },
+      {
+        id: 'swordPierce',
+        kind: 'action',
+        handler: 'swordPierce',
+        label: '飞剑穿敌',
+        color: '#9fd8ff',
+        capabilities: ['hit', 'projectile', 'targeted', 'path', 'sword'],
+        params: {
+          cooldown: 2.4,
+          damage: 3,
+          speed: 240,
+          range: 120,
+          radius: 9,
+          life: 1.2,
+          maxHits: 3,
+        },
+        movement: { preferredRange: 70 },
+        desc: '朝目标方向放出穿透飞剑，沿途命中有限敌人。',
+      },
+      {
+        id: 'swordArray',
+        kind: 'action',
+        handler: 'swordArray',
+        label: '剑阵',
+        color: '#c9b3ff',
+        capabilities: ['hit', 'area', 'sustain', 'sword'],
+        params: {
+          cooldown: 8,
+          damage: 2,
+          radius: 36,
+          range: 80,
+          duration: 5,
+          tickInterval: 0.8,
+          maxTargets: 4,
+          maxActive: 1,
+        },
+        movement: { preferredRange: 60 },
+        desc: '在目标位置布下剑阵，持续伤害范围内敌人。',
+      },
+      {
+        id: 'trap',
+        kind: 'action',
+        handler: 'trap',
+        label: '陷阱',
+        color: '#c9b3ff',
+        capabilities: ['hit', 'area', 'trigger'],
+        params: {
+          cooldown: 4.5,
+          damage: 4,
+          radius: 20,
+          range: 64,
+          triggerRadius: 20,
+          duration: 9,
+          armTime: 0.3,
+          maxActive: 3,
+          maxTargets: 4,
+        },
+        movement: { preferredRange: 55 },
+        desc: '在脚下布置陷阱，敌人靠近时引爆。',
+      },
+    ];
+
+    // ---- skills/content/elements.js ----
+    // 属性定义：命中时附带什么效果。
+    //
+    // 属性只声明 requires 与 onHit。相同属性装到不同动作上沿用同一套规则，
+    // 不存在"毒飞弹 / 毒光环"这类组合代码。
+
+    const ELEMENT_DEFS = [
+      {
+        id: 'fire',
+        kind: 'element',
+        label: '火焰',
+        color: '#ff9f45',
+        requires: ['hit'],
+        bonusDamage: 0,
+        onHit: [{ type: 'applyStatus', status: 'burn', stacks: 1 }],
+        desc: '命中造成伤害并施加灼烧。',
+      },
+      {
+        id: 'frost',
+        kind: 'element',
+        label: '冰霜',
+        color: '#9fd8ff',
+        requires: ['hit'],
+        bonusDamage: 0,
+        onHit: [{ type: 'applyStatus', status: 'chill', stacks: 1 }],
+        desc: '命中造成伤害并施加寒冷。',
+      },
+      {
+        id: 'thunder',
+        kind: 'element',
+        label: '雷电',
+        color: '#ffe066',
+        requires: ['hit'],
+        bonusDamage: 1,
+        onHit: [{ type: 'applyStatus', status: 'charge', stacks: 1 }],
+        desc: '命中造成更高伤害并施加充能。',
+      },
+    ];
+
+    // ---- skills/content/modifiers.js ----
+    // 修饰定义：改变技能行为，声明能力要求，不直接修改其他技能实例。
+    //
+    // split  需要 targeted：首次命中后向附近目标产生较弱效果
+    // echo   需要 hit：一次效果结束后延迟触发一次较弱效果
+    // expand 需要 area：扩大影响范围，同时降低触发频率
+    // pull   需要 area：把命中目标向效果中心拉近
+
+    const MODIFIER_DEFS = [
+      {
+        id: 'split',
+        kind: 'modifier',
+        label: '分裂',
+        color: '#c9b3ff',
+        requires: ['ranged'],
+        transform: { type: 'split', count: 2, damageScale: 0.5, radius: 40 },
+        desc: '首次命中后向附近目标产生较弱的后续效果。',
+      },
+      {
+        id: 'echo',
+        kind: 'modifier',
+        label: '回响',
+        color: '#a0e7c8',
+        requires: ['hit'],
+        transform: { type: 'echo', delay: 0.7, damageScale: 0.5 },
+        desc: '技能效果结束后延迟触发一次较弱效果。',
+      },
+      {
+        id: 'expand',
+        kind: 'modifier',
+        label: '扩大',
+        color: '#ffd166',
+        requires: ['area'],
+        transform: { type: 'expand', radiusScale: 1.45, cooldownScale: 1.25 },
+        desc: '影响范围更大，但触发更慢。',
+      },
+      {
+        id: 'pull',
+        kind: 'modifier',
+        label: '牵引',
+        color: '#8fd8ff',
+        requires: ['area'],
+        transform: { type: 'pull', strength: 16 },
+        desc: '命中时把敌人向效果中心拉近。',
+      },
+      {
+        id: 'detonate',
+        kind: 'modifier',
+        label: '引爆',
+        color: '#ff6b6b',
+        requires: ['hit'],
+        transform: {
+          type: 'detonate',
+          damagePerStack: 2,
+          radius: 24,
+          maxTargets: 3,
+          cooldownScale: 1.2,
+        },
+        desc: '消耗目标已有状态，在目标处造成范围伤害。',
+      },
+    ];
+
+    // ---- skills/content/reactions.js ----
+    // 共享反应定义：订阅语义事件，声明条件、消耗和产生的命令。
+    //
+    // 三个初版反应都有显式终止条件：
+    //   传火：传过去的灼烧不能再触发传火
+    //   导电：雷击不施加充能，也不能再触发导电
+    //   碎裂：碎裂伤害没有 heavy 标签，不能再触发碎裂
+    // 数值与范围都在这里，不能靠递归副作用隐式决定。
+
+    const REACTION_DEFS = [
+      {
+        id: 'spreadFire',
+        kind: 'reaction',
+        handler: 'spreadFire',
+        label: '传火',
+        event: 'entityDied',
+        priority: 10,
+        color: '#ff9f45',
+        config: { radius: 40, targets: 2, transferRatio: 0.5, minStacks: 1, maxStacks: 5, maxChain: 4 },
+        desc: '灼烧中的敌人被击败时，把一部分灼烧传给附近敌人。',
+      },
+      {
+        id: 'conductive',
+        kind: 'reaction',
+        handler: 'conductive',
+        label: '导电',
+        event: 'hitResolved',
+        priority: 20,
+        color: '#ffe066',
+        config: { consume: 3, radius: 44, targets: 3, damage: 3 },
+        desc: '带充能的敌人再次受到雷电命中时，消耗充能并对附近敌人造成雷击。',
+      },
+      {
+        id: 'shatter',
+        kind: 'reaction',
+        handler: 'shatter',
+        label: '碎裂',
+        event: 'hitResolved',
+        priority: 30,
+        color: '#9fd8ff',
+        config: { status: 'chill', threshold: 3, radius: 28, targets: 4, damage: 3 },
+        desc: '寒冷达到 3 层的敌人受到强力命中时，消耗寒冷并对周围造成范围伤害。',
+      },
+    ];
+
+    // ---- skills/content/styles.js ----
+    // 战斗风格目录：只提供起始构筑、默认移动偏好与视觉主题，不拥有独立结算。
+    //
+    // 解锁条件使用账户累计战绩（bestFloor）。新玩家先能选近战与远程；剑修、陷阱师
+    // 随最高层数开放。战斗核心不按风格 ID 判断伤害规则。
+
+    const STYLE_DEFS = [
+      {
+        id: 'ranged',
+        kind: 'style',
+        label: '远程射手',
+        visualTheme: 'ranged',
+        movementPreference: 'keepDistance',
+        defaultStyle: true,
+        unlockedBy: { bestFloor: 1 },
+        startingBuild: [{ id: 'skill-1', action: 'projectile', element: null, modifier: null }],
+        desc: '用弹体与射程处理目标，默认保持距离。',
+      },
+      {
+        id: 'melee',
+        kind: 'style',
+        label: '近战斗士',
+        visualTheme: 'melee',
+        movementPreference: 'approach',
+        unlockedBy: { bestFloor: 1 },
+        startingBuild: [{ id: 'skill-1', action: 'swing', element: null, modifier: null }],
+        desc: '靠近敌人用扇形挥斩覆盖近身目标。',
+      },
+      {
+        id: 'sword',
+        kind: 'style',
+        label: '剑修',
+        visualTheme: 'sword',
+        movementPreference: 'approach',
+        unlockedBy: { bestFloor: 3 },
+        startingBuild: [{ id: 'skill-1', action: 'orbitSword', element: null, modifier: null }],
+        desc: '驭使飞剑环身护体，凭站位持续剑击。',
+      },
+      {
+        id: 'trapper',
+        kind: 'style',
+        label: '陷阱师',
+        visualTheme: 'trap',
+        movementPreference: 'keepDistance',
+        unlockedBy: { bestFloor: 5 },
+        startingBuild: [{ id: 'skill-1', action: 'trap', element: null, modifier: null }],
+        desc: '把陷阱留在敌人必经之路，再引其踏入。',
+      },
+    ];
+
+    // ---- skills/actions/contracts.js ----
+    // 动作契约：验证参数、生成描述、声明移动提示。
+    //
+    // 这里只依赖格式化工具，不导入运行时或世界。注册表用它校验内容，编译器和
+    // 升级界面用它生成最终描述；具体行为在 actions/*.js 中实现。
+
+    const isPositiveNumber = (value) => typeof value === 'number' && Number.isFinite(value) && value > 0;
+    const isNonNegativeNumber = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+    function requireNumbers(def, keys, errors) {
+      for (const key of keys) {
+        if (!isPositiveNumber(def.params?.[key])) errors.push(`${def.id}: params.${key} 必须大于 0`);
+      }
     }
 
-    function edgeCells(attrs = {}) {
-      return Math.floor((attrs.edge ?? 0) / PLAYER.pointsPerEdgeCell);
+    function requireInteger(def, keys, errors) {
+      for (const key of keys) {
+        const value = def.params?.[key];
+        if (!(Number.isInteger(value) && value > 0)) errors.push(`${def.id}: params.${key} 必须是正整数`);
+      }
     }
 
-    /** 坚韧：受伤 −3%/点，至少还是掉 1 格以下（不取整，格数允许小数）。 */
-    function damageTaken(cells, attrs = {}) {
-      const cut = (attrs.tough ?? 0) * 0.03;
-      return Math.max(0.1, cells * (1 - cut));
+    function baseErrors(def) {
+      const errors = [];
+      if (def.params === undefined || def.params === null || typeof def.params !== 'object') {
+        errors.push(`${def.id}: 缺少 params 对象`);
+        return errors;
+      }
+      if (!isPositiveNumber(def.params.cooldown)) errors.push(`${def.id}: params.cooldown 必须大于 0`);
+      if (!isNonNegativeNumber(def.params.damage)) errors.push(`${def.id}: params.damage 不能为负`);
+      if (def.movement === undefined || !isPositiveNumber(def.movement.preferredRange)) {
+        errors.push(`${def.id}: movement.preferredRange 必须大于 0`);
+      }
+      return errors;
     }
 
-    /** 迅捷：冷却 −4%/点。 */
-    function cooldown(cd, attrs = {}) {
-      return cd * (1 - (attrs.swift ?? 0) * 0.04);
+    const ACTION_CONTRACTS = Object.freeze({
+      projectile: Object.freeze({
+        id: 'projectile',
+        capabilities: ['hit', 'projectile', 'targeted', 'ranged'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['speed', 'range', 'radius', 'life'], errors);
+          requireInteger(def, ['maxTargets'], errors);
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒向 ${fmtNumber(plan.range)} 范围内的敌人发射弹体`;
+        },
+      }),
+
+      aura: Object.freeze({
+        id: 'aura',
+        capabilities: ['hit', 'area', 'aura'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['radius'], errors);
+          requireInteger(def, ['maxTargets'], errors);
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒影响身边 ${fmtNumber(plan.radius)} 范围内的至多 ${plan.maxTargets} 个敌人`;
+        },
+      }),
+
+      impact: Object.freeze({
+        id: 'impact',
+        capabilities: ['hit', 'area', 'impact', 'targeted', 'ranged', 'heavy'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['range', 'radius'], errors);
+          requireInteger(def, ['maxTargets'], errors);
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒在 ${fmtNumber(plan.range)} 范围内的敌人处引爆 ${fmtNumber(plan.radius)} 范围冲击`;
+        },
+      }),
+
+      swing: Object.freeze({
+        id: 'swing',
+        capabilities: ['hit', 'targeted', 'area', 'melee', 'arc', 'heavy'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['radius'], errors);
+          requireInteger(def, ['maxTargets'], errors);
+          const angle = def.params?.angle;
+          if (!(typeof angle === 'number' && Number.isFinite(angle) && angle > 0 && angle <= 360)) {
+            errors.push(`${def.id}: params.angle 必须在 (0,360]`);
+          }
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒朝目标方向挥出 ${fmtNumber(plan.angle)}° 扇形，命中 ${fmtNumber(plan.radius)} 范围内至多 ${plan.maxTargets} 个敌人`;
+        },
+      }),
+
+      orbitSword: Object.freeze({
+        id: 'orbitSword',
+        capabilities: ['hit', 'orbit', 'melee'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['orbitRadius', 'hitRadius', 'angularSpeed', 'duration', 'hitInterval'], errors);
+          requireInteger(def, ['maxActive'], errors);
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒召唤 1 柄飞剑环绕自身 ${fmtNumber(plan.orbitRadius)} 半径，持续 ${fmtNumber(plan.duration)} 秒；同一目标每 ${fmtNumber(plan.hitInterval)} 秒至多受一次命中`;
+        },
+      }),
+
+      swordPierce: Object.freeze({
+        id: 'swordPierce',
+        capabilities: ['hit', 'projectile', 'targeted', 'path', 'sword'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['speed', 'range', 'radius', 'life'], errors);
+          requireInteger(def, ['maxHits'], errors);
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒向 ${fmtNumber(plan.range)} 范围内的敌人放出穿透飞剑，沿途至多命中 ${plan.maxHits} 个敌人`;
+        },
+      }),
+
+      swordArray: Object.freeze({
+        id: 'swordArray',
+        capabilities: ['hit', 'area', 'sustain', 'sword'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['radius', 'range', 'duration', 'tickInterval'], errors);
+          requireInteger(def, ['maxTargets', 'maxActive'], errors);
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒在 ${fmtNumber(plan.range)} 范围内敌人处布下持续 ${fmtNumber(plan.duration)} 秒的剑阵，每 ${fmtNumber(plan.tickInterval)} 秒影响 ${fmtNumber(plan.radius)} 范围内至多 ${plan.maxTargets} 个敌人`;
+        },
+      }),
+
+      trap: Object.freeze({
+        id: 'trap',
+        capabilities: ['hit', 'area', 'trigger'],
+        validate(def) {
+          const errors = baseErrors(def);
+          requireNumbers(def, ['radius', 'range', 'triggerRadius', 'duration', 'armTime'], errors);
+          requireInteger(def, ['maxActive'], errors);
+          return errors;
+        },
+        describe(plan) {
+          return `每 ${fmtNumber(plan.cooldown)} 秒在脚下布置持续 ${fmtNumber(plan.duration)} 秒的陷阱；敌人进入 ${fmtNumber(plan.triggerRadius)} 范围后引爆 ${fmtNumber(plan.radius)} 范围`;
+        },
+      }),
+    });
+
+    const ACTION_HANDLER_IDS = Object.freeze(Object.keys(ACTION_CONTRACTS));
+
+    function actionContract(id) {
+      return ACTION_CONTRACTS[id];
     }
 
-    /** 复原：每秒 +0.2 格。 */
-    function regenPerSecond(attrs = {}) {
-      return (attrs.recover ?? 0) * 0.2;
+    // ---- skills/modifiers/index.js ----
+    // 修饰阶段处理器：编译参数、命中后命令、描述。
+    //
+    // 结算器只把统一的上下文交给当前修饰，不按修饰类型写分支。未来开放多修饰时
+    // 按 MODIFIER_PHASES 的优先级排序；本次每个技能仍只有一个修饰槽。
+
+    const MODIFIER_PHASES = Object.freeze({
+      compile: 10,
+      cast: 20,
+      onHit: 30,
+      onEnd: 40,
+    });
+
+    const positive = (value) => typeof value === 'number' && Number.isFinite(value) && value > 0;
+
+    function splitTargets(ctx, transform) {
+      const target = ctx.target;
+      const center = {
+        x: ctx.payload.centerX ?? target.x,
+        y: ctx.payload.centerY ?? target.y,
+      };
+      return {
+        center,
+        targets: ctx.queryTargets(center, transform.radius, transform.count, target.id),
+      };
     }
 
-    /** 视野：射程 / 领域半径 +6%/点。 */
-    function visionScale(attrs = {}) {
-      return 1 + (attrs.vision ?? 0) * 0.06;
+    const MODIFIER_HANDLERS = Object.freeze({
+      split: Object.freeze({
+        phase: MODIFIER_PHASES.onHit,
+        validate(transform, id, errors) {
+          if (!(Number.isInteger(transform.count) && transform.count > 0)) {
+            errors.push(`${id}: split.count 必须是正整数`);
+          }
+          if (!positive(transform.damageScale) || transform.damageScale > 1) {
+            errors.push(`${id}: split.damageScale 必须在 (0,1]`);
+          }
+          if (!positive(transform.radius)) errors.push(`${id}: split.radius 必须大于 0`);
+        },
+        describe(plan, transform) {
+          return `首次命中后向附近 ${transform.count} 个目标造成 ${percentText(transform.damageScale)}% 伤害`;
+        },
+        onHit(ctx) {
+          const transform = ctx.transform;
+          if (!ctx.command.tags.includes('primary') || ctx.payload.noSplit === true) return;
+          const key = ctx.payload.castId ?? ctx.command.eventId;
+          if (!ctx.once('splitCasts', key)) return;
+          const { center, targets } = splitTargets(ctx, transform);
+          for (const other of targets) {
+            ctx.enqueue({
+              type: 'hit',
+              targetId: other.id,
+              sourceEntityId: ctx.command.sourceEntityId,
+              skillInstanceId: ctx.command.skillInstanceId,
+              tags: [
+                ...ctx.command.tags.filter((tag) => tag !== 'primary'),
+                'split',
+                'secondary',
+              ],
+              payload: {
+                ...ctx.payload,
+                damageScale: (ctx.payload.damageScale ?? 1) * transform.damageScale,
+                noSplit: true,
+                noEcho: true,
+                centerX: center.x,
+                centerY: center.y,
+              },
+            });
+          }
+        },
+      }),
+
+      echo: Object.freeze({
+        phase: MODIFIER_PHASES.onHit,
+        validate(transform, id, errors) {
+          if (!positive(transform.delay)) errors.push(`${id}: echo.delay 必须大于 0`);
+          if (!positive(transform.damageScale) || transform.damageScale > 1) {
+            errors.push(`${id}: echo.damageScale 必须在 (0,1]`);
+          }
+        },
+        describe(plan, transform) {
+          return `${fmtNumber(transform.delay)} 秒后再次造成 ${percentText(transform.damageScale)}% 伤害`;
+        },
+        onHit(ctx) {
+          const transform = ctx.transform;
+          if (!ctx.command.tags.includes('primary') || ctx.payload.noEcho === true) return;
+          const key = ctx.payload.castId ?? ctx.command.eventId;
+          if (!ctx.once('echoCasts', key)) return;
+          const tags = [...ctx.command.tags.filter((tag) => tag !== 'primary'), 'echo'];
+          const payload = {
+            ...ctx.payload,
+            damageScale: (ctx.payload.damageScale ?? 1) * transform.damageScale,
+            noEcho: true,
+            noSplit: true,
+          };
+          if (ctx.payload.action === 'projectile') {
+            ctx.scheduleLater(transform.delay, {
+              type: 'hit',
+              targetId: ctx.target.id,
+              sourceEntityId: ctx.command.sourceEntityId,
+              skillInstanceId: ctx.command.skillInstanceId,
+              tags,
+              payload,
+            });
+            return;
+          }
+          ctx.scheduleLater(transform.delay, {
+            type: 'areaHit',
+            sourceEntityId: ctx.command.sourceEntityId,
+            skillInstanceId: ctx.command.skillInstanceId,
+            tags,
+            payload: {
+              ...payload,
+              centerX: ctx.payload.centerX ?? ctx.target.x,
+              centerY: ctx.payload.centerY ?? ctx.target.y,
+            },
+          });
+        },
+      }),
+
+      expand: Object.freeze({
+        phase: MODIFIER_PHASES.compile,
+        validate(transform, id, errors) {
+          if (!positive(transform.radiusScale) || transform.radiusScale < 1) {
+            errors.push(`${id}: expand.radiusScale 必须 >= 1`);
+          }
+          if (!positive(transform.cooldownScale) || transform.cooldownScale < 1) {
+            errors.push(`${id}: expand.cooldownScale 必须 >= 1`);
+          }
+        },
+        describe(plan, transform) {
+          return `范围变为 ${fmtNumber(plan.radius)}，冷却变为 ${fmtNumber(plan.cooldown)} 秒`;
+        },
+        compile(numbers, transform) {
+          return {
+            ...numbers,
+            radius: numbers.radius * transform.radiusScale,
+            cooldown: numbers.cooldown * transform.cooldownScale,
+          };
+        },
+      }),
+
+      pull: Object.freeze({
+        phase: MODIFIER_PHASES.onHit,
+        validate(transform, id, errors) {
+          if (!positive(transform.strength)) errors.push(`${id}: pull.strength 必须大于 0`);
+        },
+        describe(plan, transform) {
+          return `命中时把敌人向效果中心拉近 ${fmtNumber(transform.strength)}`;
+        },
+        onHit(ctx) {
+          if (ctx.target.cells <= 0) return;
+          ctx.enqueue({
+            type: 'move',
+            targetId: ctx.target.id,
+            sourceEntityId: ctx.command.sourceEntityId,
+            skillInstanceId: ctx.command.skillInstanceId,
+            tags: ['pull'],
+            payload: {
+              centerX: ctx.payload.centerX ?? ctx.target.x,
+              centerY: ctx.payload.centerY ?? ctx.target.y,
+              strength: ctx.transform.strength,
+            },
+          });
+        },
+      }),
+
+      detonate: Object.freeze({
+        phase: MODIFIER_PHASES.onHit,
+        validate(transform, id, errors) {
+          if (!positive(transform.damagePerStack)) errors.push(`${id}: detonate.damagePerStack 必须大于 0`);
+          if (!positive(transform.radius)) errors.push(`${id}: detonate.radius 必须大于 0`);
+          if (!(Number.isInteger(transform.maxTargets) && transform.maxTargets > 0)) {
+            errors.push(`${id}: detonate.maxTargets 必须是正整数`);
+          }
+          if (!positive(transform.cooldownScale) || transform.cooldownScale < 1) {
+            errors.push(`${id}: detonate.cooldownScale 必须 >= 1`);
+          }
+        },
+        describe(plan, transform) {
+          return `消耗目标全部状态，对附近至多 ${transform.maxTargets} 个目标造成每层 ${fmtNumber(transform.damagePerStack)} 伤害；冷却变为 ${fmtNumber(plan.cooldown)} 秒`;
+        },
+        compile(numbers, transform) {
+          return { ...numbers, cooldown: numbers.cooldown * transform.cooldownScale };
+        },
+        onHit(ctx) {
+          if (!ctx.command.tags.includes('primary') || ctx.payload.noDetonate === true) return;
+          const stacks = ctx.countStatuses(ctx.target);
+          if (stacks <= 0) return;
+          const key = ctx.payload.castId ?? ctx.command.eventId;
+          if (!ctx.once('detonateCasts', key)) return;
+          const consumed = ctx.consumeStatuses(ctx.target);
+          if (consumed <= 0) return;
+          if (!ctx.world.stats.modifiers) ctx.world.stats.modifiers = {};
+          ctx.world.stats.modifiers.detonate = (ctx.world.stats.modifiers.detonate ?? 0) + 1;
+          const center = {
+            x: ctx.payload.centerX ?? ctx.target.x,
+            y: ctx.payload.centerY ?? ctx.target.y,
+          };
+          const targets = ctx.queryTargets(center, ctx.transform.radius, ctx.transform.maxTargets);
+          ctx.emitVisual({
+            type: 'detonate',
+            x: center.x,
+            y: center.y,
+            radius: ctx.transform.radius,
+            color: '#ff6b6b',
+            skillId: ctx.command.skillInstanceId,
+          });
+          targets.forEach((target, index) => {
+            ctx.enqueue({
+              type: 'hit',
+              targetId: target.id,
+              sourceEntityId: ctx.command.sourceEntityId,
+              skillInstanceId: ctx.command.skillInstanceId,
+              tags: [
+                ...ctx.command.tags.filter((tag) => tag !== 'primary' && tag !== 'heavy'),
+                'detonate',
+                'noDetonate',
+              ],
+              payload: {
+                ...ctx.payload,
+                damage: consumed * ctx.transform.damagePerStack,
+                damageScale: 1,
+                element: null,
+                heavy: false,
+                modifier: null,
+                modifierTransform: null,
+                noDetonate: true,
+                noSplit: true,
+                noEcho: true,
+                centerX: center.x,
+                centerY: center.y,
+              },
+            });
+          });
+        },
+      }),
+    });
+
+    const MODIFIER_HANDLER_IDS = Object.freeze(Object.keys(MODIFIER_HANDLERS));
+
+    function modifierHandler(type) {
+      return MODIFIER_HANDLERS[type];
     }
 
-    /** 主攻击的格数：卡面基础格 + 锋锐。衍生效果不要调这个函数。 */
-    function attackCells(card, attrs = {}) {
-      return (card.cells ?? 1) + edgeCells(attrs);
+    /** 注册表调用：校验 transform 结构与参数。 */
+    function validateModifier(def) {
+      const errors = [];
+      const transform = def.transform;
+      if (transform === undefined || transform === null || typeof transform !== 'object') {
+        errors.push(`${def.id}: 缺少 transform 对象`);
+        return errors;
+      }
+      const handler = MODIFIER_HANDLERS[transform.type];
+      if (handler === undefined) {
+        errors.push(`${def.id}: 未知修饰变换 ${JSON.stringify(transform)}`);
+        return errors;
+      }
+      handler.validate(transform, def.id, errors);
+      return errors;
     }
 
-    function locksOf(enemy) {
-      if (Array.isArray(enemy.locks)) return enemy.locks;
-      return enemy.lock ? [enemy.lock] : [];
+    /** 编译期：返回最终数值（目前只有扩大改变范围与冷却）。 */
+    function compileModifier(modifier, numbers) {
+      if (modifier === null || modifier === undefined) return numbers;
+      const handler = MODIFIER_HANDLERS[modifier.transform.type];
+      if (handler === undefined || typeof handler.compile !== 'function') return numbers;
+      return handler.compile(numbers, modifier.transform);
     }
 
-    /**
-     * 锁裁决。
-     * main=true 表示主攻击（吃护盾正面减伤），false 表示衍生伤害（灼烧跳等）。
-     */
-    function resolveHit(enemy, cells, { main = true } = {}) {
-      let dealt = cells;
-      for (const lock of locksOf(enemy)) {
-        if (lock === 'carapace') {
-          dealt = Math.min(dealt, 1); // 单次最多 1 格
-        } else if (lock === 'shield' && main) {
-          dealt = Math.max(0, dealt - 1); // 正面直接命中 -1 格
+    /** 描述期：由处理器提供最终数值描述，未知处理器返回空串（注册表已拒绝）。 */
+    function describeModifier(modifier, plan) {
+      if (modifier === null || modifier === undefined) return '';
+      const handler = MODIFIER_HANDLERS[modifier.transform.type];
+      if (handler === undefined || typeof handler.describe !== 'function') return '';
+      return handler.describe(plan, modifier.transform);
+    }
+
+    /** 命中后阶段：结算器只负责准备上下文。 */
+    function applyModifierOnHit(modifier, context) {
+      if (modifier === null || modifier === undefined) return;
+      const handler = MODIFIER_HANDLERS[modifier.transform.type];
+      if (handler === undefined || typeof handler.onHit !== 'function') return;
+      handler.onHit(context);
+    }
+
+    // ---- skills/registry.js ----
+    // 内容注册表：按类别保存定义并拒绝重复 ID、未知处理器、缺失引用、非法参数。
+    //
+    // 定义是数据，不是函数；运行时只通过稳定 ID 查找，不允许 UI 或战斗层按
+    // 中文名称匹配。注册表冻结后不再变化，冷却、层数等实例状态只存在于战斗状态。
+    //
+    // 动作契约来自 actions/contracts.js，修饰契约来自 modifiers/index.js；
+    // 注册表不再维护第二份处理器白名单。
+
+    const KINDS = Object.freeze({
+      action: ACTION_DEFS,
+      element: ELEMENT_DEFS,
+      modifier: MODIFIER_DEFS,
+      status: STATUS_DEFS,
+      reaction: REACTION_DEFS,
+      style: STYLE_DEFS,
+    });
+
+    const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+    const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+    const isPositive = (value) => isFiniteNumber(value) && value > 0;
+    const isNonNegative = (value) => isFiniteNumber(value) && value >= 0;
+
+    function deepFreeze(value) {
+      if (value === null || typeof value !== 'object') return value;
+      for (const key of Object.keys(value)) deepFreeze(value[key]);
+      return Object.freeze(value);
+    }
+
+    const ID_PATTERN = /^[a-z][a-zA-Z0-9]*$/;
+
+    function checkCommon(def, listName, seen, errors) {
+      if (!isObject(def)) {
+        errors.push(`${listName}: 定义必须是对象`);
+        return false;
+      }
+      if (typeof def.id !== 'string' || !ID_PATTERN.test(def.id)) {
+        errors.push(`${listName}: 非法 ID ${JSON.stringify(def.id)}`);
+        return false;
+      }
+      if (seen.has(def.id)) {
+        errors.push(`${listName}: 重复 ID ${def.id}`);
+        return false;
+      }
+      if (typeof def.label !== 'string' || def.label.length === 0) {
+        errors.push(`${listName}.${def.id}: 缺少 label`);
+        return false;
+      }
+      if (typeof def.kind !== 'string' || !Object.prototype.hasOwnProperty.call(KINDS, def.kind)) {
+        errors.push(`${listName}.${def.id}: 非法 kind ${JSON.stringify(def.kind)}`);
+        return false;
+      }
+      return true;
+    }
+
+    function checkCapabilities(def, errors, { required = false } = {}) {
+      if (def.capabilities === undefined && !required) return;
+      if (!Array.isArray(def.capabilities) || def.capabilities.length === 0) {
+        errors.push(`${def.id}: capabilities 必须是非空数组`);
+        return;
+      }
+      const seen = new Set();
+      for (const cap of def.capabilities) {
+        if (!CAPABILITIES.includes(cap)) errors.push(`${def.id}: 未知能力 ${String(cap)}`);
+        if (seen.has(cap)) errors.push(`${def.id}: 能力重复 ${String(cap)}`);
+        seen.add(cap);
+      }
+    }
+
+    function checkRequires(def, errors) {
+      if (!Array.isArray(def.requires) || def.requires.length === 0) {
+        errors.push(`${def.id}: requires 必须是非空数组`);
+        return;
+      }
+      const seen = new Set();
+      for (const cap of def.requires) {
+        if (!CAPABILITIES.includes(cap)) errors.push(`${def.id}: 未知能力 ${String(cap)}`);
+        if (seen.has(cap)) errors.push(`${def.id}: requires 重复 ${String(cap)}`);
+        seen.add(cap);
+      }
+    }
+
+    function checkAction(def, errors) {
+      const contract = ACTION_CONTRACTS[def.handler];
+      if (contract === undefined) {
+        errors.push(`${def.id}: 未知动作处理器 ${String(def.handler)}`);
+        return;
+      }
+      checkCapabilities(def, errors, { required: true });
+      if (!def.capabilities.includes('hit')) errors.push(`${def.id}: 动作必须声明 hit 能力`);
+      for (const cap of contract.capabilities ?? []) {
+        if (!def.capabilities.includes(cap)) {
+          errors.push(`${def.id}: 动作处理器 ${def.handler} 需要声明 ${cap} 能力`);
         }
       }
-      return Math.max(0, dealt);
+      for (const message of contract.validate(def)) errors.push(message);
     }
 
-    function createStatus() {
-      return { burn: 0, burnLeft: 0, burnTick: BURN.tickSeconds };
+    function checkElement(def, errors, statuses) {
+      checkRequires(def, errors);
+      if (def.bonusDamage !== undefined && !isNonNegative(def.bonusDamage)) {
+        errors.push(`${def.id}: bonusDamage 不能为负`);
+      }
+      if (!Array.isArray(def.onHit) || def.onHit.length === 0) {
+        errors.push(`${def.id}: onHit 必须是非空数组`);
+        return;
+      }
+      for (const effect of def.onHit) {
+        if (!isObject(effect) || !EFFECT_TYPES.includes(effect.type)) {
+          errors.push(`${def.id}: 未知命中效果 ${JSON.stringify(effect)}`);
+          continue;
+        }
+        if (effect.type === 'applyStatus') {
+          if (!statuses.has(effect.status)) errors.push(`${def.id}: 未知状态 ${String(effect.status)}`);
+          if (!(Number.isInteger(effect.stacks) && effect.stacks > 0)) {
+            errors.push(`${def.id}: applyStatus.stacks 必须是正整数`);
+          }
+        }
+      }
     }
 
-    function applyBurn(status, stacks, cap = BURN.cap) {
-      if (stacks <= 0) return;
-      status.burn = Math.min(cap, status.burn + stacks);
-      status.burnLeft = BURN.durationSeconds;
+    function checkModifier(def, errors) {
+      checkRequires(def, errors);
+      for (const message of validateModifier(def)) errors.push(message);
+    }
+
+    function checkStatus(def, errors) {
+      if (!(Number.isInteger(def.cap) && def.cap > 0)) errors.push(`${def.id}: cap 必须是正整数`);
+      if (!isPositive(def.duration)) errors.push(`${def.id}: duration 必须大于 0`);
+      if (!['add-refresh'].includes(def.stacking)) errors.push(`${def.id}: 未知重复施加策略 ${String(def.stacking)}`);
+      if (def.tickSeconds !== undefined) {
+        if (!isPositive(def.tickSeconds)) errors.push(`${def.id}: tickSeconds 必须大于 0`);
+        if (!isNonNegative(def.damagePerStack)) errors.push(`${def.id}: damagePerStack 不能为负`);
+      }
+      if (def.slowPerStack !== undefined && !isNonNegative(def.slowPerStack)) {
+        errors.push(`${def.id}: slowPerStack 不能为负`);
+      }
+      if (def.maxSlow !== undefined && !(isNonNegative(def.maxSlow) && def.maxSlow < 1)) {
+        errors.push(`${def.id}: maxSlow 必须在 [0,1)`);
+      }
+    }
+
+    function checkReaction(def, errors, statuses) {
+      if (!REACTION_HANDLERS.includes(def.handler)) errors.push(`${def.id}: 未知反应处理器 ${String(def.handler)}`);
+      if (!REACTION_EVENTS.includes(def.event)) errors.push(`${def.id}: 未知语义事件 ${String(def.event)}`);
+      if (!isFiniteNumber(def.priority)) errors.push(`${def.id}: priority 必须是数字`);
+      if (!isObject(def.config)) {
+        errors.push(`${def.id}: 缺少 config 对象`);
+        return;
+      }
+      for (const [key, value] of Object.entries(def.config)) {
+        if (typeof value === 'number' && !Number.isFinite(value)) errors.push(`${def.id}: config.${key} 不是有限数字`);
+      }
+      if (typeof def.config.status === 'string' && !statuses.has(def.config.status)) {
+        errors.push(`${def.id}: config.status 引用了未知状态 ${String(def.config.status)}`);
+      }
+    }
+
+    function checkStyle(def, errors, byKind) {
+      if (!MOVEMENT_STRATEGIES.includes(def.movementPreference)) {
+        errors.push(`${def.id}: 未知移动偏好 ${String(def.movementPreference)}`);
+      }
+      if (typeof def.visualTheme !== 'string' || def.visualTheme.length === 0) {
+        errors.push(`${def.id}: 缺少 visualTheme`);
+      }
+      if (
+        !isObject(def.unlockedBy) ||
+        !(Number.isInteger(def.unlockedBy.bestFloor) && def.unlockedBy.bestFloor >= 1)
+      ) {
+        errors.push(`${def.id}: unlockedBy.bestFloor 必须是正整数`);
+      }
+      if (!Array.isArray(def.startingBuild) || def.startingBuild.length === 0) {
+        errors.push(`${def.id}: startingBuild 必须是非空数组`);
+        return;
+      }
+      if (def.startingBuild.length > BUILD_LIMITS.maxSkills) {
+        errors.push(`${def.id}: startingBuild 超过技能上限`);
+      }
+      for (const skill of def.startingBuild) {
+        if (!isObject(skill)) {
+          errors.push(`${def.id}: startingBuild 的槽位必须是对象`);
+          continue;
+        }
+        const action = byKind.action?.get(skill.action);
+        if (action === undefined) {
+          errors.push(`${def.id}: 起始动作不存在 ${String(skill.action)}`);
+          continue;
+        }
+        for (const slot of ['element', 'modifier']) {
+          const id = skill[slot];
+          if (id === null || id === undefined) continue;
+          const component = byKind[slot]?.get(id);
+          if (component === undefined) {
+            errors.push(`${def.id}: 起始${slot === 'element' ? '属性' : '修饰'}不存在 ${String(id)}`);
+            continue;
+          }
+          const missing = component.requires.filter((cap) => !action.capabilities.includes(cap));
+          if (missing.length > 0) {
+            errors.push(`${def.id}: 起始${slot === 'element' ? '属性' : '修饰'} ${id} 与动作 ${action.id} 不兼容`);
+          }
+        }
+      }
     }
 
     /**
-     * 推进状态，返回这一帧的灼烧伤害（0 表示没有跳）。
-     * 调用方负责再走一次 resolveHit(..., { main: false })。
+     * 校验一组内容定义。返回结构化错误；空数组表示通过。
+     * 注册表加载时也调用它，因此内容错误会在启动阶段暴露，而不是战斗中途。
      */
-    function advanceStatus(status, dt) {
-      if (status.burn <= 0) return 0;
-      status.burnLeft -= dt;
-      if (status.burnLeft <= 0) {
-        status.burn = 0;
-        return 0;
+    function validateContent(lists = KINDS) {
+      const errors = [];
+      const seen = new Set();
+      const byKind = {};
+
+      for (const [kind, list] of Object.entries(lists)) {
+        if (!Array.isArray(list)) {
+          errors.push(`${kind}: 定义表必须是数组`);
+          byKind[kind] = new Map();
+          continue;
+        }
+        byKind[kind] = new Map();
+        for (const def of list) {
+          if (!checkCommon(def, kind, seen, errors)) continue;
+          if (def.kind !== kind) {
+            errors.push(`${kind}.${def.id}: kind 应为 ${kind}，实际是 ${def.kind}`);
+            continue;
+          }
+          seen.add(def.id);
+          byKind[kind].set(def.id, def);
+        }
       }
-      status.burnTick -= dt;
-      if (status.burnTick > 0) return 0;
-      status.burnTick += BURN.tickSeconds;
-      return status.burn * BURN.damagePerStack;
+
+      const checks = {
+        action: (def) => checkAction(def, errors),
+        element: (def) => checkElement(def, errors, byKind.status ?? new Map()),
+        modifier: (def) => checkModifier(def, errors),
+        status: (def) => checkStatus(def, errors),
+        reaction: (def) => checkReaction(def, errors, byKind.status ?? new Map()),
+        style: (def) => checkStyle(def, errors, byKind),
+      };
+      for (const [kind, table] of Object.entries(byKind)) {
+        const check = checks[kind];
+        if (check === undefined) continue;
+        for (const def of table.values()) check(def);
+      }
+
+      return errors;
+    }
+
+    /** 由内容表构建不可变注册表。内容错误直接抛错，避免半残内容进入战斗。 */
+    function buildContent(lists = KINDS) {
+      const errors = validateContent(lists);
+      if (errors.length > 0) {
+        throw new Error('技能内容注册失败：\n- ' + errors.join('\n- '));
+      }
+      const byKind = {};
+      const defs = new Map();
+      for (const [kind, list] of Object.entries(lists)) {
+        const table = new Map();
+        for (const def of list) {
+          const frozen = deepFreeze(def);
+          table.set(frozen.id, frozen);
+          defs.set(frozen.id, frozen);
+        }
+        byKind[kind] = table;
+      }
+      const order = {};
+      for (const [kind, table] of Object.entries(byKind)) order[kind] = [...table.keys()];
+      return deepFreeze({ defs, byKind, order });
+    }
+
+    const CONTENT = buildContent();
+
+    function contentById(id) {
+      if (typeof id !== 'string') return undefined;
+      return CONTENT.defs.get(id);
+    }
+
+    function contentByKind(kind) {
+      return CONTENT.byKind[kind] ?? new Map();
+    }
+
+    function contentList(kind) {
+      return (CONTENT.order[kind] ?? []).map((id) => CONTENT.byKind[kind].get(id));
+    }
+
+    function isKind(id, kind) {
+      const def = contentById(id);
+      return def !== undefined && def.kind === kind;
+    }
+
+    // ---- skills/actions/projectile.js ----
+    // 飞弹：检查目标与实体上限，创建带计划快照的弹体实体。
+
+    const projectileAction = Object.freeze({
+      canCast(context) {
+        const plan = context.plan;
+        if (context.entityCount('projectile') >= RUNTIME_LIMITS.maxProjectiles) return false;
+        return context.queryNearest(context.world.player, plan.range) !== null;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        const target = context.queryNearest(player, plan.range);
+        if (target === null) return false;
+        const entity = context.spawnEntity({
+          kind: 'projectile',
+          x: player.x,
+          y: player.y,
+          targetId: target.id,
+          plan,
+          skillInstanceId: plan.id,
+          castId: context.castId,
+          speed: plan.speed,
+          hitRadius: plan.action.params.radius ?? 3,
+          life: plan.life,
+        });
+        if (entity === null) return false;
+        context.emitVisual({
+          type: 'shot',
+          x: player.x,
+          y: player.y,
+          skillId: plan.id,
+          element: plan.element === null ? null : plan.element.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        return true;
+      },
+    });
+
+    // ---- skills/actions/aura.js ----
+    // 光环：周期性选择身边有限目标，逐个提交统一命中。
+
+    const auraAction = Object.freeze({
+      canCast(context) {
+        return context.queryTargets(context.world.player, context.plan.radius, context.plan.maxTargets).length > 0;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        const targets = context.queryTargets(player, plan.radius, plan.maxTargets);
+        if (targets.length === 0) return false;
+        context.emitVisual({
+          type: 'pulse',
+          x: player.x,
+          y: player.y,
+          radius: plan.radius,
+          element: plan.element === null ? null : plan.element.id,
+          skillId: plan.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        targets.forEach((target, index) => {
+          context.hit({
+            targetId: target.id,
+            center: player,
+            extraTags: ['aura'],
+            primary: index === 0,
+          });
+        });
+        return true;
+      },
+    });
+
+    // ---- skills/actions/impact.js ----
+    // 冲击：在选定目标位置产生一次范围强力命中，带 heavy 标签。
+
+    const impactAction = Object.freeze({
+      canCast(context) {
+        return context.queryNearest(context.world.player, context.plan.range) !== null;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        const target = context.queryNearest(player, plan.range);
+        if (target === null) return false;
+        const center = { x: target.x, y: target.y };
+        const targets = context.queryTargets(center, plan.radius, plan.maxTargets);
+        if (targets.length === 0) return false;
+        context.emitVisual({
+          type: 'impact',
+          x: center.x,
+          y: center.y,
+          radius: plan.radius,
+          element: plan.element === null ? null : plan.element.id,
+          skillId: plan.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        targets.forEach((other, index) => {
+          context.hit({
+            targetId: other.id,
+            center,
+            extraTags: ['impact'],
+            primary: index === 0,
+          });
+        });
+        return true;
+      },
+    });
+
+    // ---- skills/actions/swing.js ----
+    // 挥斩：靠近目标后朝其方向挥出扇形，命中扇区内有限敌人。
+
+    const angleDelta = (a, b) => {
+      let d = a - b;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      return Math.abs(d);
+    };
+
+    const swingAction = Object.freeze({
+      canCast(context) {
+        return context.queryNearest(context.world.player, context.plan.radius) !== null;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        const target = context.queryNearest(player, plan.radius);
+        if (target === null) return false;
+        const facing = Math.atan2(target.y - player.y, target.x - player.x);
+        const half = ((plan.angle ?? 90) * Math.PI) / 360;
+        const candidates = context.queryTargets(player, plan.radius, Math.max(plan.maxTargets * 4, 8));
+        const hits = candidates
+          .filter((enemy) => angleDelta(Math.atan2(enemy.y - player.y, enemy.x - player.x), facing) <= half)
+          .slice(0, plan.maxTargets);
+        if (hits.length === 0) return false;
+        context.emitVisual({
+          type: 'swing',
+          x: player.x,
+          y: player.y,
+          radius: plan.radius,
+          angle: facing,
+          half,
+          element: plan.element === null ? null : plan.element.id,
+          skillId: plan.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        hits.forEach((enemy, index) => {
+          context.hit({
+            targetId: enemy.id,
+            center: player,
+            extraTags: ['swing', 'arc'],
+            primary: index === 0,
+          });
+        });
+        return true;
+      },
+    });
+
+    // ---- skills/actions/orbitSword.js ----
+    // 御剑：召唤环绕自身的飞剑实体。环绕、碰撞与命中间隔由 entities/orbitSword.js 推进。
+
+    const orbitSwordAction = Object.freeze({
+      canCast(context) {
+        return context.entityCount('orbitSword') < context.plan.maxActive;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        if (context.entityCount('orbitSword') >= plan.maxActive) return false;
+        const entity = context.spawnEntity({
+          kind: 'orbitSword',
+          x: player.x,
+          y: player.y,
+          plan,
+          skillInstanceId: plan.id,
+          castId: context.castId,
+          angle: context.rng() * Math.PI * 2,
+          orbitRadius: plan.orbitRadius,
+          hitRadius: plan.hitRadius,
+          angularSpeed: plan.angularSpeed,
+          life: plan.duration,
+          hitInterval: plan.hitInterval,
+          maxTargets: plan.maxTargets,
+          nextHit: new Map(),
+        });
+        if (entity === null) return false;
+        context.emitVisual({
+          type: 'swordSummon',
+          x: player.x,
+          y: player.y,
+          skillId: plan.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        return true;
+      },
+    });
+
+    // ---- skills/actions/swordPierce.js ----
+    // 飞剑穿敌：朝目标方向放出直线飞行的穿透飞剑，沿途每个敌人只命中一次。
+
+    const swordPierceAction = Object.freeze({
+      canCast(context) {
+        if (context.entityCount('piercingSword') >= RUNTIME_LIMITS.maxSwordPieces) return false;
+        return context.queryNearest(context.world.player, context.plan.range) !== null;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        const target = context.queryNearest(player, plan.range);
+        if (target === null) return false;
+        if (context.entityCount('piercingSword') >= RUNTIME_LIMITS.maxSwordPieces) return false;
+        const dx = target.x - player.x;
+        const dy = target.y - player.y;
+        const length = Math.hypot(dx, dy) || 1;
+        const angle = Math.atan2(dy, dx);
+        const entity = context.spawnEntity({
+          kind: 'piercingSword',
+          x: player.x,
+          y: player.y,
+          plan,
+          skillInstanceId: plan.id,
+          castId: context.castId,
+          dirX: dx / length,
+          dirY: dy / length,
+          angle,
+          speed: plan.speed,
+          hitRadius: plan.radius,
+          life: plan.life,
+          range: plan.range,
+          maxHits: plan.maxHits,
+          hitIds: [],
+          traveled: 0,
+        });
+        if (entity === null) return false;
+        context.emitVisual({
+          type: 'swordShot',
+          x: player.x,
+          y: player.y,
+          angle,
+          skillId: plan.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        return true;
+      },
+    });
+
+    // ---- skills/actions/swordArray.js ----
+    // 剑阵：在目标位置创建固定区域，周期性对范围内有限目标提交命中。
+
+    const swordArrayAction = Object.freeze({
+      canCast(context) {
+        if (context.entityCount('swordArray') >= context.plan.maxActive) return false;
+        return context.queryNearest(context.world.player, context.plan.range) !== null;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        if (context.entityCount('swordArray') >= plan.maxActive) return false;
+        const target = context.queryNearest(player, plan.range);
+        if (target === null) return false;
+        if (context.entityCount('swordArray') >= RUNTIME_LIMITS.maxSwordArrays) return false;
+        const entity = context.spawnEntity({
+          kind: 'swordArray',
+          x: target.x,
+          y: target.y,
+          plan,
+          skillInstanceId: plan.id,
+          castId: context.castId,
+          radius: plan.radius,
+          life: plan.duration,
+          tickInterval: plan.tickInterval,
+          tickTimer: plan.tickInterval,
+          maxTargets: plan.maxTargets,
+        });
+        if (entity === null) return false;
+        context.emitVisual({
+          type: 'swordArray',
+          x: target.x,
+          y: target.y,
+          radius: plan.radius,
+          skillId: plan.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        return true;
+      },
+    });
+
+    // ---- skills/actions/trap.js ----
+    // 陷阱：在脚下放置等待触发的实体。触发与清理由 entities/trap.js 推进。
+
+    const trapAction = Object.freeze({
+      canCast(context) {
+        return context.entityCount('trap') < context.plan.maxActive;
+      },
+
+      cast(context) {
+        const plan = context.plan;
+        const player = context.world.player;
+        if (context.entityCount('trap') >= plan.maxActive) return false;
+        const target = context.queryNearest(player, plan.range);
+        const center = target === null ? { x: player.x, y: player.y } : { x: target.x, y: target.y };
+        const entity = context.spawnEntity({
+          kind: 'trap',
+          x: center.x,
+          y: center.y,
+          plan,
+          skillInstanceId: plan.id,
+          castId: context.castId,
+          radius: plan.radius,
+          triggerRadius: plan.triggerRadius,
+          armTime: plan.armTime,
+          life: plan.duration,
+          maxTargets: plan.maxTargets,
+          armedAt: context.time + plan.armTime,
+        });
+        if (entity === null) return false;
+        context.emitVisual({
+          type: 'trapPlaced',
+          x: center.x,
+          y: center.y,
+          skillId: plan.id,
+          color: plan.element === null ? plan.action.color : plan.element.color,
+        });
+        return true;
+      },
+    });
+
+    // ---- skills/actions/index.js ----
+    // 动作实现表：契约与运行时处理器在同一处合并，任何一边缺失都会在加载时失败。
+    //
+    // registry.js 只读 contracts.js（避免把世界依赖带进内容校验），runtime.js 读
+    // 本文件；测试会核对两边的 ID 集合一致。
+
+    const HANDLERS = Object.freeze({
+      projectile: projectileAction,
+      aura: auraAction,
+      impact: impactAction,
+      swing: swingAction,
+      orbitSword: orbitSwordAction,
+      swordPierce: swordPierceAction,
+      swordArray: swordArrayAction,
+      trap: trapAction,
+    });
+
+    for (const id of Object.keys(ACTION_CONTRACTS)) {
+      if (HANDLERS[id] === undefined) throw new Error(`缺少动作处理器实现：${id}`);
+    }
+    for (const id of Object.keys(HANDLERS)) {
+      if (ACTION_CONTRACTS[id] === undefined) throw new Error(`缺少动作契约：${id}`);
+    }
+
+    const ACTION_IMPLEMENTATIONS = Object.freeze(
+      Object.fromEntries(
+        Object.keys(HANDLERS).map((id) => [
+          id,
+          Object.freeze({ contract: ACTION_CONTRACTS[id], handler: HANDLERS[id] }),
+        ]),
+      ),
+    );
+
+    const IMPLEMENTED_ACTION_IDS = Object.freeze(Object.keys(ACTION_IMPLEMENTATIONS));
+
+    function actionImplementation(id) {
+      return ACTION_IMPLEMENTATIONS[id];
+    }
+
+    // ---- skills/compile.js ----
+    // 构筑编译：build → 校验 → 不可变 SkillPlan。
+    //
+    // 运行时不再反复扫描构筑；冷却、伤害、范围、命中效果和描述都来自同一份
+    // 编译结果。动作描述由 actions/contracts.js 提供，修饰描述由 modifiers/index.js
+    // 提供；未知处理器直接失败，不再静默回退成另一种动作的文案。
+    //
+    // 失败返回结构化错误（code / path / message），调用方可以逐条显示。
+
+    const BUILD_VERSION = 3;
+
+    const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+    function freezePlan(plan) {
+      Object.freeze(plan.effects);
+      Object.freeze(plan.tags);
+      Object.freeze(plan.capabilities);
+      Object.freeze(plan.descriptionData);
+      return Object.freeze(plan);
+    }
+
+    function emptyBuild() {
+      return {
+        version: BUILD_VERSION,
+        skills: [{ id: 'skill-1', action: 'projectile', element: null, modifier: null }],
+        reserve: [],
+      };
+    }
+
+    /** 把任意存档/UI 输入收敛成合法形状；不在这里判断内容是否存在。 */
+    function normalizeBuild(input) {
+      const src = isPlainObject(input) ? input : {};
+      const rawSkills = Array.isArray(src.skills) ? src.skills : [];
+      const skills = [];
+      for (let index = 0; index < rawSkills.length; index += 1) {
+        const raw = isPlainObject(rawSkills[index]) ? rawSkills[index] : {};
+        const id = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : `skill-${index + 1}`;
+        skills.push({
+          id,
+          action: typeof raw.action === 'string' && raw.action.length > 0 ? raw.action : null,
+          element: typeof raw.element === 'string' && raw.element.length > 0 ? raw.element : null,
+          modifier: typeof raw.modifier === 'string' && raw.modifier.length > 0 ? raw.modifier : null,
+        });
+      }
+      const rawReserve = Array.isArray(src.reserve) ? src.reserve : [];
+      const reserve = [];
+      for (const id of rawReserve) {
+        if (typeof id !== 'string' || id.length === 0) continue;
+        if (reserve.includes(id)) continue;
+        if (reserve.length >= BUILD_LIMITS.maxReserve) break;
+        reserve.push(id);
+      }
+      return { version: BUILD_VERSION, skills, reserve };
+    }
+
+    function elementPhrase(element, damage) {
+      if (element === null) return `；命中造成 ${fmtNumber(damage)} 伤害`;
+      const effects = element.onHit
+        .filter((effect) => effect.type === 'applyStatus')
+        .map((effect) => {
+          const status = contentById(effect.status);
+          return `${effect.stacks} 层${status === undefined ? effect.status : status.label}`;
+        });
+      const suffix = effects.length > 0 ? `并施加 ${effects.join('、')}` : '';
+      return `；命中造成 ${fmtNumber(damage)} 伤害${suffix}`;
+    }
+
+    function compileSkill(skill, index, errors) {
+      const path = `skills[${index}]`;
+      const action = contentById(skill.action);
+      if (action === undefined) {
+        errors.push({
+          code: 'unknown-action',
+          path: `${path}.action`,
+          id: skill.action,
+          message: `技能 ${index + 1} 的动作不存在：${String(skill.action)}`,
+        });
+        return null;
+      }
+      if (action.kind !== 'action') {
+        errors.push({
+          code: 'wrong-category',
+          path: `${path}.action`,
+          id: skill.action,
+          message: `${action.id} 不是动作`,
+        });
+        return null;
+      }
+      const contract = ACTION_CONTRACTS[action.handler];
+      if (contract === undefined) {
+        errors.push({
+          code: 'unknown-handler',
+          path: `${path}.action`,
+          id: action.id,
+          message: `${action.id} 没有动作处理器契约`,
+        });
+        return null;
+      }
+
+      const caps = new Set(action.capabilities);
+      let element = null;
+      if (skill.element !== null) {
+        const def = contentById(skill.element);
+        if (def === undefined) {
+          errors.push({
+            code: 'unknown-element',
+            path: `${path}.element`,
+            id: skill.element,
+            message: `技能 ${index + 1} 的属性不存在：${String(skill.element)}`,
+          });
+        } else if (def.kind !== 'element') {
+          errors.push({
+            code: 'wrong-category',
+            path: `${path}.element`,
+            id: skill.element,
+            message: `${def.id} 不是属性`,
+          });
+        } else {
+          const missing = def.requires.filter((cap) => !caps.has(cap));
+          if (missing.length > 0) {
+            errors.push({
+              code: 'capability-mismatch',
+              path: `${path}.element`,
+              id: def.id,
+              message: `${def.label}需要 ${missing.join('、')} 能力，${action.label}不具备`,
+            });
+          } else {
+            element = def;
+          }
+        }
+      }
+
+      let modifier = null;
+      if (skill.modifier !== null) {
+        const def = contentById(skill.modifier);
+        if (def === undefined) {
+          errors.push({
+            code: 'unknown-modifier',
+            path: `${path}.modifier`,
+            id: skill.modifier,
+            message: `技能 ${index + 1} 的修饰不存在：${String(skill.modifier)}`,
+          });
+        } else if (def.kind !== 'modifier') {
+          errors.push({
+            code: 'wrong-category',
+            path: `${path}.modifier`,
+            id: skill.modifier,
+            message: `${def.id} 不是修饰`,
+          });
+        } else {
+          const missing = def.requires.filter((cap) => !caps.has(cap));
+          if (missing.length > 0) {
+            errors.push({
+              code: 'capability-mismatch',
+              path: `${path}.modifier`,
+              id: def.id,
+              message: `${def.label}需要 ${missing.join('、')} 能力，${action.label}不具备`,
+            });
+          } else {
+            modifier = def;
+          }
+        }
+      }
+
+      const damage = action.params.damage + (element === null ? 0 : element.bonusDamage ?? 0);
+      const baseNumbers = { ...action.params, damage };
+      const numbers = compileModifier(modifier, baseNumbers);
+      const planLike = {
+        ...numbers,
+        action,
+        element,
+        modifier,
+        maxTargets: numbers.maxTargets ?? 1,
+      };
+
+      const actionText = contract.describe(planLike);
+      if (typeof actionText !== 'string' || actionText.length === 0) {
+        errors.push({
+          code: 'undescribable-action',
+          path: `${path}.action`,
+          id: action.id,
+          message: `${action.id} 的处理器没有提供描述`,
+        });
+        return null;
+      }
+      const elementText = elementPhrase(element, damage);
+      const modifierText = describeModifier(modifier, planLike);
+      if (modifier !== null && (typeof modifierText !== 'string' || modifierText.length === 0)) {
+        errors.push({
+          code: 'undescribable-modifier',
+          path: `${path}.modifier`,
+          id: modifier.id,
+          message: `${modifier.id} 的处理器没有提供描述`,
+        });
+        return null;
+      }
+      const label = `${element === null ? '' : element.label}${action.label}`;
+      const description =
+        `${label}：${actionText}${elementText}` +
+        (modifier === null ? '' : `；${modifier.label}：${modifierText}`) +
+        '。';
+      const descriptionData = Object.freeze({
+        label,
+        action: actionText,
+        element: Object.freeze({
+          damage,
+          effects: Object.freeze(
+            element === null ? [] : element.onHit.map((effect) => Object.freeze({ ...effect })),
+          ),
+        }),
+        modifier: modifier === null ? null : Object.freeze({ id: modifier.id, text: modifierText }),
+        numbers: Object.freeze({
+          cooldown: numbers.cooldown,
+          damage,
+          radius: numbers.radius ?? 0,
+          range: numbers.range ?? 0,
+          maxTargets: numbers.maxTargets ?? 1,
+          angle: numbers.angle ?? 0,
+        }),
+      });
+
+      const plan = freezePlan({
+        id: skill.id,
+        index,
+        action,
+        element,
+        modifier,
+        capabilities: Object.freeze([...action.capabilities]),
+        params: Object.freeze({ ...numbers }),
+        cooldown: numbers.cooldown,
+        damage,
+        speed: numbers.speed ?? 0,
+        range: numbers.range ?? 0,
+        radius: numbers.radius ?? 0,
+        maxTargets: numbers.maxTargets ?? 1,
+        life: numbers.life ?? 0,
+        angle: numbers.angle ?? 0,
+        orbitRadius: numbers.orbitRadius ?? 0,
+        hitRadius: numbers.hitRadius ?? 0,
+        angularSpeed: numbers.angularSpeed ?? 0,
+        duration: numbers.duration ?? 0,
+        hitInterval: numbers.hitInterval ?? 0,
+        maxActive: numbers.maxActive ?? 1,
+        maxHits: numbers.maxHits ?? 0,
+        tickInterval: numbers.tickInterval ?? 0,
+        triggerRadius: numbers.triggerRadius ?? 0,
+        armTime: numbers.armTime ?? 0,
+        movement: Object.freeze({ ...action.movement }),
+        heavy: action.capabilities.includes('heavy'),
+        transform: modifier === null ? null : modifier.transform,
+        effects: Object.freeze(
+          element === null ? [] : element.onHit.map((effect) => Object.freeze({ ...effect })),
+        ),
+        tags: Object.freeze(
+          [action.id, element === null ? null : element.id, modifier === null ? null : modifier.id].filter(
+            (tag) => tag !== null,
+          ),
+        ),
+        label,
+        description,
+        descriptionData,
+      });
+      return plan;
     }
 
     /**
-     * 稳态 DPS：忽略预热与目标死亡，用来比较 build 的形状。
-     * 数值模拟器与单测共用，保证"设计稿里的 5 倍差距"能被复现。
+     * 编译构筑。
+     * @returns {{ok:boolean, build:object, plans:Array, errors:Array, warnings:Array}}
      */
-    function steadyDps(cards, attrs, enemy) {
-      let direct = 0;
-      let burnPerSecond = 0;
-      for (const card of cards) {
-        direct += resolveHit(enemy, attackCells(card, attrs), { main: true }) / card.cd;
-        burnPerSecond += (card.burn ?? 0) / card.cd;
+    function compileBuild(input) {
+      const build = normalizeBuild(input);
+      const errors = [];
+      const warnings = [];
+
+      if (build.skills.length === 0) {
+        errors.push({
+          code: 'missing-action',
+          path: 'skills',
+          message: '至少需要一个带动作的技能',
+        });
       }
-      // 层数只在"连续 6 秒没有新层"时整体熄灭，不会逐层衰减。
-      // 所以平衡态是"6 秒内能叠到几层"，再受 5 层上限约束。
-      const stacks = Math.min(BURN.cap, burnPerSecond * BURN.durationSeconds);
-      return direct + (stacks * BURN.damagePerStack) / BURN.tickSeconds;
+      if (build.skills.length > BUILD_LIMITS.maxSkills) {
+        errors.push({
+          code: 'too-many-skills',
+          path: 'skills',
+          message: `最多只能装备 ${BUILD_LIMITS.maxSkills} 个技能`,
+        });
+      }
+
+      const ids = new Set();
+      const plans = [];
+      for (let index = 0; index < build.skills.length; index += 1) {
+        const skill = build.skills[index];
+        if (ids.has(skill.id)) {
+          errors.push({
+            code: 'duplicate-skill-id',
+            path: `skills[${index}].id`,
+            id: skill.id,
+            message: `技能实例 ID 重复：${skill.id}`,
+          });
+        }
+        ids.add(skill.id);
+        if (index >= BUILD_LIMITS.maxSkills) continue;
+        const plan = compileSkill(skill, index, errors);
+        if (plan !== null) plans.push(plan);
+      }
+
+      for (const id of build.reserve) {
+        if (contentById(id) === undefined) {
+          warnings.push({
+            code: 'unknown-reserve',
+            path: 'reserve',
+            id,
+            message: `备用栏里的组件已不存在：${id}`,
+          });
+        }
+      }
+
+      return {
+        ok: errors.length === 0,
+        build,
+        plans,
+        errors,
+        warnings,
+      };
     }
 
-    // ---- cards.js ----
-    // 卡片数据（MVP 子集：灼烧包）。
-    //
-    // 只收录"行为已经实现"的卡。docs/cards.md 里的 24 张是完整设计，
-    // 但没实现的卡不进代码——否则会出现"有数据、没行为"的死卡。
-    //
-    // 与 cards.md §7 的偏差：MVP 用「斩杀 / 时锚」替换了「压缩 / 禁疗」，
-    // 因为 MVP 没有回血敌人，禁疗无处生效。
-
-    const STARTER_ID = 'orb_phys';
-
-    const CARDS = Object.freeze({
-      orb_phys: Object.freeze({
-        id: 'orb_phys',
-        name: '铁弹',
-        carrier: 'orb',
-        effect: 'phys',
-        cells: 1,
-        cd: 0.7,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['phys', 'single']),
-        solves: Object.freeze(['shield']),
-        desc: '击退；对护盾 +1 格',
-      }),
-      orb_fire: Object.freeze({
-        id: 'orb_fire',
-        name: '火箭',
-        carrier: 'orb',
-        effect: 'fire',
-        cells: 1,
-        cd: 0.9,
-        burn: 1,
-        aoe: 0,
-        tags: Object.freeze(['fire', 'single', 'dot']),
-        solves: Object.freeze(['carapace', 'regen']),
-        desc: '灼烧 +1 层',
-      }),
-      field_fire: Object.freeze({
-        id: 'field_fire',
-        name: '火海',
-        carrier: 'field',
-        effect: 'fire',
-        cells: 1,
-        cd: 1.5,
-        burn: 1,
-        aoe: 3,
-        tags: Object.freeze(['fire', 'aoe', 'dot']),
-        solves: Object.freeze(['carapace', 'summon']),
-        desc: '半径内最多 3 个目标，各 1 格 + 灼烧 +1',
-      }),
-      summon_fire: Object.freeze({
-        id: 'summon_fire',
-        name: '火灵',
-        carrier: 'summon',
-        mode: 'turret',
-        hp: 4,
-        effect: 'fire',
-        cells: 1,
-        cd: 1.2,
-        burn: 1,
-        aoe: 0,
-        tags: Object.freeze(['fire', 'single', 'dot']),
-        solves: Object.freeze(['carapace', 'regen']),
-        desc: '射程 36，灼烧 +1；生命 4',
-      }),
-      self_fire: Object.freeze({
-        id: 'self_fire',
-        name: '燃身',
-        carrier: 'self',
-        effect: 'fire',
-        cells: 1,
-        cd: 3,
-        burn: 2,
-        aoe: 0,
-        tags: Object.freeze(['fire', 'self', 'dot']),
-        solves: Object.freeze(['carapace']),
-        desc: '每 3 秒：周围 1 格 + 灼烧 2 层',
-      }),
-      rule_boom: Object.freeze({
-        id: 'rule_boom',
-        name: '尸爆',
-        carrier: 'rule',
-        effect: 'fire',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'aoe']),
-        solves: Object.freeze(['split', 'summon']),
-        desc: '击杀时对周围造成 2 次 1 格',
-      }),
-      rule_combo: Object.freeze({
-        id: 'rule_combo',
-        name: '连击',
-        carrier: 'rule',
-        effect: 'fire',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'multi']),
-        solves: Object.freeze(['carapace']),
-        desc: '每 4 次命中，追加 1 次 1 格',
-      }),
-      rule_execute: Object.freeze({
-        id: 'rule_execute',
-        name: '斩杀',
-        carrier: 'rule',
-        effect: 'fire',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'execute']),
-        solves: Object.freeze(['split', 'summon']),
-        desc: '命中后，2 格以下的目标直接移除',
-      }),
-      rule_anchor: Object.freeze({
-        id: 'rule_anchor',
-        name: '时锚',
-        carrier: 'rule',
-        effect: 'fire',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'control']),
-        solves: Object.freeze(['bomb']),
-        desc: '每 10 秒冻结全场 1.2 秒',
-      }),
-      // ---- P0 位移家族 ----
-      gravity_well: Object.freeze({
-        id: 'gravity_well',
-        name: '引力井',
-        carrier: 'verb',
-        kind: 'pull',
-        cells: 0,
-        cd: 2,
-        burn: 0,
-        aoe: 0,
-        radius: 40,
-        strength: 10,
-        tags: Object.freeze(['verb', 'gravity']),
-        solves: Object.freeze(['summon']),
-        desc: '每 2 秒把 40 格内的敌人拉近 10px',
-      }),
-      shockwave: Object.freeze({
-        id: 'shockwave',
-        name: '冲击波',
-        carrier: 'verb',
-        kind: 'push',
-        cells: 1,
-        cd: 4,
-        burn: 0,
-        aoe: 0,
-        radius: 24,
-        strength: 18,
-        tags: Object.freeze(['verb', 'gravity']),
-        solves: Object.freeze(['bomb']),
-        desc: '每 4 秒推开 24 格内的敌人 18px，各 1 格',
-      }),
-      vortex: Object.freeze({
-        id: 'vortex',
-        name: '涡流',
-        carrier: 'verb',
-        kind: 'vortex',
-        cells: 0,
-        cd: 6,
-        burn: 0,
-        aoe: 0,
-        radius: 30,
-        duration: 1.5,
-        tags: Object.freeze(['verb', 'gravity']),
-        solves: Object.freeze(['summon']),
-        desc: '半径 30 内的敌人绕你旋转 1.5 秒',
-      }),
-      rule_pin: Object.freeze({
-        id: 'rule_pin',
-        name: '钉住',
-        carrier: 'rule',
-        effect: 'control',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'verb']),
-        solves: Object.freeze(['carapace']),
-        desc: '每 3 秒，下一发命中定身 1 秒',
-      }),
-      rule_wall_slam: Object.freeze({
-        id: 'rule_wall_slam',
-        name: '撞墙',
-        carrier: 'rule',
-        effect: 'phys',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'gravity']),
-        solves: Object.freeze(['carapace']),
-        desc: '被位移撞到墙的敌人受 2 格（每只每秒一次）',
-      }),
-      // ---- P1 标记家族 ----
-      mark_hunter: Object.freeze({
-        id: 'mark_hunter',
-        name: '猎标',
-        carrier: 'rule',
-        effect: 'mind',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'mark']),
-        solves: Object.freeze(['split']),
-        desc: '攻击叠 1 层标记（上限 3）；带标记者优先被瞄准',
-      }),
-      fuse: Object.freeze({
-        id: 'fuse',
-        name: '引信',
-        carrier: 'rule',
-        effect: 'fire',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'mark']),
-        solves: Object.freeze(['split', 'summon']),
-        desc: '带标记的敌人死亡时爆炸，伤害 = 层数',
-      }),
-      spread: Object.freeze({
-        id: 'spread',
-        name: '传导',
-        carrier: 'rule',
-        effect: 'mind',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'mark']),
-        solves: Object.freeze(['summon']),
-        desc: '带标记的敌人死亡时，标记传给 2 个最近的敌人',
-      }),
-      execute_mark: Object.freeze({
-        id: 'execute_mark',
-        name: '处决',
-        carrier: 'rule',
-        effect: 'mind',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'mark']),
-        solves: Object.freeze(['carapace', 'split']),
-        desc: '3 层标记且 ≤4 格的目标直接移除',
-      }),
-      mark_bolt: Object.freeze({
-        id: 'mark_bolt',
-        name: '标记弹',
-        carrier: 'orb',
-        effect: 'mind',
-        cells: 0,
-        cd: 1.0,
-        burn: 0,
-        aoe: 0,
-        mark: 2,
-        tags: Object.freeze(['mark', 'single']),
-        solves: Object.freeze(['split']),
-        desc: '不造成伤害，叠 2 层标记',
-      }),
-      // ---- P2 召唤家族 ----
-      bomber: Object.freeze({
-        id: 'bomber',
-        name: '自爆傀儡',
-        carrier: 'summon',
-        mode: 'charge',
-        hp: 3,
-        blast: 3,
-        radius: 18,
-        cells: 0,
-        cd: 8,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['summon', 'blast']),
-        solves: Object.freeze(['split', 'summon']),
-        desc: '冲向最近敌人，接触后 18 格范围爆炸 3 格',
-      }),
-      link: Object.freeze({
-        id: 'link',
-        name: '连结',
-        carrier: 'rule',
-        effect: 'life',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'summon']),
-        solves: Object.freeze(['reflect']),
-        desc: '你受到的伤害 50% 转移给最近的召唤物',
-      }),
-      merge: Object.freeze({
-        id: 'merge',
-        name: '合体',
-        carrier: 'rule',
-        effect: 'life',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'summon']),
-        solves: Object.freeze(['summon']),
-        desc: '两个召唤物靠近时合并：生命相加，攻击变范围',
-      }),
-      sacrifice: Object.freeze({
-        id: 'sacrifice',
-        name: '献祭',
-        carrier: 'rule',
-        effect: 'time',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'summon']),
-        solves: Object.freeze(['summon']),
-        desc: '召唤物死亡时，刷新一个随机冷却',
-      }),
-      totem: Object.freeze({
-        id: 'totem',
-        name: '图腾',
-        carrier: 'summon',
-        mode: 'totem',
-        hp: 6,
-        cells: 0,
-        cd: 2,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['summon', 'heal']),
-        solves: Object.freeze(['regen']),
-        desc: '不动，每 2 秒给周围召唤物回 1 格',
-      }),
-      // ---- P3 时间家族 ----
-      time_stop: Object.freeze({
-        id: 'time_stop',
-        name: '时停',
-        carrier: 'rule',
-        effect: 'time',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'time']),
-        solves: Object.freeze(['bomb']),
-        desc: '每 12 秒冻结全场 1.5 秒',
-      }),
-      rewind: Object.freeze({
-        id: 'rewind',
-        name: '回溯',
-        carrier: 'rule',
-        effect: 'time',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'time']),
-        solves: Object.freeze(['carapace']),
-        desc: '生命低于 50% 时，回到 3 秒前的位置与生命（每层 1 次）',
-      }),
-      delay: Object.freeze({
-        id: 'delay',
-        name: '延迟',
-        carrier: 'rule',
-        effect: 'time',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'time']),
-        solves: Object.freeze(['reflect']),
-        desc: '受到的伤害延迟 2 秒结算；期间击杀来源则取消',
-      }),
-      chain: Object.freeze({
-        id: 'chain',
-        name: '连锁',
-        carrier: 'rule',
-        effect: 'time',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'time']),
-        solves: Object.freeze(['carapace', 'summon']),
-        desc: '击杀后，下次攻击额外发射 1 发（最多叠 3）',
-      }),
-      // ---- P4 风险家族 ----
-      desperate: Object.freeze({
-        id: 'desperate',
-        name: '破釜',
-        carrier: 'rule',
-        effect: 'life',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'risk']),
-        solves: Object.freeze(['carapace']),
-        desc: '生命低于 30% 时，所有冷却减半',
-      }),
-      shield_burst: Object.freeze({
-        id: 'shield_burst',
-        name: '护盾爆',
-        carrier: 'rule',
-        effect: 'life',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'risk']),
-        solves: Object.freeze(['bomb']),
-        desc: '每 6 秒获得 2 格护盾；护盾破碎时对周围造成 3 格',
-      }),
-      blood_debt: Object.freeze({
-        id: 'blood_debt',
-        name: '血偿',
-        carrier: 'rule',
-        effect: 'life',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'risk']),
-        solves: Object.freeze(['carapace']),
-        desc: '每次受伤，下一次攻击 +1 格（最多 +3）',
-      }),
-      overdraft: Object.freeze({
-        id: 'overdraft',
-        name: '透支',
-        carrier: 'rule',
-        effect: 'life',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['rule', 'risk']),
-        solves: Object.freeze(['summon']),
-        desc: '每层开始扣 3 格生命，立刻刷新一次所有冷却',
-      }),
-      // ---- P5 环境家族 ----
-      flame_trap: Object.freeze({
-        id: 'flame_trap',
-        name: '火焰陷阱',
-        carrier: 'trap',
-        kind: 'flame',
-        radius: 12,
-        cells: 2,
-        burn: 2,
-        cd: 5,
-        ttl: 8,
-        aoe: 0,
-        tags: Object.freeze(['trap', 'fire']),
-        solves: Object.freeze(['summon']),
-        desc: '在脚下放置陷阱：触发时 12 格范围 2 格 + 2 层灼烧',
-      }),
-      frost_trap: Object.freeze({
-        id: 'frost_trap',
-        name: '冰霜陷阱',
-        carrier: 'trap',
-        kind: 'frost',
-        radius: 12,
-        cells: 1,
-        freeze: 1.5,
-        cd: 7,
-        ttl: 8,
-        aoe: 0,
-        tags: Object.freeze(['trap', 'ice']),
-        solves: Object.freeze(['bomb']),
-        desc: '触发时冻结范围内敌人 1.5 秒',
-      }),
-      fire_trail: Object.freeze({
-        id: 'fire_trail',
-        name: '火痕',
-        carrier: 'trail',
-        kind: 'fire',
-        radius: 7,
-        cells: 1,
-        burn: 1,
-        cd: 0.5,
-        ttl: 2,
-        aoe: 0,
-        tags: Object.freeze(['trail', 'fire']),
-        solves: Object.freeze(['carapace']),
-        desc: '移动时留下火焰，持续 2 秒，每 0.5 秒 1 格',
-      }),
-      shock_trail: Object.freeze({
-        id: 'shock_trail',
-        name: '电痕',
-        carrier: 'trail',
-        kind: 'shock',
-        radius: 7,
-        cells: 1,
-        cd: 0.5,
-        ttl: 2,
-        aoe: 0,
-        tags: Object.freeze(['trail', 'thunder']),
-        solves: Object.freeze(['summon']),
-        desc: '移动轨迹带电，经过的敌人每 0.5 秒 1 格',
-      }),
-    });
-
-    /** P5 环境包。 */
-    const ENV_PACK = Object.freeze(['flame_trap', 'frost_trap', 'fire_trail', 'shock_trail']);
-
-    /** P4 风险包。 */
-    const RISK_PACK = Object.freeze(['desperate', 'shield_burst', 'blood_debt', 'overdraft']);
-    /** P3 时间包。 */
-    const TIME_PACK = Object.freeze(['time_stop', 'rewind', 'delay', 'chain']);
-
-    /** P2 召唤包。 */
-    const SUMMON_PACK = Object.freeze(['bomber', 'link', 'merge', 'sacrifice', 'totem']);
-
-    /** P1 标记包。 */
-    const MARK_PACK = Object.freeze([
-      'mark_hunter',
-      'fuse',
-      'spread',
-      'execute_mark',
-      'mark_bolt',
-    ]);
-
-    /** P0 位移包：先只放这一族，便于单独验证。 */
-    const GRAVITY_PACK = Object.freeze([
-      'gravity_well',
-      'shockwave',
-      'vortex',
-      'rule_pin',
-      'rule_wall_slam',
-    ]);
-
-    /** 灼烧包的抽卡池：已拥有铁弹 + 三件套时，从这 8 张里出三选一。 */
-    const FIRE_PACK = Object.freeze([
-      'orb_fire',
-      'field_fire',
-      'summon_fire',
-      'self_fire',
-      'rule_boom',
-      'rule_combo',
-      'rule_execute',
-      'rule_anchor',
-    ]);
-
-    /** 实验包：灼烧包 + P0–P5 全部新机制，进游戏用的唯一入口。 */
-    const LAB_PACK = Object.freeze([
-      ...FIRE_PACK,
-      ...GRAVITY_PACK,
-      ...MARK_PACK,
-      ...SUMMON_PACK,
-      ...TIME_PACK,
-      ...RISK_PACK,
-      ...ENV_PACK,
-    ]);
-
-    /** 灼烧包的开局 build（模拟器与单测用）。 */
-    const FIRE_BUILD = Object.freeze(['orb_phys', 'orb_fire', 'field_fire', 'summon_fire']);
-
-    // ---- 核心卡（跨包、跨轮，永久槽）----
-    // 与普通卡不同：核心不占抽卡槽，进战斗时直接挂上，改变的是"规则"。
-
-    const CORE_CARDS = Object.freeze({
-      core_anchor: Object.freeze({
-        id: 'core_anchor',
-        name: '时锚',
-        carrier: 'core',
-        effect: 'control',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['core', 'control']),
-        desc: '开局 3 秒内刷出的敌人被冻结 3 秒',
-      }),
-      core_ember: Object.freeze({
-        id: 'core_ember',
-        name: '余烬之种',
-        carrier: 'core',
-        effect: 'fire',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['core', 'fire']),
-        desc: '灼烧上限 +2；灼烧目标死亡时传给 3 个敌人',
-      }),
-      core_echo: Object.freeze({
-        id: 'core_echo',
-        name: '回响',
-        carrier: 'core',
-        effect: 'time',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['core', 'cooldown']),
-        desc: '每击杀 8 个敌人，立刻刷新所有冷却',
-      }),
-      core_siphon: Object.freeze({
-        id: 'core_siphon',
-        name: '汲取',
-        carrier: 'core',
-        effect: 'life',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['core', 'heal']),
-        desc: '每次击杀回复 1 格生命',
-      }),
-      core_hunter: Object.freeze({
-        id: 'core_hunter',
-        name: '猎手',
-        carrier: 'core',
-        effect: 'mind',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['core', 'target']),
-        desc: '优先攻击当前格数最低的敌人',
-      }),
-      core_pierce: Object.freeze({
-        id: 'core_pierce',
-        name: '磁力',
-        carrier: 'core',
-        effect: 'phys',
-        cells: 0,
-        cd: 0,
-        burn: 0,
-        aoe: 0,
-        tags: Object.freeze(['core', 'pierce']),
-        desc: '弹丸命中后额外穿透 1 个目标',
-      }),
-    });
-
-    /** 解锁条件是行为式的；stats 由客户端累计。 */
-    const CORES = Object.freeze([
-      Object.freeze({
-        id: 'core_anchor',
-        cond: (s) => s.bestFloor >= 2,
-        condText: '到达第 2 层',
-      }),
-      Object.freeze({
-        id: 'core_pierce',
-        cond: (s) => s.drafts >= 2,
-        condText: '累计抽到 2 张卡',
-      }),
-      Object.freeze({
-        id: 'core_siphon',
-        cond: (s) => s.kills >= 50,
-        condText: '累计击杀 50',
-      }),
-      Object.freeze({
-        id: 'core_ember',
-        cond: (s) => s.bestFloor >= 5,
-        condText: '到达第 5 层',
-      }),
-      Object.freeze({
-        id: 'core_echo',
-        cond: (s) => s.maxFloorKills >= 12,
-        condText: '单层击杀 12',
-      }),
-      Object.freeze({
-        id: 'core_hunter',
-        cond: (s) => s.bestFloor >= 6,
-        condText: '到达第 6 层',
-      }),
-    ]);
-
-    function unlockedCores(stats) {
-      return CORES.filter((core) => core.cond(stats)).map((core) => core.id);
+    /** 只取第一个技能计划，供 UI 空槽提示与测试使用。 */
+    function firstPlan(plans) {
+      return Array.isArray(plans) && plans.length > 0 ? plans[0] : null;
     }
 
-    function cardsById(ids) {
-      return ids.map((id) => {
-        const card = cardById(id);
-        if (card === undefined) throw new Error(`unknown card: ${id}`);
-        return card;
+    /**
+     * 存档修复：移除已删除的组件，清空不兼容的槽位，丢弃非法备用栏条目。
+     * 返回被移除的 ID，供 UI 显示"存档已修复"提示。
+     */
+    function pruneBuild(input) {
+      const build = normalizeBuild(input);
+      const removed = [];
+      const skills = [];
+      const usedIds = new Set();
+      for (const raw of build.skills) {
+        if (skills.length >= BUILD_LIMITS.maxSkills) {
+          removed.push(raw.action ?? raw.id);
+          continue;
+        }
+        const action = contentById(raw.action);
+        if (action === undefined || action.kind !== 'action') {
+          if (raw.action !== null) removed.push(raw.action);
+          continue;
+        }
+        let skillId = raw.id;
+        if (usedIds.has(skillId)) {
+          let number = skills.length + 1;
+          while (usedIds.has(`skill-${number}`)) number += 1;
+          skillId = `skill-${number}`;
+          removed.push(raw.id);
+        }
+        usedIds.add(skillId);
+        const caps = new Set(action.capabilities);
+        const skill = { id: skillId, action: raw.action, element: null, modifier: null };
+        if (raw.element !== null) {
+          const def = contentById(raw.element);
+          if (def !== undefined && def.kind === 'element' && def.requires.every((cap) => caps.has(cap))) {
+            skill.element = raw.element;
+          } else {
+            removed.push(raw.element);
+          }
+        }
+        if (raw.modifier !== null) {
+          const def = contentById(raw.modifier);
+          if (def !== undefined && def.kind === 'modifier' && def.requires.every((cap) => caps.has(cap))) {
+            skill.modifier = raw.modifier;
+          } else {
+            removed.push(raw.modifier);
+          }
+        }
+        skills.push(skill);
+      }
+      const reserve = [];
+      for (const id of build.reserve) {
+        if (contentById(id) === undefined) removed.push(id);
+        else reserve.push(id);
+      }
+      const next = skills.length > 0 ? skills : emptyBuild().skills;
+      return { build: { version: BUILD_VERSION, skills: next, reserve }, removed };
+    }
+
+    /** 内容目录里所有可选 ID，按类别；UI 只读。 */
+    function contentCatalog() {
+      return CONTENT.order;
+    }
+
+    // ---- skills/status.js ----
+    // 状态实例：层数、到期时间、周期跳动与来源。
+    //
+    // 定义（上限/时长/跳动）在 content/statuses.js；这里只处理实例状态。
+    // 重复施加策略固定为"加层并刷新整体持续时间"，由定义声明，不隐式继承。
+
+    function createStatuses() {
+      return {};
+    }
+
+    function statusDef(id) {
+      const def = contentById(id);
+      if (def === undefined || def.kind !== 'status') {
+        throw new Error(`unknown status: ${String(id)}`);
+      }
+      return def;
+    }
+
+    function getStatusInstance(entity, id) {
+      if (entity === null || entity === undefined || entity.statuses === undefined) return null;
+      return entity.statuses[id] ?? null;
+    }
+
+    function stacksOf(entity, id) {
+      const instance = getStatusInstance(entity, id);
+      return instance === null ? 0 : instance.stacks;
+    }
+
+    function ensureStatuses(entity) {
+      if (entity.statuses === undefined || entity.statuses === null) entity.statuses = createStatuses();
+      return entity.statuses;
+    }
+
+    /**
+     * 施加状态。返回 {before, after, applied, refreshed}。
+     * 来源放在实例上，周期伤害与传火都能继承技能归因。
+     */
+    function applyStatus(entity, id, stacks, meta = {}) {
+      const def = statusDef(id);
+      const table = ensureStatuses(entity);
+      let instance = table[id];
+      const before = instance === undefined ? 0 : instance.stacks;
+      if (stacks <= 0) {
+        return { def, before, after: before, applied: 0, refreshed: instance !== undefined };
+      }
+      if (instance === undefined) {
+        instance = {
+          id,
+          stacks: 0,
+          remaining: def.duration,
+          tickTimer: def.tickSeconds ?? 0,
+          source: { ...meta },
+        };
+        table[id] = instance;
+      }
+      const after = Math.min(def.cap, before + stacks);
+      instance.stacks = after;
+      instance.remaining = def.duration;
+      instance.source = { ...meta };
+      if (before === 0) instance.tickTimer = def.tickSeconds ?? 0;
+      return { def, before, after, applied: after - before, refreshed: true };
+    }
+
+    /** 消耗层数（反应使用），返回实际消耗量。 */
+    function consumeStatus(entity, id, stacks = Infinity) {
+      const instance = getStatusInstance(entity, id);
+      if (instance === null) return 0;
+      const consumed = Math.min(instance.stacks, Math.max(0, stacks));
+      instance.stacks -= consumed;
+      if (instance.stacks <= 0) delete entity.statuses[id];
+      return consumed;
+    }
+
+    function removeStatus(entity, id) {
+      if (entity.statuses === undefined) return;
+      delete entity.statuses[id];
+    }
+
+    function statusSnapshot(entity) {
+      return {
+        burn: stacksOf(entity, 'burn'),
+        chill: stacksOf(entity, 'chill'),
+        charge: stacksOf(entity, 'charge'),
+      };
+    }
+
+    /** 寒冷降低移动速度；每层数值来自状态定义。 */
+    function slowFactor(entity) {
+      const instance = getStatusInstance(entity, 'chill');
+      if (instance === null) return 1;
+      const def = statusDef('chill');
+      return 1 - Math.min(def.maxSlow ?? 0.4, instance.stacks * (def.slowPerStack ?? 0));
+    }
+
+    /**
+     * 推进所有实体的状态计时，返回这一帧的周期伤害。
+     * 周期伤害只产生命令，不在这里直接改生命。
+     */
+    function tickStatuses(world, dt) {
+      const ticks = [];
+      const entities = world.enemies;
+      if (!Array.isArray(entities)) return ticks;
+      for (const entity of entities) {
+        if (entity.cells <= 0 || entity.statuses === undefined) continue;
+        for (const [id, instance] of Object.entries(entity.statuses)) {
+          const def = statusDef(id);
+          instance.remaining -= dt;
+          if (instance.remaining <= 0) {
+            delete entity.statuses[id];
+            continue;
+          }
+          if (def.tickSeconds === undefined) continue;
+          instance.tickTimer -= dt;
+          let guard = 0;
+          while (instance.tickTimer <= 0 && guard < RUNTIME_LIMITS.maxTicksPerStep) {
+            instance.tickTimer += def.tickSeconds;
+            guard += 1;
+            const damage = instance.stacks * (def.damagePerStack ?? 0);
+            if (damage <= 0) continue;
+            ticks.push({
+              targetId: entity.id,
+              statusId: id,
+              stacks: instance.stacks,
+              damage,
+              sourceEntityId: instance.source?.sourceEntityId ?? null,
+              skillInstanceId: instance.source?.skillInstanceId ?? null,
+              element: instance.source?.element ?? null,
+              rootEventId: instance.source?.rootEventId ?? null,
+            });
+          }
+        }
+      }
+      return ticks;
+    }
+
+    // ---- skills/reactions.js ----
+    // 共享反应：读取语义事件快照，只提交命令，不直接结算。
+    //
+    // 反应按显式优先级、再按稳定 ID 排序；同一事件对同一反应至多触发一次。
+    // 每个处理器必须返回终止理由明确的命令，例如传火后的灼烧带 canSpread=false。
+
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+    function aliveEnemies(world) {
+      return world.enemies.filter((enemy) => enemy.cells > 0);
+    }
+
+    function nearby(world, from, radius, count, excludeId = -1) {
+      return aliveEnemies(world)
+        .filter((enemy) => enemy.id !== excludeId)
+        .map((enemy) => ({ enemy, d: dist(from, enemy) }))
+        .filter((entry) => entry.d <= radius)
+        .sort((a, b) => a.d - b.d || a.enemy.id - b.enemy.id)
+        .slice(0, count)
+        .map((entry) => entry.enemy);
+    }
+
+    function spreadFire(world, event, def) {
+      if (event.burnStacks <= 0) return null;
+      if ((event.burnSpreadDepth ?? 0) >= def.config.maxChain) return null;
+      const targets = nearby(world, event, def.config.radius, def.config.targets, event.targetId);
+      if (targets.length === 0) return null;
+      const stacks = Math.max(
+        def.config.minStacks,
+        Math.min(def.config.maxStacks, Math.floor(event.burnStacks * def.config.transferRatio)),
+      );
+      const commands = targets.map((target) => ({
+        type: 'applyStatus',
+        targetId: target.id,
+        sourceEntityId: event.targetId,
+        skillInstanceId: event.burnSkillInstanceId ?? event.skillInstanceId ?? null,
+        tags: ['reaction', 'spreadFire', 'fire'],
+        payload: {
+          status: 'burn',
+          stacks,
+          meta: {
+            sourceEntityId: event.targetId,
+            skillInstanceId: event.burnSkillInstanceId ?? event.skillInstanceId ?? null,
+            element: 'fire',
+            rootEventId: event.rootEventId ?? null,
+            canSpread: true,
+            spreadDepth: (event.burnSpreadDepth ?? 0) + 1,
+          },
+        },
+      }));
+      return { commands, triggered: { id: def.id, x: event.x, y: event.y } };
+    }
+
+    function conductive(world, event, def) {
+      if (event.type !== 'hitResolved') return null;
+      if (!event.tags.includes('thunder') || event.tags.includes('noConductive')) return null;
+      if ((event.beforeCharge ?? 0) < 1) return null;
+      const target = world.enemies.find((enemy) => enemy.id === event.targetId);
+      if (target === undefined || target.deathHandled) return null;
+      if (stacksOf(target, 'charge') <= 0) return null;
+      consumeStatus(target, 'charge', def.config.consume);
+      const targets = nearby(world, target, def.config.radius, def.config.targets, target.id);
+      if (targets.length === 0) {
+        return { commands: [], triggered: { id: def.id, x: target.x, y: target.y } };
+      }
+      const commands = targets.map((other) => ({
+        type: 'hit',
+        targetId: other.id,
+        sourceEntityId: target.id,
+        skillInstanceId: event.skillInstanceId ?? null,
+        tags: ['reaction', 'conductive', 'lightning', 'thunder', 'noConductive', 'noCharge'],
+        payload: {
+          damage: def.config.damage,
+          damageScale: 1,
+          element: null,
+          heavy: false,
+          sourceTag: 'reaction:conductive',
+        },
+      }));
+      return { commands, triggered: { id: def.id, x: target.x, y: target.y } };
+    }
+
+    function shatter(world, event, def) {
+      if (event.type !== 'hitResolved') return null;
+      if (!event.tags.includes('heavy') || event.tags.includes('noShatter')) return null;
+      const target = world.enemies.find((enemy) => enemy.id === event.targetId);
+      if (target === undefined || target.deathHandled) return null;
+      if (stacksOf(target, def.config.status) < def.config.threshold) return null;
+      consumeStatus(target, def.config.status, Infinity);
+      const targets = nearby(world, target, def.config.radius, def.config.targets);
+      const commands = targets.map((other) => ({
+        type: 'hit',
+        targetId: other.id,
+        sourceEntityId: target.id,
+        skillInstanceId: event.skillInstanceId ?? null,
+        tags: ['reaction', 'shatter', 'frost', 'noShatter'],
+        payload: {
+          damage: def.config.damage,
+          damageScale: 1,
+          element: null,
+          heavy: false,
+          sourceTag: 'reaction:shatter',
+        },
+      }));
+      return { commands, triggered: { id: def.id, x: target.x, y: target.y } };
+    }
+
+    const REACTION_IMPL = Object.freeze({ spreadFire, conductive, shatter });
+
+    /**
+     * 评估一个语义事件。
+     * @returns {{commands:Array, triggered:Array<{id:string,x:number,y:number}>}}
+     */
+    function evaluateReactions(world, event) {
+      const commands = [];
+      const triggered = [];
+      if (event === null || event === undefined) return { commands, triggered };
+      const list = contentList('reaction')
+        .filter((def) => def.event === event.type)
+        .sort((a, b) => a.priority - b.priority || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      for (const def of list) {
+        if (event.firedReactions !== undefined && event.firedReactions.has(def.id)) continue;
+        const handler = REACTION_IMPL[def.handler];
+        if (handler === undefined) continue;
+        const result = handler(world, event, def);
+        if (result === null) continue;
+        if (event.firedReactions === undefined) event.firedReactions = new Set();
+        event.firedReactions.add(def.id);
+        for (const command of result.commands) commands.push({ ...command, reactionId: def.id });
+        if (result.triggered !== undefined) triggered.push(result.triggered);
+      }
+      return { commands, triggered };
+    }
+
+    // ---- skills/resolve.js ----
+    // 命中结算与命令队列。
+    //
+    // 结算顺序（docs/skill-architecture.md）：
+    //   1. 校验来源与目标仍有效，记录命中快照
+    //   2. 应用基础伤害，生命归零只标记，不立刻移除
+    //   3. 应用属性效果与修饰命令，检查共享反应
+    //   4. 死亡统一在命令队列处理完后结算，读取死亡时状态快照
+    //   5. 后续命令按 FIFO 入队处理，不递归调用结算器
+    //
+    // 每个命令携带 eventId / rootEventId / depth，派生命令继承根事件与技能归因。
+    // 深度与每根事件命令数都有上限，超限写入诊断，不静默随机丢弃。
+
+    const DEFAULT_BOUNDS = Object.freeze({ w: 160, h: 144 });
+
+    function boundsOf(world) {
+      return world.bounds ?? DEFAULT_BOUNDS;
+    }
+
+    function ensureResolutionState(world) {
+      if (!Array.isArray(world.commands)) world.commands = [];
+      if (!Array.isArray(world.delayed)) world.delayed = [];
+      if (!(world.rootBudget instanceof Map)) world.rootBudget = new Map();
+      if (!(world.splitCasts instanceof Set)) world.splitCasts = new Set();
+      if (!(world.echoCasts instanceof Set)) world.echoCasts = new Set();
+      if (!Array.isArray(world.diagnostics)) world.diagnostics = [];
+      if (typeof world.nextEventId !== 'number') world.nextEventId = 1;
+      if (!world.stats) world.stats = { damage: {}, bySkill: {}, reactions: {}, kills: 0 };
+      if (!world.stats.damage) world.stats.damage = {};
+      if (!world.stats.bySkill) world.stats.bySkill = {};
+      if (!world.stats.reactions) world.stats.reactions = {};
+      if (!world.stats.casts) world.stats.casts = {};
+      if (!world.stats.modifiers) world.stats.modifiers = {};
+      if (typeof world.stats.overflow !== 'number') world.stats.overflow = 0;
+      if (!Array.isArray(world.events)) world.events = [];
+    }
+
+    function diagnose(world, code, detail) {
+      if (!Array.isArray(world.diagnostics)) world.diagnostics = [];
+      if (world.diagnostics.length >= 64) return;
+      world.diagnostics.push({ code, t: world.time ?? 0, ...detail });
+    }
+
+    function reactionStat(world, id) {
+      if (world.stats.reactions[id] === undefined) world.stats.reactions[id] = { count: 0, damage: 0 };
+      return world.stats.reactions[id];
+    }
+
+    /** 入队一个命令；派生命令由调用方填写 rootEventId 与 depth。 */
+    function enqueue(world, partial) {
+      ensureResolutionState(world);
+      const depth = partial.depth ?? 0;
+      if (depth > RUNTIME_LIMITS.maxCommandDepth) {
+        diagnose(world, 'command-depth', { depth, type: partial.type });
+        return false;
+      }
+      const eventId = world.nextEventId;
+      world.nextEventId += 1;
+      const rootEventId = partial.rootEventId ?? eventId;
+      const used = world.rootBudget.get(rootEventId) ?? 0;
+      if (used >= RUNTIME_LIMITS.maxCommandsPerRoot) {
+        diagnose(world, 'command-budget', { rootEventId, type: partial.type });
+        return false;
+      }
+      world.rootBudget.set(rootEventId, used + 1);
+      world.commands.push({
+        eventId,
+        rootEventId,
+        depth,
+        type: partial.type,
+        targetId: partial.targetId ?? null,
+        sourceEntityId: partial.sourceEntityId ?? null,
+        skillInstanceId: partial.skillInstanceId ?? null,
+        reactionId: partial.reactionId ?? null,
+        tags: Array.isArray(partial.tags) ? [...partial.tags] : [],
+        payload: partial.payload ?? {},
+      });
+      return true;
+    }
+
+    function enqueueReactionCommands(world, parent, result) {
+      for (const command of result.commands) {
+        enqueue(world, {
+          ...command,
+          rootEventId: parent.rootEventId,
+          depth: parent.depth + 1,
+        });
+      }
+      for (const marker of result.triggered) {
+        const stat = reactionStat(world, marker.id);
+        stat.count += 1;
+        world.events.push({ type: 'reaction', id: marker.id, x: marker.x, y: marker.y });
+      }
+    }
+
+    function findEnemy(world, id) {
+      if (id === null || id === undefined) return undefined;
+      return world.enemies.find((enemy) => enemy.id === id);
+    }
+
+    function recordDamage(world, command, amount) {
+      if (!(amount > 0)) return;
+      const key = command.skillInstanceId ?? command.payload.sourceTag ?? 'other';
+      world.stats.damage[key] = (world.stats.damage[key] ?? 0) + amount;
+      if (command.skillInstanceId !== null && command.skillInstanceId !== undefined) {
+        world.stats.bySkill[command.skillInstanceId] =
+          (world.stats.bySkill[command.skillInstanceId] ?? 0) + amount;
+      }
+      if (command.reactionId !== null && command.reactionId !== undefined) {
+        reactionStat(world, command.reactionId).damage += amount;
+      }
+    }
+
+    function applyDamage(world, enemy, amount, command) {
+      if (!(amount > 0)) return 0;
+      const before = Math.max(0, enemy.cells);
+      const effective = Math.min(before, amount);
+      const overflow = amount - effective;
+      enemy.cells -= amount;
+      enemy.flash = 0.12;
+      world.stats.overflow = (world.stats.overflow ?? 0) + overflow;
+      recordDamage(world, command, effective);
+      return effective;
+    }
+
+    function targetsInRadius(world, center, radius, count, excludeId = -1) {
+      return world.enemies
+        .filter((enemy) => enemy.cells > 0 && !enemy.dead && enemy.id !== excludeId)
+        .map((enemy) => ({ enemy, d: Math.hypot(enemy.x - center.x, enemy.y - center.y) }))
+        .filter((entry) => entry.d <= radius + entry.enemy.r)
+        .sort((a, b) => a.d - b.d || a.enemy.id - b.enemy.id)
+        .slice(0, count)
+        .map((entry) => entry.enemy);
+    }
+
+    function scheduleDelayed(world, command) {
+      ensureResolutionState(world);
+      if (!Array.isArray(world.delayedSeq)) world.delayedSeq = 0;
+      world.delayedSeq += 1;
+      world.delayed.push({ due: world.time + command.delay, seq: world.delayedSeq, command });
+    }
+
+    /** 把到期的延迟命令移进队列；echo 在这里真正入队。 */
+    function advanceDelayed(world) {
+      ensureResolutionState(world);
+      if (world.delayed.length === 0) return 0;
+      const due = [];
+      const keep = [];
+      for (const item of world.delayed) {
+        if (item.due <= world.time) due.push(item);
+        else keep.push(item);
+      }
+      world.delayed = keep;
+      due.sort((a, b) => a.due - b.due || a.seq - b.seq);
+      for (const item of due) enqueue(world, item.command);
+      return due.length;
+    }
+
+    function executeHit(world, command) {
+      const target = findEnemy(world, command.targetId);
+      if (target === undefined || target.dead || target.cells <= 0) return;
+      const payload = command.payload;
+      const element = payload.element === null || payload.element === undefined
+        ? null
+        : contentById(payload.element);
+      const beforeCharge = stacksOf(target, 'charge');
+      const damage = (payload.damage ?? 0) * (payload.damageScale ?? 1);
+      const dealt = applyDamage(world, target, damage, command);
+
+      // 死亡目标仍完成本次状态施加：先结算效果，再标记待死亡。
+      if (element !== null) {
+        for (const effect of element.onHit) {
+          if (effect.type !== 'applyStatus') continue;
+          const result = applyStatus(target, effect.status, effect.stacks, {
+            sourceEntityId: command.sourceEntityId,
+            skillInstanceId: command.skillInstanceId,
+            element: element.id,
+            rootEventId: command.rootEventId,
+            canSpread: true,
+          });
+          world.events.push({
+            type: 'status',
+            status: effect.status,
+            x: target.x,
+            y: target.y,
+            stacks: result.after,
+            applied: result.applied,
+            element: element.id,
+          });
+          const applied = evaluateReactions(world, {
+            type: 'statusApplied',
+            targetId: target.id,
+            statusId: effect.status,
+            stacks: result.after,
+            applied: result.applied,
+            eventId: command.eventId,
+            rootEventId: command.rootEventId,
+            skillInstanceId: command.skillInstanceId,
+          });
+          enqueueReactionCommands(world, command, applied);
+        }
+      }
+
+      world.events.push({
+        type: 'hit',
+        x: target.x,
+        y: target.y,
+        cells: dealt,
+        element: element === null ? null : element.id,
+        skillId: command.skillInstanceId,
+        depth: command.depth,
+        reaction: command.reactionId,
+      });
+
+      const reactions = evaluateReactions(world, {
+        type: 'hitResolved',
+        targetId: target.id,
+        tags: command.tags,
+        element: element === null ? null : element.id,
+        beforeCharge,
+        eventId: command.eventId,
+        rootEventId: command.rootEventId,
+        skillInstanceId: command.skillInstanceId,
+      });
+      enqueueReactionCommands(world, command, reactions);
+
+      applyModifier(world, command, target, payload);
+
+      if (target.cells <= 0) target.dead = true;
+    }
+
+    function applyModifier(world, command, target, payload) {
+      const raw = payload.modifier;
+      if (raw === null || raw === undefined) return;
+      // 兼容旧命令/测试里直接传入 transform 的写法；新计划统一传修饰定义。
+      const modifier = raw.transform !== undefined ? raw : { id: raw.type, transform: raw };
+      if (modifier.transform === undefined) return;
+      const context = {
+        world,
+        command,
+        target,
+        payload,
+        transform: modifier.transform,
+        enqueue: (partial) =>
+          enqueue(world, {
+            ...partial,
+            rootEventId: command.rootEventId,
+            depth: command.depth + 1,
+          }),
+        scheduleLater: (delay, later) =>
+          scheduleDelayed(world, {
+            delay,
+            command: {
+              ...later,
+              rootEventId: command.rootEventId,
+              depth: command.depth + 1,
+            },
+          }),
+        queryTargets: (center, radius, count, excludeId) =>
+          targetsInRadius(world, center, radius, count, excludeId),
+        countStatuses: (target) =>
+          Object.values(target.statuses ?? {}).reduce((sum, instance) => sum + instance.stacks, 0),
+        consumeStatuses: (target) => {
+          let total = 0;
+          for (const id of Object.keys(target.statuses ?? {})) {
+            total += consumeStatus(target, id, Infinity);
+          }
+          return total;
+        },
+        emitVisual: (event) => world.events.push(event),
+        once: (setName, key) => {
+          if (!(world[setName] instanceof Set)) world[setName] = new Set();
+          if (world[setName].has(key)) return false;
+          world[setName].add(key);
+          return true;
+        },
+      };
+      applyModifierOnHit(modifier, context);
+    }
+
+    function executeAreaHit(world, command) {
+      const payload = command.payload;
+      const center = { x: payload.centerX ?? 0, y: payload.centerY ?? 0 };
+      const targets = targetsInRadius(world, center, payload.radius ?? 0, payload.maxTargets ?? 8);
+      targets.forEach((target, index) => {
+        enqueue(world, {
+          type: 'hit',
+          targetId: target.id,
+          sourceEntityId: command.sourceEntityId,
+          skillInstanceId: command.skillInstanceId,
+          rootEventId: command.rootEventId,
+          depth: command.depth + 1,
+          tags: index === 0 ? [...command.tags, 'primary'] : command.tags,
+          payload: { ...payload, centerX: center.x, centerY: center.y },
+        });
       });
     }
 
-    function cardById(id) {
-      return CARDS[id] ?? CORE_CARDS[id];
+    function executeStatusDamage(world, command) {
+      const target = findEnemy(world, command.targetId);
+      if (target === undefined || target.dead || target.cells <= 0) return;
+      const dealt = applyDamage(world, target, command.payload.damage ?? 0, command);
+      world.events.push({
+        type: 'burn',
+        status: command.payload.statusId,
+        x: target.x,
+        y: target.y,
+        cells: dealt,
+      });
+      if (target.cells <= 0) target.dead = true;
+    }
+
+    function executeApplyStatus(world, command) {
+      const target = findEnemy(world, command.targetId);
+      if (target === undefined || target.dead || target.cells <= 0) return;
+      const payload = command.payload;
+      const result = applyStatus(target, payload.status, payload.stacks, {
+        ...(payload.meta ?? {}),
+        rootEventId: command.rootEventId,
+        canSpread: payload.meta?.canSpread ?? true,
+      });
+      world.events.push({
+        type: 'status',
+        status: payload.status,
+        x: target.x,
+        y: target.y,
+        stacks: result.after,
+        applied: result.applied,
+        reaction: command.reactionId,
+      });
+      const reactions = evaluateReactions(world, {
+        type: 'statusApplied',
+        targetId: target.id,
+        statusId: payload.status,
+        stacks: result.after,
+        applied: result.applied,
+        eventId: command.eventId,
+        rootEventId: command.rootEventId,
+        skillInstanceId: command.skillInstanceId,
+      });
+      enqueueReactionCommands(world, command, reactions);
+    }
+
+    function executeMove(world, command) {
+      const target = findEnemy(world, command.targetId);
+      if (target === undefined || target.dead || target.cells <= 0) return;
+      const payload = command.payload;
+      const dx = payload.centerX - target.x;
+      const dy = payload.centerY - target.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 0.001) return;
+      const step = Math.min(d, payload.strength ?? 0);
+      const bounds = boundsOf(world);
+      target.x = Math.max(target.r, Math.min(bounds.w - target.r, target.x + (dx / d) * step));
+      target.y = Math.max(target.r, Math.min(bounds.h - target.r, target.y + (dy / d) * step));
+      world.events.push({ type: 'pull', x: target.x, y: target.y });
+    }
+
+    function executeCommand(world, command) {
+      switch (command.type) {
+        case 'hit':
+          executeHit(world, command);
+          break;
+        case 'areaHit':
+          executeAreaHit(world, command);
+          break;
+        case 'statusDamage':
+          executeStatusDamage(world, command);
+          break;
+        case 'applyStatus':
+          executeApplyStatus(world, command);
+          break;
+        case 'move':
+          executeMove(world, command);
+          break;
+        default:
+          diagnose(world, 'unknown-command', { type: String(command.type) });
+          break;
+      }
+    }
+
+    /** FIFO 处理当前队列。返回处理数量；超预算时清空并留下诊断。 */
+    function processCommands(world) {
+      ensureResolutionState(world);
+      let processed = 0;
+      while (world.commands.length > 0) {
+        if (processed >= RUNTIME_LIMITS.maxCommandsPerStep) {
+          diagnose(world, 'step-budget', { pending: world.commands.length, processed });
+          world.commands.length = 0;
+          break;
+        }
+        const command = world.commands.shift();
+        processed += 1;
+        executeCommand(world, command);
+      }
+      return processed;
+    }
+
+    /** 死亡时读取状态快照并提交反应命令；由战斗层在移除实体前调用。 */
+    function queueDeathReactions(world, enemy) {
+      ensureResolutionState(world);
+      const burn = getStatusInstance(enemy, 'burn');
+      const event = {
+        type: 'entityDied',
+        targetId: enemy.id,
+        x: enemy.x,
+        y: enemy.y,
+        burnStacks: burn === null ? 0 : burn.stacks,
+        burnCanSpread: true,
+        burnSpreadDepth: burn === null ? 0 : burn.source?.spreadDepth ?? 0,
+        burnSkillInstanceId: burn === null ? null : burn.source?.skillInstanceId ?? null,
+        rootEventId: burn === null ? null : burn.source?.rootEventId ?? null,
+        skillInstanceId: burn === null ? null : burn.source?.skillInstanceId ?? null,
+        eventId: world.nextEventId,
+      };
+      world.nextEventId += 1;
+      const result = evaluateReactions(world, event);
+      const parent = {
+        rootEventId: event.eventId,
+        depth: 0,
+        skillInstanceId: event.skillInstanceId,
+      };
+      enqueueReactionCommands(world, parent, result);
+      return result;
+    }
+
+    // ---- skills/world.js ----
+    // 战斗世界接口：动作与实体处理器只通过这里查询目标、创建实体、提交命中。
+    //
+    // 处理器不直接改敌人生命、状态或其他技能，也不读取 registry 的具体内容。
+    // 这样属性、反应、伤害归因继续由公共结算处理。
+
+    const ENTITY_LIMITS = Object.freeze({
+      projectile: RUNTIME_LIMITS.maxProjectiles,
+      orbitSword: RUNTIME_LIMITS.maxOrbitSwords,
+      trap: RUNTIME_LIMITS.maxTraps,
+      piercingSword: RUNTIME_LIMITS.maxSwordPieces,
+      swordArray: RUNTIME_LIMITS.maxSwordArrays,
+    });
+
+    function livingEnemies(world) {
+      return world.enemies.filter((enemy) => enemy.cells > 0 && !enemy.dead && !enemy.deathHandled);
+    }
+
+    function enemiesInRadius(world, center, radius, count, excludeId = -1) {
+      return livingEnemies(world)
+        .filter((enemy) => enemy.id !== excludeId)
+        .map((enemy) => ({ enemy, d: Math.hypot(enemy.x - center.x, enemy.y - center.y) }))
+        .filter((entry) => entry.d <= radius + entry.enemy.r)
+        .sort((a, b) => a.d - b.d || a.enemy.id - b.enemy.id)
+        .slice(0, count)
+        .map((entry) => entry.enemy);
+    }
+
+    function nearestEnemy(world, from, range, excludeId = -1) {
+      let best = null;
+      let bestD = range;
+      for (const enemy of livingEnemies(world)) {
+        if (enemy.id === excludeId) continue;
+        const d = Math.hypot(enemy.x - from.x, enemy.y - from.y) - enemy.r;
+        if (d < bestD) {
+          best = enemy;
+          bestD = d;
+        }
+      }
+      return best;
+    }
+
+    function countEntities(world, kind) {
+      if (!Array.isArray(world.entities)) return 0;
+      return world.entities.filter((entity) => entity.kind === kind && !entity.dead).length;
+    }
+
+    function spawnEntity(world, spec) {
+      ensureResolutionState(world);
+      if (!Array.isArray(world.entities)) world.entities = [];
+      const limit = ENTITY_LIMITS[spec.kind] ?? RUNTIME_LIMITS.maxEntities;
+      const activeCount = world.entities.filter((entity) => !entity.dead).length;
+      if (activeCount >= RUNTIME_LIMITS.maxEntities || countEntities(world, spec.kind) >= limit) {
+        diagnose(world, 'entity-limit', { kind: spec.kind, limit });
+        return null;
+      }
+      const entity = {
+        ownerId: world.player.id,
+        bornAt: world.time,
+        dead: false,
+        ...spec,
+        id: world.nextId++,
+      };
+      world.entities.push(entity);
+      return entity;
+    }
+
+    function removeEntity(world, entity) {
+      entity.dead = true;
+    }
+
+    /**
+     * 提交一次统一命中。payload 字段与 resolve.js 的共享契约一致；
+     * 属性、强力标签和修饰都由这里统一带入，处理器不自己拼状态。
+     */
+    function enqueueHit(world, plan, opts) {
+      ensureResolutionState(world);
+      const tags = [...plan.tags];
+      if (plan.heavy) tags.push('heavy');
+      for (const tag of opts.extraTags ?? []) {
+        if (!tags.includes(tag)) tags.push(tag);
+      }
+      tags.push(opts.primary === false ? 'secondary' : 'primary');
+      enqueue(world, {
+        type: 'hit',
+        targetId: opts.targetId,
+        sourceEntityId: opts.sourceEntityId ?? world.player.id,
+        skillInstanceId: plan.id,
+        tags,
+        payload: {
+          damage: plan.damage,
+          damageScale: opts.damageScale ?? 1,
+          element: plan.element === null ? null : plan.element.id,
+          heavy: plan.heavy,
+          modifier: plan.modifier,
+          modifierTransform: plan.transform,
+          castId: opts.castId ?? null,
+          action: plan.action.handler,
+          centerX: opts.center?.x ?? 0,
+          centerY: opts.center?.y ?? 0,
+          radius: plan.radius,
+          maxTargets: plan.maxTargets,
+        },
+      });
+    }
+
+    function emitVisual(world, event) {
+      ensureResolutionState(world);
+      world.events.push(event);
+    }
+
+    /** 动作和实体共享的基础上下文；具体处理器再附加 plan / entity。 */
+    function createWorldContext(world) {
+      return {
+        world,
+        get time() {
+          return world.time;
+        },
+        rng: world.rng,
+        queryTargets: (center, radius, count, excludeId) =>
+          enemiesInRadius(world, center, radius, count, excludeId),
+        queryNearest: (from, range, excludeId) => nearestEnemy(world, from, range, excludeId),
+        entityCount: (kind) => countEntities(world, kind),
+        spawnEntity: (spec) => spawnEntity(world, spec),
+        emitVisual: (event) => emitVisual(world, event),
+        scheduleLater: (delay, command) => scheduleDelayed(world, { delay, command }),
+        enqueue: (command) => enqueue(world, command),
+        bounds: ARENA,
+      };
+    }
+
+    function createActionContext(world, skill, plan, castId) {
+      const base = createWorldContext(world);
+      return {
+        ...base,
+        skill,
+        plan,
+        castId,
+        hit: (opts) =>
+          enqueueHit(world, plan, {
+            ...opts,
+            castId: opts.castId ?? castId,
+          }),
+      };
+    }
+
+    function createEntityContext(world, entity) {
+      const base = createWorldContext(world);
+      const plan = entity.plan;
+      return {
+        ...base,
+        entity,
+        plan,
+        castId: entity.castId,
+        hit: (opts) =>
+          enqueueHit(world, plan, {
+            ...opts,
+            sourceEntityId: entity.id,
+            castId: opts.castId ?? entity.castId,
+          }),
+      };
+    }
+
+    // ---- skills/entities/projectile.js ----
+    // 飞弹实体：追踪目标、推进、碰撞并提交统一命中。
+    // 计划快照在发射时固定；改装后的新施放使用新计划。
+
+    const projectileEntity = Object.freeze({
+      update(context, dt) {
+        const entity = context.entity;
+        const world = context.world;
+        const target = world.enemies.find(
+          (enemy) => enemy.id === entity.targetId && enemy.cells > 0 && !enemy.dead && !enemy.deathHandled,
+        );
+        if (target === undefined) {
+          entity.life -= dt;
+          if (entity.life <= 0) entity.dead = true;
+          return;
+        }
+        const dx = target.x - entity.x;
+        const dy = target.y - entity.y;
+        const distance = Math.hypot(dx, dy) || 1;
+        const travel = entity.speed * dt;
+        if (distance <= travel + entity.hitRadius + target.r) {
+          context.hit({
+            targetId: target.id,
+            center: { x: target.x, y: target.y },
+            extraTags: ['projectile'],
+          });
+          entity.dead = true;
+          return;
+        }
+        entity.x += (dx / distance) * travel;
+        entity.y += (dy / distance) * travel;
+        entity.life -= dt;
+        if (entity.life <= 0) entity.dead = true;
+      },
+    });
+
+    // ---- skills/entities/orbitSword.js ----
+    // 环绕飞剑实体：维护角度、半径、生命周期和逐目标命中间隔。
+    // 碰撞只提交统一命中，属性与反应仍走公共结算。
+
+    const orbitSwordEntity = Object.freeze({
+      update(context, dt) {
+        const entity = context.entity;
+        const world = context.world;
+        entity.life -= dt;
+        if (entity.life <= 0) {
+          if (entity.nextHit instanceof Map) entity.nextHit.clear();
+          entity.dead = true;
+          return;
+        }
+        if (!(entity.nextHit instanceof Map)) entity.nextHit = new Map();
+        entity.angle += entity.angularSpeed * dt;
+        entity.x = world.player.x + Math.cos(entity.angle) * entity.orbitRadius;
+        entity.y = world.player.y + Math.sin(entity.angle) * entity.orbitRadius;
+
+        const candidates = context.queryTargets(
+          entity,
+          entity.hitRadius,
+          Math.max(entity.maxTargets * 4, 8),
+        );
+        let hits = 0;
+        for (const enemy of candidates) {
+          if (hits >= entity.maxTargets) break;
+          const readyAt = entity.nextHit.get(enemy.id) ?? 0;
+          if (world.time < readyAt) continue;
+          context.hit({
+            targetId: enemy.id,
+            center: { x: entity.x, y: entity.y },
+            extraTags: ['orbit'],
+            primary: hits === 0,
+          });
+          entity.nextHit.set(enemy.id, world.time + entity.hitInterval);
+          hits += 1;
+        }
+
+        // 目标失效后清理命中记录，避免 Map 随波次无限增长。
+        const aliveIds = new Set(
+          world.enemies
+            .filter((enemy) => enemy.cells > 0 && !enemy.dead && !enemy.deathHandled)
+            .map((enemy) => enemy.id),
+        );
+        for (const id of entity.nextHit.keys()) {
+          if (!aliveIds.has(id)) entity.nextHit.delete(id);
+        }
+      },
+    });
+
+    // ---- skills/entities/piercingSword.js ----
+    // 穿透飞剑实体：直线飞行，沿途每个目标至多命中一次，达到命中数或射程后清理。
+
+    const piercingSwordEntity = Object.freeze({
+      update(context, dt) {
+        const entity = context.entity;
+        entity.life -= dt;
+        const travel = entity.speed * dt;
+        entity.traveled += travel;
+        entity.x += entity.dirX * travel;
+        entity.y += entity.dirY * travel;
+        if (entity.life <= 0 || entity.traveled > entity.range) {
+          entity.dead = true;
+          return;
+        }
+        if (!Array.isArray(entity.hitIds)) entity.hitIds = [];
+        const candidates = context.queryTargets(
+          entity,
+          entity.hitRadius,
+          Math.max(entity.maxHits * 4, 8),
+        );
+        for (const enemy of candidates) {
+          if (entity.hitIds.length >= entity.maxHits) break;
+          if (entity.hitIds.includes(enemy.id)) continue;
+          context.hit({
+            targetId: enemy.id,
+            center: { x: entity.x, y: entity.y },
+            extraTags: ['swordPierce', 'path'],
+            primary: entity.hitIds.length === 0,
+          });
+          entity.hitIds.push(enemy.id);
+        }
+        if (entity.hitIds.length >= entity.maxHits) entity.dead = true;
+      },
+    });
+
+    // ---- skills/entities/swordArray.js ----
+    // 剑阵实体：固定在目标位置，按间隔对范围内有限目标提交命中，到期清理。
+
+    const swordArrayEntity = Object.freeze({
+      update(context, dt) {
+        const entity = context.entity;
+        entity.life -= dt;
+        if (entity.life <= 0) {
+          entity.dead = true;
+          return;
+        }
+        entity.tickTimer -= dt;
+        if (entity.tickTimer > 0) return;
+        entity.tickTimer += entity.tickInterval;
+        const targets = context.queryTargets(entity, entity.radius, entity.maxTargets);
+        if (targets.length === 0) return;
+        context.emitVisual({
+          type: 'swordArrayPulse',
+          x: entity.x,
+          y: entity.y,
+          radius: entity.radius,
+          skillId: entity.plan.id,
+          color: entity.plan.element === null ? entity.plan.action.color : entity.plan.element.color,
+        });
+        targets.forEach((enemy, index) => {
+          context.hit({
+            targetId: enemy.id,
+            center: { x: entity.x, y: entity.y },
+            extraTags: ['swordArray', 'sustain'],
+            primary: index === 0,
+          });
+        });
+      },
+    });
+
+    // ---- skills/entities/trap.js ----
+    // 陷阱实体：等待敌人进入触发范围，触发后提交范围命中并销毁。
+    // 与飞剑不同，它不移动，也不自主选敌。
+
+    const trapEntity = Object.freeze({
+      update(context, dt) {
+        const entity = context.entity;
+        entity.life -= dt;
+        if (entity.life <= 0) {
+          entity.dead = true;
+          return;
+        }
+        if (context.time < entity.armedAt) return;
+        const trigger = context.queryTargets(entity, entity.triggerRadius, 1);
+        if (trigger.length === 0) return;
+        const targets = context.queryTargets(entity, entity.radius, entity.maxTargets);
+        context.emitVisual({
+          type: 'trapTrigger',
+          x: entity.x,
+          y: entity.y,
+          radius: entity.radius,
+          color: entity.plan.element === null ? entity.plan.action.color : entity.plan.element.color,
+          skillId: entity.plan.id,
+        });
+        targets.forEach((enemy, index) => {
+          context.hit({
+            targetId: enemy.id,
+            center: { x: entity.x, y: entity.y },
+            extraTags: ['trap'],
+            primary: index === 0,
+          });
+        });
+        entity.dead = true;
+      },
+    });
+
+    // ---- skills/entities/index.js ----
+    // 持续实体生命周期分派：固定步推进、稳定 ID 顺序、清理与只读视图。
+    //
+    // 新实体在本帧施放后同帧首次推进；这条规则由测试锁定，避免以后改变时序却
+    // 没有可见说明。遍历和候选目标都使用稳定 ID / 距离加 ID 排序。
+
+    const ENTITY_HANDLERS = Object.freeze({
+      projectile: projectileEntity,
+      orbitSword: orbitSwordEntity,
+      piercingSword: piercingSwordEntity,
+      swordArray: swordArrayEntity,
+      trap: trapEntity,
+    });
+
+    function updateEntities(world, dt) {
+      if (!Array.isArray(world.entities)) world.entities = [];
+      world.entities.sort((a, b) => a.id - b.id);
+      for (const entity of world.entities) {
+        if (entity.dead) continue;
+        const handler = ENTITY_HANDLERS[entity.kind];
+        if (handler === undefined) {
+          diagnose(world, 'unknown-entity', { kind: String(entity.kind), id: entity.id });
+          entity.dead = true;
+          continue;
+        }
+        handler.update(createEntityContext(world, entity), dt);
+      }
+      world.entities = world.entities.filter((entity) => !entity.dead);
+      // 客户端和既有测试使用只读分类视图；权威列表仍是 world.entities。
+      world.projectiles = world.entities.filter((entity) => entity.kind === 'projectile');
+      world.orbitSwords = world.entities.filter((entity) => entity.kind === 'orbitSword');
+      world.piercingSwords = world.entities.filter((entity) => entity.kind === 'piercingSword');
+      world.swordArrays = world.entities.filter((entity) => entity.kind === 'swordArray');
+      world.traps = world.entities.filter((entity) => entity.kind === 'trap');
+    }
+
+    // ---- skills/runtime.js ----
+    // 技能冷却与动作调度：只负责"到期 → 检查 → 施放 → 启动冷却"。
+    //
+    // 具体行为在 actions/*.js；动作通过 action context 查询目标、创建实体和提交
+    // 命中。没有目标或实体上限时 canCast 返回 false，技能保持就绪，下一固定步重试。
+
+    function castDueSkills(world, dt) {
+      ensureResolutionState(world);
+      if (!world.stats.casts) world.stats.casts = {};
+      for (const skill of world.skills) {
+        if (skill.timer > 0) skill.timer = Math.max(0, skill.timer - dt);
+        if (skill.timer > 0) continue;
+        const plan = skill.plan;
+        const implementation = actionImplementation(plan.action.handler);
+        if (implementation === undefined) {
+          diagnose(world, 'unknown-action-handler', { handler: plan.action.handler, skillId: plan.id });
+          skill.timer = plan.cooldown;
+          continue;
+        }
+        const castId = `${plan.id}:${skill.castCount}`;
+        const context = createActionContext(world, skill, plan, castId);
+        if (!implementation.handler.canCast(context)) continue;
+        if (!implementation.handler.cast(context)) continue;
+        skill.castCount += 1;
+        skill.timer = plan.cooldown;
+        world.stats.casts[plan.id] = (world.stats.casts[plan.id] ?? 0) + 1;
+      }
+    }
+
+    /** 新建技能实例：开局给一小段预热，避免同时开火。 */
+    function createSkillInstances(plans) {
+      return plans.map((plan) => ({
+        id: plan.id,
+        plan,
+        timer: plan.cooldown * 0.35,
+        castCount: 0,
+      }));
+    }
+
+    /**
+     * 编辑构筑后的重编译接入点。
+     * 已存在的实体保留自己的 plan 快照；冷却按技能实例 ID 继承。
+     */
+    function replaceSkillInstances(world, plans) {
+      const previous = new Map(world.skills.map((skill) => [skill.plan.id, skill]));
+      world.skills = plans.map((plan) => {
+        const old = previous.get(plan.id);
+        return {
+          id: plan.id,
+          plan,
+          timer: old === undefined ? plan.cooldown * 0.35 : Math.min(old.timer, plan.cooldown),
+          castCount: old === undefined ? 0 : old.castCount,
+        };
+      });
+    }
+
+    function resetSkillCooldowns(world) {
+      for (const skill of world.skills) skill.timer = 0;
+    }
+
+    function skillColor(plan) {
+      if (plan === null || plan === undefined) return '#7f93a3';
+      return plan.element === null ? plan.action.color : plan.element.color;
+    }
+
+    // ---- skills/draft.js ----
+    // 构筑编辑与升级候选：放置规则、替换、备用栏与三选一。
+    //
+    // 放置只做"哪个技能的哪个槽位"的判断；是否合法仍由 compile.js 复核，
+    // 所以 UI 预览与真正装入不会给出不同结果。
+
+    const SLOT_OF_KIND = Object.freeze({ element: 'element', modifier: 'modifier' });
+
+    function cloneBuild(input) {
+      const build = normalizeBuild(input);
+      return {
+        version: build.version,
+        skills: build.skills.map((skill) => ({ ...skill })),
+        reserve: [...build.reserve],
+      };
+    }
+
+    function actionOf(skill) {
+      const def = contentById(skill.action);
+      return def !== undefined && def.kind === 'action' ? def : null;
+    }
+
+    function placementLabel(build, placement) {
+      const skill = build.skills[placement.skillIndex];
+      const action = skill === undefined ? null : actionOf(skill);
+      const name = action === null ? `技能 ${placement.skillIndex + 1}` : action.label;
+      if (placement.kind === 'action') {
+        return placement.replacing ? `${name} · 动作槽（替换）` : `新技能 ${placement.skillIndex + 1}`;
+      }
+      return `${name} · ${placement.kind === 'element' ? '属性' : '修饰'}槽`;
+    }
+
+    /** 空槽位：动作创建新技能，属性/修饰填入兼容的空槽。 */
+    function placementsFor(input, id) {
+      const build = normalizeBuild(input);
+      const def = contentById(id);
+      if (def === undefined) return [];
+      if (def.kind === 'action') {
+        if (build.skills.length >= BUILD_LIMITS.maxSkills) return [];
+        if (build.skills.some((skill) => skill.action === id)) return [];
+        return [{ kind: 'action', skillIndex: build.skills.length, replacing: false }];
+      }
+      const slot = SLOT_OF_KIND[def.kind];
+      if (slot === undefined) return [];
+      const out = [];
+      build.skills.forEach((skill, skillIndex) => {
+        const action = actionOf(skill);
+        if (action === null) return;
+        if (skill[slot] !== null) return;
+        if (!def.requires.every((cap) => action.capabilities.includes(cap))) return;
+        out.push({ kind: def.kind, skillIndex, replacing: false });
+      });
+      return out;
+    }
+
+    /**
+     * 替换槽位：已经装了同类组件时，玩家可以换掉它。
+     * 动作只在两个技能槽都满时提供替换，替换会改变该技能的运行身份。
+     */
+    function replacementsFor(input, id) {
+      const build = normalizeBuild(input);
+      const def = contentById(id);
+      if (def === undefined) return [];
+      if (def.kind === 'action') {
+        if (build.skills.length < BUILD_LIMITS.maxSkills) return [];
+        if (build.skills.some((skill) => skill.action === id)) return [];
+        return build.skills.map((skill, skillIndex) => ({
+          kind: 'action',
+          skillIndex,
+          replacing: true,
+        }));
+      }
+      const slot = SLOT_OF_KIND[def.kind];
+      if (slot === undefined) return [];
+      const out = [];
+      build.skills.forEach((skill, skillIndex) => {
+        const action = actionOf(skill);
+        if (action === null) return;
+        if (skill[slot] === null) return;
+        if (skill[slot] === id) return;
+        if (!def.requires.every((cap) => action.capabilities.includes(cap))) return;
+        out.push({ kind: def.kind, skillIndex, replacing: true });
+      });
+      return out;
+    }
+
+    function upgradeSlots(build, id) {
+      const placements = placementsFor(build, id);
+      if (placements.length > 0) return placements;
+      return replacementsFor(build, id);
+    }
+
+    /** 装入组件。替换下来的旧组件进入备用栏；备用栏满时丢弃最旧的一个。 */
+    function installChoice(input, id, placement) {
+      const build = cloneBuild(input);
+      const def = contentById(id);
+      if (def === undefined) return { ok: false, reason: 'unknown-component', build };
+      if (placement === undefined || placement === null) {
+        const first = upgradeSlots(build, id)[0];
+        if (first === undefined) return { ok: false, reason: 'no-slot', build };
+        placement = first;
+      }
+      const warnings = [];
+      if (def.kind === 'action') {
+        if (placement.kind !== 'action') return { ok: false, reason: 'wrong-slot', build };
+        const reserve = build.reserve;
+        const incomingIndex = reserve.indexOf(id);
+        if (incomingIndex >= 0) reserve.splice(incomingIndex, 1);
+
+        if (placement.replacing === true) {
+          const skill = build.skills[placement.skillIndex];
+          if (skill === undefined) return { ok: false, reason: 'no-skill', build };
+          const moved = [];
+          let nextElement = skill.element;
+          let nextModifier = skill.modifier;
+          const caps = new Set(def.capabilities);
+          if (nextElement !== null) {
+            const element = contentById(nextElement);
+            if (element === undefined || !element.requires.every((cap) => caps.has(cap))) {
+              moved.push(nextElement);
+              nextElement = null;
+            }
+          }
+          if (nextModifier !== null) {
+            const modifier = contentById(nextModifier);
+            if (modifier === undefined || !modifier.requires.every((cap) => caps.has(cap))) {
+              moved.push(nextModifier);
+              nextModifier = null;
+            }
+          }
+          if (skill.action !== null) moved.push(skill.action);
+          const free = BUILD_LIMITS.maxReserve - reserve.length;
+          if (moved.length > free) {
+            return {
+              ok: false,
+              reason: 'reserve-full',
+              build,
+              moved,
+              free,
+              required: moved.length,
+            };
+          }
+          for (const component of moved) {
+            if (!reserve.includes(component)) reserve.push(component);
+          }
+          skill.action = id;
+          skill.element = nextElement;
+          skill.modifier = nextModifier;
+          return {
+            ok: true,
+            build,
+            warnings,
+            moved,
+            retained: [nextElement, nextModifier].filter((component) => component !== null),
+          };
+        }
+
+        if (build.skills.length >= BUILD_LIMITS.maxSkills) {
+          return { ok: false, reason: 'too-many-skills', build };
+        }
+        if (build.skills.some((skill) => skill.action === id)) {
+          return { ok: false, reason: 'duplicate-action', build };
+        }
+        let number = build.skills.length + 1;
+        const used = new Set(build.skills.map((skill) => skill.id));
+        while (used.has(`skill-${number}`)) number += 1;
+        build.skills.push({ id: `skill-${number}`, action: id, element: null, modifier: null });
+      } else {
+        if (placement.kind !== def.kind) return { ok: false, reason: 'wrong-slot', build };
+        const slot = SLOT_OF_KIND[def.kind];
+        const skill = build.skills[placement.skillIndex];
+        if (skill === undefined || slot === undefined) return { ok: false, reason: 'no-skill', build };
+        const action = actionOf(skill);
+        if (action === null || !def.requires.every((cap) => action.capabilities.includes(cap))) {
+          return { ok: false, reason: 'capability-mismatch', build };
+        }
+        const previous = skill[slot];
+        // 原子替换：先取出本次装配组件，再放入旧组件；只有取出后仍无空位才丢弃最旧项。
+        const incomingIndex = build.reserve.indexOf(id);
+        if (incomingIndex >= 0) build.reserve.splice(incomingIndex, 1);
+        skill[slot] = id;
+        if (previous !== null) {
+          if (build.reserve.length >= BUILD_LIMITS.maxReserve) {
+            const dropped = build.reserve.shift();
+            warnings.push({ code: 'reserve-full', message: `备用栏已满，丢弃 ${dropped}` });
+          }
+          build.reserve.push(previous);
+        }
+      }
+      return { ok: true, build, warnings };
+    }
+
+    /** 把备用栏组件装回构筑；优先空槽，其次替换同类槽位。 */
+    function equipReserveComponent(input, id) {
+      const build = normalizeBuild(input);
+      if (!build.reserve.includes(id)) return { ok: false, reason: 'not-in-reserve', build };
+      const slots = upgradeSlots(build, id);
+      if (slots.length === 0) return { ok: false, reason: 'no-slot', build };
+      return installChoice(build, id, slots[0]);
+    }
+
+    function candidatesFor(build, kind) {
+      const defs = contentList(kind);
+      return defs.filter((def) => {
+        const slots = upgradeSlots(build, def.id);
+        if (slots.length === 0) return false;
+        return slots.some((slot) => installChoice(build, def.id, slot).ok);
+      });
+    }
+
+    function shuffled(list, rng) {
+      const out = [...list];
+      for (let i = out.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(rng() * (i + 1));
+        const tmp = out[i];
+        out[i] = out[j];
+        out[j] = tmp;
+      }
+      return out;
+    }
+
+    function stageKinds(build, draftCount) {
+      const hasSkillRoom = build.skills.length < BUILD_LIMITS.maxSkills;
+      if (draftCount === 0) return ['element'];
+      if (draftCount <= 2) return ['modifier', 'element'];
+      const hasActionOption = candidatesFor(build, 'action').length > 0;
+      if (hasSkillRoom || hasActionOption) return ['action', 'modifier', 'element'];
+      return ['modifier', 'element'];
+    }
+
+    function stageLabel(build, draftCount) {
+      if (draftCount === 0) return '选择属性';
+      if (draftCount <= 2) return '选择修饰';
+      if (build.skills.length < BUILD_LIMITS.maxSkills) return '选择动作';
+      if (candidatesFor(build, 'action').length > 0) return '强化或更换动作';
+      return '强化技能';
+    }
+
+    /**
+     * 生成三选一候选。优先覆盖本阶段开放的类型，再随机补齐。
+     * 池子为空时返回空数组，由战斗层保留 pending，稍后再试。
+     */
+    function offerUpgrades(input, rng, { draftCount = 0, count = 3 } = {}) {
+      const build = normalizeBuild(input);
+      const kinds = stageKinds(build, draftCount);
+      const pools = {};
+      for (const kind of kinds) pools[kind] = shuffled(candidatesFor(build, kind), rng);
+      const picked = [];
+      const seen = new Set();
+      let guard = 0;
+      while (picked.length < count && guard < 64) {
+        guard += 1;
+        let added = false;
+        for (const kind of kinds) {
+          if (picked.length >= count) break;
+          const pool = pools[kind];
+          if (pool.length === 0) continue;
+          while (pool.length > 0 && seen.has(pool[0].id)) pool.shift();
+          if (pool.length === 0) continue;
+          const def = pool.shift();
+          picked.push(def.id);
+          seen.add(def.id);
+          added = true;
+        }
+        if (!added) break;
+      }
+      return picked;
+    }
+
+    /** 选择界面里的一张候选：装入后的完整描述。 */
+    function choiceInfo(build, id, placement) {
+      const def = contentById(id);
+      if (def === undefined) return null;
+      const slots = upgradeSlots(build, id);
+      const target = placement ?? slots[0] ?? null;
+      let description = def.desc;
+      let label = def.label;
+      let blocked = false;
+      let note = '';
+      let moved = [];
+      let retained = [];
+      if (target !== null) {
+        const installed = installChoice(build, id, target);
+        if (installed.ok) {
+          const compiled = compileBuild(installed.build);
+          const plan = compiled.plans[target.skillIndex];
+          if (plan !== undefined) {
+            description = plan.description;
+            label = plan.label;
+          }
+          moved = installed.moved ?? [];
+          retained = installed.retained ?? [];
+          if (moved.length > 0) {
+            note = '将移入备用栏：' + moved.map((component) => contentById(component)?.label ?? component).join('、');
+          }
+        } else {
+          blocked = true;
+          moved = installed.moved ?? [];
+          if (installed.reason === 'reserve-full') {
+            note = `备用栏空间不足：需要 ${installed.required ?? moved.length} 格，只有 ${installed.free ?? 0} 格`;
+          } else if (installed.reason === 'capability-mismatch') {
+            note = '当前动作不支持该组件';
+          } else if (installed.reason === 'duplicate-action') {
+            note = '该动作已经在构筑中';
+          } else {
+            note = '无法装入该位置';
+          }
+        }
+      }
+      return {
+        id,
+        kind: def.kind,
+        label,
+        baseLabel: def.label,
+        description,
+        color: def.color ?? '#dbe7f0',
+        slots,
+        target,
+        blocked,
+        note,
+        moved,
+        retained,
+      };
+    }
+
+    // ---- skills/styles.js ----
+    // 战斗风格读取：起始构筑、默认移动偏好、解锁与视觉主题。
+    // 风格只引用组件，不拥有独立结算代码。
+
+    function listStyles() {
+      return contentList('style');
+    }
+
+    function styleById(id) {
+      const def = contentById(id);
+      return def !== undefined && def.kind === 'style' ? def : undefined;
+    }
+
+    function defaultStyle() {
+      const styles = listStyles();
+      return styles.find((style) => style.defaultStyle === true) ?? styles[0];
+    }
+
+    function isStyleUnlocked(style, stats) {
+      if (style === undefined) return false;
+      const needed = style.unlockedBy?.bestFloor ?? 1;
+      return (stats?.bestFloor ?? 1) >= needed;
+    }
+
+    function availableStyles(stats) {
+      return listStyles().filter((style) => isStyleUnlocked(style, stats));
+    }
+
+    /** 未知或被锁定的风格安全回退到默认风格，不覆盖已保存构筑。 */
+    function resolveStyle(id, stats) {
+      const style = styleById(id);
+      if (style !== undefined && isStyleUnlocked(style, stats)) return style;
+      return defaultStyle();
+    }
+
+    /** 由风格生成一轮的起始构筑；已有存档的构筑不会被隐式替换。 */
+    function buildFromStyle(style) {
+      const source = style ?? defaultStyle();
+      const skills = source.startingBuild.map((skill, index) => ({
+        id: typeof skill.id === 'string' && skill.id.length > 0 ? skill.id : `skill-${index + 1}`,
+        action: skill.action,
+        element: skill.element ?? null,
+        modifier: skill.modifier ?? null,
+      }));
+      return { version: BUILD_VERSION, skills, reserve: [] };
+    }
+
+    // ---- movement.js ----
+    // 常规移动决策与位移请求裁决。
+    //
+    // 技能只提供 movement.preferredRange，不直接争夺玩家移动。策略层在每步做一次
+    // 统一选择；多个并列目标按 ID 打破平局。位移请求首版只保证场地内落点与确定性，
+    // 不宣称完整危险评估。
+
+    const CENTER_PULL = 56;
+    const PLAYER_MARGIN = 6;
+
+    const clampValue = (value, lo, hi) => (value < lo ? lo : value > hi ? hi : value);
+
+    function preferredRanges(plans) {
+      const ranges = [];
+      for (const plan of plans) {
+        const value = plan.movement?.preferredRange;
+        if (typeof value === 'number' && Number.isFinite(value) && value > 0) ranges.push(value);
+      }
+      return ranges.length > 0 ? ranges : [40];
+    }
+
+    function desiredRange(plans, strategy) {
+      const ranges = preferredRanges(plans);
+      const min = Math.min(...ranges);
+      const max = Math.max(...ranges);
+      if (strategy === 'approach') return min;
+      if (strategy === 'keepDistance') return max;
+      // auto：混合构筑取折中距离，先保留近战可接近的机会，也不过度贴近。
+      return Math.round((min + max) / 2);
+    }
+
+    function createMovementState(plans, strategy = 'auto') {
+      const chosen = MOVEMENT_STRATEGIES.includes(strategy) ? strategy : 'auto';
+      return { strategy: chosen, desiredRange: desiredRange(plans, chosen) };
+    }
+
+    function refreshMovementState(world) {
+      world.movement = createMovementState(world.plans, world.movement?.strategy ?? 'auto');
+      return world.movement;
+    }
+
+    function nearestLiving(world) {
+      let best = null;
+      let bestD = Infinity;
+      for (const enemy of world.enemies) {
+        if (enemy.cells <= 0 || enemy.dead || enemy.deathHandled) continue;
+        const d = Math.hypot(enemy.x - world.player.x, enemy.y - world.player.y);
+        if (d < bestD || (d === bestD && best !== null && enemy.id < best.id)) {
+          best = enemy;
+          bestD = d;
+        }
+      }
+      return best;
+    }
+
+    /** 玩家常规移动：由策略统一决定保持距离、接近或折中。 */
+    function movePlayer(world, dt) {
+      const player = world.player;
+      const desired = world.movement?.desiredRange ?? 40;
+      const nearest = nearestLiving(world);
+      let vx = 0;
+      let vy = 0;
+      if (nearest !== null) {
+        const dx = player.x - nearest.x;
+        const dy = player.y - nearest.y;
+        const d = Math.hypot(dx, dy) || 1;
+        if (d < desired - 8) {
+          vx += dx / d;
+          vy += dy / d;
+        } else if (d > desired + 8) {
+          vx -= dx / d;
+          vy -= dy / d;
+        } else {
+          vx += -dy / d;
+          vy += dx / d;
+        }
+      }
+      const cx = ARENA.w / 2 - player.x;
+      const cy = ARENA.h / 2 - player.y;
+      const cd = Math.hypot(cx, cy) || 1;
+      if (cd > CENTER_PULL) {
+        vx += (cx / cd) * 0.7;
+        vy += (cy / cd) * 0.7;
+      }
+      const len = Math.hypot(vx, vy);
+      if (len < 0.001) return;
+      player.x = clampValue(player.x + (vx / len) * player.speed * dt, PLAYER_MARGIN, ARENA.w - PLAYER_MARGIN);
+      player.y = clampValue(player.y + (vy / len) * player.speed * dt, PLAYER_MARGIN, ARENA.h - PLAYER_MARGIN);
+    }
+
+    function compareRequests(a, b) {
+      return b.priority - a.priority || a.sourceId - b.sourceId || a.seq - b.seq;
+    }
+
+    /**
+     * 提交临时位移请求。request: { sourceId, priority, x, y, distance? }
+     * 首版按优先级、来源 ID、入队顺序裁决，落点限制在场地内。
+     */
+    function requestDisplacement(world, request) {
+      if (!Array.isArray(world.displacements)) world.displacements = [];
+      if (typeof world.nextDisplacementSeq !== 'number') world.nextDisplacementSeq = 1;
+      const seq = world.nextDisplacementSeq;
+      world.nextDisplacementSeq += 1;
+      const priority = Number.isFinite(request.priority) ? request.priority : 0;
+      world.displacements.push({ ...request, priority, seq, applied: false });
+      return seq;
+    }
+
+    /** 每步一次性裁决位移请求；无效请求直接丢弃，不消耗技能冷却。 */
+    function resolveDisplacements(world) {
+      if (!Array.isArray(world.displacements) || world.displacements.length === 0) return [];
+      const requests = world.displacements.sort(compareRequests);
+      world.displacements = [];
+      const applied = [];
+      for (const request of requests) {
+        if (!Number.isFinite(request.x) || !Number.isFinite(request.y)) continue;
+        if (!(Number.isFinite(request.distance) && request.distance > 0)) continue;
+        const startX = world.player.x;
+        const startY = world.player.y;
+        const dx = request.x - startX;
+        const dy = request.y - startY;
+        const d = Math.hypot(dx, dy);
+        if (d < 0.001) continue;
+        const step = Math.min(d, request.distance);
+        world.player.x = clampValue(startX + (dx / d) * step, PLAYER_MARGIN, ARENA.w - PLAYER_MARGIN);
+        world.player.y = clampValue(startY + (dy / d) * step, PLAYER_MARGIN, ARENA.h - PLAYER_MARGIN);
+        request.applied = true;
+        applied.push(request);
+      }
+      return applied;
+    }
+
+    // ---- enemies.js ----
+    // 敌人定义：通过行为、位置和数量制造不同问题，不要求玩家拥有唯一解法。
+    //
+    // 敌人不读取具体技能 ID；只使用统一的伤害、状态、移动和死亡接口。
+    // 第一版原型使用设计稿里的三种敌人：群游者、重甲兽、游击者。
+
+    const ENEMY_TYPES = Object.freeze({
+      swarm: Object.freeze({
+        id: 'swarm',
+        label: '群游者',
+        cells: 4,
+        speed: 34,
+        damage: 1,
+        radius: 2.6,
+        behavior: 'chase',
+        attackInterval: 1.6,
+        xp: 1,
+        color: { rim: '#7e312c', body: '#c4534b' },
+      }),
+      brute: Object.freeze({
+        id: 'brute',
+        label: '重甲兽',
+        cells: 14,
+        speed: 16,
+        damage: 2,
+        radius: 4.2,
+        behavior: 'chase',
+        attackInterval: 2.2,
+        xp: 3,
+        color: { rim: '#314554', body: '#6f97b0' },
+      }),
+      skirmisher: Object.freeze({
+        id: 'skirmisher',
+        label: '游击者',
+        cells: 6,
+        speed: 30,
+        damage: 1,
+        radius: 2.8,
+        behavior: 'kite',
+        preferredRange: 52,
+        attackInterval: 2.4,
+        shot: Object.freeze({ speed: 120, damage: 1, radius: 2.5, life: 1.6 }),
+        xp: 2,
+        color: { rim: '#4d2379', body: '#8f4bd6' },
+      }),
+    });
+
+    function enemyType(id) {
+      const def = ENEMY_TYPES[id];
+      if (def === undefined) throw new Error(`unknown enemy type: ${String(id)}`);
+      return def;
+    }
+
+    /** 按层成长；同一层的不同敌人共享倍率，保持相对关系。 */
+    function enemyCellsAt(floor, type) {
+      const def = enemyType(type);
+      return Math.max(1, Math.round(def.cells * (1 + 0.13 * (floor - 1))));
+    }
+
+    function enemyDamageAt(floor, type) {
+      const def = enemyType(type);
+      return def.damage + (floor >= 10 ? 1 : 0);
+    }
+
+    /** 层定义给出权重表，刷新时按权重循环取类型，保证同层混合稳定可复现。 */
+    function bagOf(mix) {
+      const bag = [];
+      for (const [type, weight] of Object.entries(mix)) {
+        const times = Math.max(0, Math.floor(weight));
+        for (let i = 0; i < times; i += 1) bag.push(type);
+      }
+      return bag;
     }
 
     // ---- floors.js ----
-    // 层数表（1–12 层，MVP 用 1–8）。
+    // 层数表：敌人数量、类型与层修饰符。
     //
-    // 数值来自 docs/floors.md，改动前先跑 `node tools/balance-sim.mjs --sweep`
-    // 确认第 6 层那道墙还在。
-    //
-    // "双锁混编"的实现是：同一层的敌人轮换携带不同的单锁，而不是一只怪同时带两个锁。
-    // 同时带两个锁的怪留给以后（倍率相乘已经是按这个设计的）。
+    // 旧文档里的"锁"（甲壳、分裂、锚定……）已随旧卡牌系统一起舍弃。
+    // 现在每一层只描述敌人构成与压力，不再要求特定卡牌组合。
 
     const FLOOR_SECONDS = 26;
+    const TIME_LIMIT = 45;
 
     /** 层修饰符：让同一套 build 在不同层表现不同。 */
     const MODIFIERS = Object.freeze({
-      crowded: Object.freeze({ name: '拥挤', desc: '敌人 +50%，血量 −30%' }),
+      crowded: Object.freeze({ name: '拥挤', desc: '敌人 +50%，生命 −30%' }),
       frenzy: Object.freeze({ name: '狂暴', desc: '敌人移速 +30%，伤害 +1' }),
-      silent: Object.freeze({ name: '静默', desc: '领域类卡失效' }),
-      elite: Object.freeze({ name: '精英', desc: '最后一只怪带双锁，击杀给一次三选一' }),
+      elite: Object.freeze({ name: '精英', desc: '最后一只敌人强化，清层后额外给一次三选一' }),
     });
 
-    const FLOOR_MODIFIERS = Object.freeze({ 4: 'crowded', 7: 'frenzy', 10: 'silent', 13: 'elite' });
+    const FLOOR_MODIFIERS = Object.freeze({ 4: 'crowded', 7: 'frenzy', 10: 'elite', 13: 'elite' });
 
     function floorModifier(floor) {
       return FLOOR_MODIFIERS[floor] ?? null;
     }
 
-    /** 锁对格数的倍率。一只怪带多个锁时相乘。 */
-    const LOCK_CELLS = Object.freeze({
-      carapace: 2,
-      split: 1.2,
-      regen: 1.5,
-      shield: 1.5,
-      anchor: 1.4,
-      cleanse: 1.2,
-      devour: 1.5,
-      phase: 1.3,
-      reflect: 1.2,
-      generator: 1.5,
-    });
-
-    function baseCells(floor) {
-      return 4 + 1.35 * floor;
-    }
-
-    function lockMultiplier(locks = []) {
-      return locks.reduce((m, lock) => m * (LOCK_CELLS[lock] ?? 1), 1);
-    }
-
-    /** 先乘倍率再取整，否则 ×2 的锁会比设计值少 1 格（第 7 层就是例子）。 */
-    function enemyCells(floor, locks = []) {
-      return Math.round(baseCells(floor) * lockMultiplier(locks));
-    }
-
-    function enemyDamage(floor) {
-      if (floor >= 10) return 3;
-      if (floor >= 5) return 2;
-      return 1;
-    }
-
-    function spawnSeconds(def) {
-      return FLOOR_SECONDS / def.enemies;
-    }
-
     const FLOORS = Object.freeze([
-      Object.freeze({ floor: 1, enemies: 8, locks: Object.freeze([]) }),
-      Object.freeze({ floor: 2, enemies: 9, locks: Object.freeze([]) }),
-      Object.freeze({ floor: 3, enemies: 10, locks: Object.freeze([]) }),
-      Object.freeze({ floor: 4, enemies: 12, locks: Object.freeze([]) }),
-      Object.freeze({ floor: 5, enemies: 13, locks: Object.freeze([]) }),
-      Object.freeze({ floor: 6, enemies: 8, locks: Object.freeze(['carapace']) }),
-      Object.freeze({ floor: 7, enemies: 9, locks: Object.freeze(['carapace']) }),
-      Object.freeze({ floor: 8, enemies: 10, locks: Object.freeze(['carapace']) }),
-      Object.freeze({ floor: 9, enemies: 12, locks: Object.freeze(['split']) }),
-      Object.freeze({ floor: 10, enemies: 13, locks: Object.freeze(['anchor']) }),
-      Object.freeze({ floor: 11, enemies: 13, locks: Object.freeze(['cleanse']) }),
-      Object.freeze({ floor: 12, enemies: 14, locks: Object.freeze(['phase']) }),
-      Object.freeze({ floor: 13, enemies: 14, locks: Object.freeze(['devour']) }),
-      Object.freeze({ floor: 14, enemies: 15, locks: Object.freeze(['generator']) }),
-      Object.freeze({ floor: 15, enemies: 16, locks: Object.freeze(['reflect']) }),
+      Object.freeze({ floor: 1, count: 8, mix: Object.freeze({ swarm: 1 }) }),
+      Object.freeze({ floor: 2, count: 9, mix: Object.freeze({ swarm: 1 }) }),
+      Object.freeze({ floor: 3, count: 9, mix: Object.freeze({ swarm: 3, brute: 1 }) }),
+      Object.freeze({ floor: 4, count: 12, mix: Object.freeze({ swarm: 3, brute: 1 }) }),
+      Object.freeze({ floor: 5, count: 10, mix: Object.freeze({ swarm: 2, brute: 1 }) }),
+      Object.freeze({ floor: 6, count: 10, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 1 }) }),
+      Object.freeze({ floor: 7, count: 11, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 1 }) }),
+      Object.freeze({ floor: 8, count: 10, mix: Object.freeze({ swarm: 2, brute: 2 }) }),
+      Object.freeze({ floor: 9, count: 11, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 1 }) }),
+      Object.freeze({ floor: 10, count: 12, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 2 }) }),
+      Object.freeze({ floor: 11, count: 12, mix: Object.freeze({ swarm: 3, brute: 1, skirmisher: 1 }) }),
+      Object.freeze({ floor: 12, count: 13, mix: Object.freeze({ swarm: 2, brute: 2, skirmisher: 1 }) }),
+      Object.freeze({ floor: 13, count: 13, mix: Object.freeze({ swarm: 2, brute: 1, skirmisher: 2 }) }),
+      Object.freeze({ floor: 14, count: 14, mix: Object.freeze({ swarm: 3, brute: 1, skirmisher: 2 }) }),
+      Object.freeze({ floor: 15, count: 14, mix: Object.freeze({ swarm: 2, brute: 2, skirmisher: 2 }) }),
     ]);
 
-    /** MVP 只做到第 8 层（第 6 层是墙，第 8 层是切片上限）。 */
-    const MVP_FLOOR_COUNT = 8;
-
-    const MVP_FLOORS = Object.freeze(FLOORS.filter((f) => f.floor <= MVP_FLOOR_COUNT));
+    const MAX_FLOOR = 15;
 
     function floorDef(n) {
-      const def = FLOORS.find((f) => f.floor === n);
+      const def = FLOORS.find((entry) => entry.floor === n);
       if (def === undefined) throw new Error(`floor not in table: ${n}`);
       return def;
     }
 
+    function enemyTotal(def, { modifier, extra = 0 } = {}) {
+      let base = def.count;
+      if (modifier === 'crowded') base = Math.round(base * 1.5);
+      return base + extra;
+    }
+
+    function spawnSeconds(def) {
+      return FLOOR_SECONDS / def.count;
+    }
+
     // ---- arena.js ----
-    // 战斗状态机（无渲染、无 DOM、可复现）。
+    // 战斗世界：位置、刷怪、走位、经验、抽选与胜负。
     //
-    // 这一层是游戏真正的核心：位置、走位、刷怪、命中、状态、层推进、三选一。
-    // client.js 只负责把 battle 画出来；测试直接跑这里。
-    //
-    // 设计约束：
-    //   - 纯函数式推进：step(battle, dt)，不读全局、不用 Math.random
-    //   - 同一 seed + 同一 dt 序列 → 同一结果
-    //   - 所有伤害都走 rules.js 的 resolveHit，锁不会在这里被绕过
-    //   - 抽卡只在 arena 里发生，UI 只调用 chooseCard
-    //
-    // 已知取舍：
-    //   - 没有寻路，敌人直线追玩家；160×144 的场地不需要
-    //   - 走位是"绕最近目标 + 回中心"的启发式，不是完整 AI（轮次 5 再做）
-    //   - 召唤物是炮台：会攻击，但不会被敌人选为目标
-    //   - 分裂子体不给经验，避免刷经验
+    // 技能裁决全部在 src/game/skills/：这里只负责实体位置、敌人 AI 和战斗循环，
+    // 并按架构规定的固定步长顺序调用运行时。相同初始状态、seed 和 dt 序列
+    // 必须产生同一结果。
 
-    const ARENA = Object.freeze({ w: 160, h: 144 });
-    const TIME_LIMIT = 45;
-    const MAX_SLOTS = 3;
     const MAX_EXTRA = 18;
+    const MAX_SKILLS = 2;
 
+    const PLAYER_BASE_CELLS = 24;
     const PLAYER_SPEED = 52;
     const PLAYER_RADIUS = 3;
     const CONTACT_PAD = 1.5;
     const ENEMY_ATTACK_INTERVAL = 1.6;
-    const ENEMY_SPEED_BASE = 26;
-    const ENEMY_SPEED_PER_FLOOR = 1.4;
-    const ORB_RANGE = 74;
-    const FIELD_RADIUS = 30;
-    const SUMMON_RANGE = 42;
-    const BULLET_SPEED = 180;
-    const BULLET_HIT_RADIUS = 3.5;
-    const KEEP_DISTANCE = 42;
-    const CENTER_PULL = 56;
-
-    const SELF_RADIUS = 20;
-    const BOOM_RADIUS = 14;
-    const FREEZE_SECONDS = 1.2;
-    const ANCHOR_SECONDS = 10;
-    const COMBO_EVERY = 4;
-    const EXECUTE_THRESHOLD = 2;
-    const XP_PER_CELL = 3;
-    const VORTEX_SPEED = 120;
+    const ENEMY_SPEED_PER_FLOOR = 0.6;
+    const XP_PER_KILL_CAP = 6;
 
     const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
-    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+    const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
     function mulberry32(seed) {
       let a = seed >>> 0;
@@ -995,10 +3803,6 @@ window.__ModuleLoader__.load({
       };
     }
 
-    function enemyRadius(cells) {
-      return 2.5 + Math.min(3.5, cells / 10);
-    }
-
     function spawnPoint(rng) {
       const edge = Math.floor(rng() * 4);
       if (edge === 0) return { x: rng() * ARENA.w, y: -6 };
@@ -1007,135 +3811,263 @@ window.__ModuleLoader__.load({
       return { x: -6, y: rng() * ARENA.h };
     }
 
-    const hasRule = (battle, id) => battle.rules.some((rule) => rule.id === id);
-    const hasCore = (battle, id) => battle.cards.some((card) => card.id === id);
-
-    /** 破釜：残血时冷却减半。所有出手机制都要走这里。 */
-    function cardCooldown(battle, cd) {
-      let value = cooldown(cd, battle.attrs);
-      if (hasRule(battle, 'desperate') && battle.player.cells < battle.player.maxCells * 0.3) {
-        value *= 0.5;
+    function normalizeCompile(build) {
+      const pruned = pruneBuild(build);
+      const compiled = compileBuild(pruned.build);
+      if (pruned.removed.length > 0) {
+        compiled.warnings.push({
+          code: 'pruned-build',
+          path: 'skills',
+          message: '已移除失效组件：' + pruned.removed.join('、'),
+        });
       }
-      return value;
-    }
-    const orbRange = (battle) => ORB_RANGE * visionScale(battle.attrs);
-    const fieldRadius = (battle) => FIELD_RADIUS * visionScale(battle.attrs);
-    const selfRadius = (battle) => SELF_RADIUS * visionScale(battle.attrs);
-    const summonRange = (battle) => SUMMON_RANGE * visionScale(battle.attrs);
-
-    function makeSummon(battle, card) {
-      const hp = card.hp ?? 4;
+      if (compiled.plans.length > 0) return compiled;
+      const fallback = compileBuild(emptyBuild());
       return {
-        id: battle.nextId++,
-        card,
-        x: battle.player.x - 8,
-        y: battle.player.y - 8,
-        cells: hp,
-        maxCells: hp,
-        mode: card.mode ?? 'turret',
-        timer: cardCooldown(battle, card.cd) * 0.5,
+        ...fallback,
+        errors: [
+          ...compiled.errors,
+          {
+            code: 'empty-build',
+            path: 'skills',
+            message: '构筑没有可运行的动作，已临时使用基础飞弹',
+          },
+        ],
+        warnings: [...compiled.warnings, ...fallback.warnings],
       };
     }
 
-    function nearestSummon(battle, from, range = Infinity) {
-      let best = null;
-      let bestD = range;
-      for (const s of battle.summons) {
-        const d = dist(from, s);
-        if (d < bestD) {
-          best = s;
-          bestD = d;
+    function createBattle({
+      floor = 1,
+      build = emptyBuild(),
+      seed = 1,
+      extra = 0,
+      level = 1,
+      xp = 0,
+      xpNext = 8,
+      pending = 0,
+      draftCount = 0,
+      movementStrategy = 'auto',
+      styleId = null,
+    } = {}) {
+      const def = floorDef(floor);
+      const compiled = normalizeCompile(build);
+      const modifier = floorModifier(floor);
+      const player = {
+        id: 'player',
+        kind: 'player',
+        x: ARENA.w / 2,
+        y: ARENA.h / 2,
+        radius: PLAYER_RADIUS,
+        cells: PLAYER_BASE_CELLS,
+        maxCells: PLAYER_BASE_CELLS,
+        speed: PLAYER_SPEED,
+      };
+      const battle = {
+        def,
+        floor,
+        modifier,
+        styleId,
+        build: compiled.build,
+        plans: compiled.plans,
+        compileErrors: compiled.errors,
+        compileWarnings: compiled.warnings,
+        skills: createSkillInstances(compiled.plans),
+        player,
+        enemies: [],
+        entities: [],
+        projectiles: [],
+        orbitSwords: [],
+        piercingSwords: [],
+        swordArrays: [],
+        traps: [],
+        enemyShots: [],
+        commands: [],
+        delayed: [],
+        displacements: [],
+        nextDisplacementSeq: 1,
+        rootBudget: new Map(),
+        splitCasts: new Set(),
+        echoCasts: new Set(),
+        events: [],
+        diagnostics: [],
+        time: 0,
+        state: 'fighting',
+        rng: mulberry32(seed),
+        seed,
+        nextId: 1,
+        nextEventId: 1,
+        bounds: ARENA,
+        stats: {
+          damage: {},
+          bySkill: {},
+          reactions: {},
+          casts: {},
+          modifiers: {},
+          overflow: 0,
+          kills: 0,
+          killsByType: {},
+        },
+        movement: createMovementState(compiled.plans, movementStrategy),
+        total: 0,
+        spawned: 0,
+        kills: 0,
+        extra: Math.min(MAX_EXTRA, Math.max(0, extra)),
+        level,
+        xp,
+        xpNext,
+        pending,
+        draftCount,
+        offer: null,
+        surge: false,
+        lastStage: stageLabel(compiled.build, draftCount),
+      };
+      battle.total = enemyTotal(def, { modifier, extra: battle.extra });
+      if (battle.pending > 0) rollOffer(battle);
+      return battle;
+    }
+
+    function enemySequence(battle) {
+      return bagOf(battle.def.mix);
+    }
+
+    function spawnTick(battle) {
+      const total = enemyTotal(battle.def, { modifier: battle.modifier, extra: battle.extra });
+      battle.total = total;
+      const interval = FLOOR_SECONDS / total;
+      const bag = enemySequence(battle);
+      while (battle.spawned < total && battle.time >= battle.spawned * interval) {
+        const index = battle.spawned;
+        const type = bag.length === 0 ? 'swarm' : bag[index % bag.length];
+        const typeDef = enemyType(type);
+        const isElite = battle.modifier === 'elite' && index === total - 1;
+        let cells = enemyCellsAt(battle.floor, type);
+        if (battle.modifier === 'crowded') cells = Math.round(cells * 0.7);
+        if (isElite) cells = Math.round(cells * 2.5);
+        const at = spawnPoint(battle.rng);
+        const radius = typeDef.radius + (isElite ? 1 : 0);
+        const enemy = {
+          id: battle.nextId++,
+          kind: 'enemy',
+          type,
+          x: at.x,
+          y: at.y,
+          cells,
+          maxCells: cells,
+          radius,
+          r: radius,
+          speed: typeDef.speed * (1 + battle.floor * ENEMY_SPEED_PER_FLOOR * 0.02) * (battle.modifier === 'frenzy' ? 1.3 : 1),
+          damage: enemyDamageAt(battle.floor, type) + (battle.modifier === 'frenzy' ? 1 : 0) + (isElite ? 1 : 0),
+          behavior: typeDef.behavior,
+          preferredRange: typeDef.preferredRange ?? 0,
+          shot: typeDef.shot ?? null,
+          attackTimer: typeDef.attackInterval,
+          statuses: {},
+          dead: false,
+          deathHandled: false,
+          flash: 0,
+          elite: isElite,
+        };
+        battle.enemies.push(enemy);
+        battle.spawned += 1;
+        if (battle.spawned === total && isElite) battle.events.push({ type: 'elite', x: enemy.x, y: enemy.y });
+      }
+    }
+
+    function moveEnemy(battle, enemy, dt) {
+      const player = battle.player;
+      const speed = enemy.speed * slowFactor(enemy);
+      if (enemy.behavior === 'kite') {
+        const d = distance(enemy, player) || 1;
+        const ideal = enemy.preferredRange;
+        let vx = 0;
+        let vy = 0;
+        if (d < ideal - 6) {
+          vx = (enemy.x - player.x) / d;
+          vy = (enemy.y - player.y) / d;
+        } else if (d > ideal + 6) {
+          vx = (player.x - enemy.x) / d;
+          vy = (player.y - enemy.y) / d;
+        } else {
+          vx = -(player.y - enemy.y) / d;
+          vy = (player.x - enemy.x) / d;
         }
+        enemy.x = clamp(enemy.x + vx * speed * dt, enemy.r, ARENA.w - enemy.r);
+        enemy.y = clamp(enemy.y + vy * speed * dt, enemy.r, ARENA.h - enemy.r);
+        return;
       }
-      return best;
+      const dx = player.x - enemy.x;
+      const dy = player.y - enemy.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const reach = enemy.r + PLAYER_RADIUS + CONTACT_PAD;
+      if (d <= reach) return;
+      const step = Math.min(speed * dt, d - reach);
+      enemy.x += (dx / d) * step;
+      enemy.y += (dy / d) * step;
     }
 
-    function refreshOneCooldown(battle) {
-      const pool = [...battle.sources, ...battle.selfs];
-      if (pool.length === 0) return;
-      const pick = pool[Math.floor(battle.rng() * pool.length)];
-      pick.timer = 0;
+    function enemiesMove(battle, dt) {
+      for (const enemy of battle.enemies) {
+        if (enemy.cells <= 0 || enemy.dead) continue;
+        enemy.flash = Math.max(0, enemy.flash - dt);
+        moveEnemy(battle, enemy, dt);
+      }
     }
 
-    function killSummon(battle, summon) {
-      const index = battle.summons.indexOf(summon);
-      if (index < 0) return;
-      battle.summons.splice(index, 1);
-      if (hasRule(battle, 'sacrifice')) refreshOneCooldown(battle);
-      battle.respawns.push({ card: summon.card, at: battle.time + 8 });
-      battle.events.push({ type: 'summonDown', x: summon.x, y: summon.y });
+    function hurtPlayer(battle, amount) {
+      if (!(amount > 0) || battle.state !== 'fighting') return;
+      battle.player.cells -= amount;
+      battle.events.push({ type: 'hurt', x: battle.player.x, y: battle.player.y, cells: amount });
+      if (battle.player.cells <= 0) {
+        battle.player.cells = 0;
+        battle.state = 'dead';
+      }
     }
 
-    /** 把一张卡加进当前战斗。开局 build 与抽卡都走这里。 */
-    function addCard(battle, id) {
-      const card = cardsById([id])[0];
-      battle.cards.push(card);
-      if (card.carrier === 'rule') {
-        battle.rules.push(card);
-        return card;
-      }
-      if (card.carrier === 'core') {
-        return card;
-      }
-      if (card.carrier === 'verb') {
-        battle.verbs.push({ card, timer: card.cd * 0.5 });
-        return card;
-      }
-      if (card.carrier === 'trap') {
-        battle.trapSources.push({ card, timer: card.cd * 0.5 });
-        return card;
-      }
-      if (card.carrier === 'trail') {
-        battle.trailSources.push({ card, timer: 0 });
-        return card;
-      }
-      if (card.carrier === 'self') {
-        battle.selfs.push({ card, timer: cardCooldown(battle, card.cd) });
-        return card;
-      }
-      if (card.carrier === 'summon') {
-        battle.summons.push(makeSummon(battle, card));
-        return card;
-      }
-      battle.sources.push({ card, timer: cardCooldown(battle, card.cd) * 0.5 });
-      return card;
-    }
-
-    function rollOffer(battle) {
-      if (battle.offer !== null || battle.pending <= 0) return;
-      if (battle.slots.length >= MAX_SLOTS) return;
-      const owned = new Set(battle.cards.map((card) => card.id));
-      const available = battle.pool.filter((id) => !owned.has(id));
-      if (available.length === 0) return;
-
-      const picked = [];
-
-      // 定向保底：上一轮死在哪把锁，这次一定给一张能解它的卡
-      if (battle.pity !== null) {
-        const counter = available.find((id) => (cardById(id)?.solves ?? []).includes(battle.pity));
-        if (counter !== undefined) {
-          picked.push(counter);
-          available.splice(available.indexOf(counter), 1);
+    function enemiesAttack(battle, dt) {
+      const player = battle.player;
+      for (const enemy of battle.enemies) {
+        if (enemy.cells <= 0 || enemy.dead || battle.state !== 'fighting') continue;
+        const d = distance(enemy, player);
+        const inRange = enemy.behavior === 'kite' ? d <= 96 : d <= enemy.r + PLAYER_RADIUS + CONTACT_PAD + 1;
+        if (!inRange) continue;
+        enemy.attackTimer -= dt;
+        if (enemy.attackTimer > 0) continue;
+        enemy.attackTimer = enemy.behavior === 'kite' ? 2.4 : ENEMY_ATTACK_INTERVAL;
+        if (enemy.behavior === 'kite' && enemy.shot !== null) {
+          const dx = player.x - enemy.x;
+          const dy = player.y - enemy.y;
+          const length = Math.hypot(dx, dy) || 1;
+          battle.enemyShots.push({
+            id: battle.nextId++,
+            x: enemy.x,
+            y: enemy.y,
+            vx: (dx / length) * enemy.shot.speed,
+            vy: (dy / length) * enemy.shot.speed,
+            life: enemy.shot.life,
+            radius: enemy.shot.radius,
+            damage: enemy.damage,
+          });
+          battle.events.push({ type: 'enemyShot', x: enemy.x, y: enemy.y });
+          continue;
         }
-        battle.pity = null;
+        hurtPlayer(battle, enemy.damage);
       }
+    }
 
-      // 按家族抽：优先从同一个主题里取，保证三张能互相组合
-      if (battle.families.length > 0 && picked.length < 3) {
-        const family = battle.families[Math.floor(battle.rng() * battle.families.length)];
-        for (const id of family) {
-          if (picked.length >= 3) break;
-          if (!available.includes(id)) continue;
-          picked.push(id);
-          available.splice(available.indexOf(id), 1);
+    function updateEnemyShots(battle, dt) {
+      const alive = [];
+      for (const shot of battle.enemyShots) {
+        shot.x += shot.vx * dt;
+        shot.y += shot.vy * dt;
+        shot.life -= dt;
+        if (Math.hypot(shot.x - battle.player.x, shot.y - battle.player.y) <= shot.radius + PLAYER_RADIUS) {
+          hurtPlayer(battle, shot.damage);
+          continue;
         }
+        if (shot.life > 0) alive.push(shot);
       }
-
-      while (picked.length < 3 && available.length > 0) {
-        const index = Math.floor(battle.rng() * available.length);
-        picked.push(available.splice(index, 1)[0]);
-      }
-      battle.offer = picked;
+      battle.enemyShots = alive;
     }
 
     function awardXp(battle, amount) {
@@ -1144,910 +4076,64 @@ window.__ModuleLoader__.load({
         battle.xp -= battle.xpNext;
         battle.level += 1;
         battle.xpNext = 6 + battle.level * 2;
-        battle.points += 1;
         if (battle.level % 2 === 0) battle.pending += 1;
+        battle.events.push({ type: 'levelUp', level: battle.level });
       }
       rollOffer(battle);
     }
 
-    /** 选中一张卡：进槽、生效、刷新下一次 offer。 */
-    function chooseCard(battle, id) {
-      if (battle.offer === null || !battle.offer.includes(id)) return false;
-      if (battle.slots.length >= MAX_SLOTS) return false;
-      battle.slots.push(id);
-      battle.offer = null;
-      battle.pending = Math.max(0, battle.pending - 1);
-      addCard(battle, id);
-      battle.events.push({ type: 'draft', id });
-      rollOffer(battle);
+    function rollOffer(battle) {
+      if (battle.offer !== null || battle.pending <= 0) return;
+      const offer = offerUpgrades(battle.build, battle.rng, { draftCount: battle.draftCount });
+      if (offer.length === 0) return;
+      battle.offer = offer;
+      battle.lastStage = stageLabel(battle.build, battle.draftCount);
+      battle.events.push({ type: 'offer' });
+    }
+
+    function deathRound(battle) {
+      const dead = battle.enemies.filter((enemy) => enemy.cells <= 0 && !enemy.deathHandled);
+      if (dead.length === 0) return false;
+      for (const enemy of dead) {
+        enemy.deathHandled = true;
+        battle.kills += 1;
+        battle.stats.kills += 1;
+        battle.stats.killsByType[enemy.type] = (battle.stats.killsByType[enemy.type] ?? 0) + 1;
+        battle.events.push({ type: 'kill', x: enemy.x, y: enemy.y, id: enemy.id, enemyType: enemy.type });
+        queueDeathReactions(battle, enemy);
+        if (enemy.elite) {
+          battle.pending += 1;
+          battle.events.push({ type: 'eliteDown', x: enemy.x, y: enemy.y });
+        }
+        const xp = enemy.elite ? enemyType(enemy.type).xp * 3 : enemyType(enemy.type).xp;
+        awardXp(battle, Math.min(XP_PER_KILL_CAP, xp));
+      }
+      battle.enemies = battle.enemies.filter((enemy) => !enemy.deathHandled);
       return true;
     }
 
-    function createBattle({
-      floor,
-      build,
-      attrs = {},
-      seed = 1,
-      pool = [],
-      drafted = [],
-      points = 0,
-      level = 1,
-      xp = 0,
-      xpNext = 6,
-      pending = 0,
-      extra = 0,
-      cores = [],
-      families = [],
-      pity = null,
-    }) {
-      const def = floorDef(floor);
-      const normalized = normalizeAttrs(attrs);
-      const maxCells = playerCells(normalized);
-      const battle = {
-        def,
-        floor,
-        attrs: normalized,
-        points,
-        pool: [...pool],
-        families: families.map((family) => [...family]),
-        pity,
-        modifier: floorModifier(floor),
-        slots: [...drafted],
-        cards: [],
-        rules: [],
-        selfs: [],
-        verbs: [],
-        sources: [],
-        summons: [],
-        respawns: [],
-        traps: [],
-        trails: [],
-        trapSources: [],
-        trailSources: [],
-        enemies: [],
-        bullets: [],
-        rng: mulberry32(seed),
-        time: 0,
-        state: 'fighting',
-        player: {
-          x: ARENA.w / 2,
-          y: ARENA.h / 2,
-          cells: maxCells,
-          maxCells,
-          speed: PLAYER_SPEED,
-          shield: 0,
-        },
-        level,
-        xp,
-        xpNext,
-        pending,
-        extra: Math.min(MAX_EXTRA, Math.max(0, extra)),
-        burnCap: BURN.cap,
-        emberSpread: 1,
-        echoKills: 0,
-        offer: null,
-        hitCount: 0,
-        anchorTimer: 0,
-        pinCd: 0,
-        timeStopTimer: 0,
-        delayQueue: [],
-        snapshots: [],
-        snapshotTimer: 0,
-        rewindCd: 0,
-        rewindUsed: false,
-        chainStacks: 0,
-        shieldTimer: 6,
-        bloodStacks: 0,
-        stats: { damage: {}, killsByLock: {} },
-        surge: false,
-        spawned: 0,
-        kills: 0,
-        events: [],
-        nextId: 1,
-        seed,
-      };
-      for (const id of build) addCard(battle, id);
-      for (const id of cores) addCard(battle, id);
-      battle.burnCap = hasCore(battle, 'core_ember') ? BURN.cap + 2 : BURN.cap;
-      battle.emberSpread = hasCore(battle, 'core_ember') ? 3 : 1;
-      if (hasRule(battle, 'overdraft')) {
-        battle.player.cells = Math.max(1, battle.player.cells - 3);
-        refreshCooldowns(battle);
+    function processAllCommands(battle) {
+      processCommands(battle);
+      let rounds = 0;
+      while (deathRound(battle) && rounds < 8) {
+        rounds += 1;
+        processCommands(battle);
       }
-      if (battle.pending > 0) rollOffer(battle);
-      return battle;
+      if (rounds >= 8) diagnose(battle, 'death-rounds', { rounds });
     }
 
-    function nearestEnemy(battle, from, range = Infinity, excludeId = -1) {
-      let best = null;
-      let bestD = range;
-      for (const e of battle.enemies) {
-        if (e.cells <= 0 || e.id === excludeId) continue;
-        const d = dist(from, e);
-        if (d < bestD) {
-          best = e;
-          bestD = d;
-        }
-      }
-      return best;
-    }
-
-    /** 猎手核心：优先打格数最低的；标记规则：优先打带标记的。 */
-    function pickTarget(battle, from, range, excludeId = -1) {
-      if (hasRule(battle, 'mark_hunter')) {
-        let marked = null;
-        let bestMark = 0;
-        let bestD = Infinity;
-        for (const e of battle.enemies) {
-          if (e.cells <= 0 || e.id === excludeId || (e.mark ?? 0) <= 0) continue;
-          const d = dist(from, e);
-          if (d > range) continue;
-          if (e.mark > bestMark || (e.mark === bestMark && d < bestD)) {
-            marked = e;
-            bestMark = e.mark;
-            bestD = d;
-          }
-        }
-        if (marked !== null) return marked;
-      }
-      if (!hasCore(battle, 'core_hunter')) return nearestEnemy(battle, from, range, excludeId);
-      let best = null;
-      let bestCells = Infinity;
-      let bestD = Infinity;
-      for (const e of battle.enemies) {
-        if (e.cells <= 0 || e.id === excludeId) continue;
-        const d = dist(from, e);
-        if (d > range) continue;
-        if (e.cells < bestCells || (e.cells === bestCells && d < bestD)) {
-          best = e;
-          bestCells = e.cells;
-          bestD = d;
-        }
-      }
-      return best;
-    }
-
-    /** 本方实际要刷多少只：拥挤层 +50%，过载潮再叠加。 */
-    function enemyTotal(battle) {
-      let base = battle.def.enemies;
-      if (battle.modifier === 'crowded') base = Math.round(base * 1.5);
-      return base + battle.extra;
-    }
-
-    function spawnTick(battle) {
-      const total = enemyTotal(battle);
-      // 额外敌人不延长层时长，而是压缩刷怪间隔，否则压力永远刷不完
-      const interval = FLOOR_SECONDS / total;
-      while (battle.spawned < total && battle.time >= battle.spawned * interval) {
-        const index = battle.spawned;
-        const isElite = battle.modifier === 'elite' && index === total - 1;
-        const lock = battle.def.locks.length ? battle.def.locks[index % battle.def.locks.length] : null;
-        const locks = isElite ? ['carapace', 'phase'] : lock ? [lock] : [];
-        let cells = isElite
-          ? Math.round(enemyCells(battle.floor, []) * 3)
-          : enemyCells(battle.floor, locks);
-        if (!isElite && battle.modifier === 'crowded') cells = Math.round(cells * 0.7);
-        const at = spawnPoint(battle.rng);
-        battle.enemies.push({
-          id: battle.nextId++,
-          x: at.x,
-          y: at.y,
-          cells,
-          maxCells: cells,
-          locks,
-          primary: true,
-          canSplit: lock === 'split',
-          elite: isElite,
-          r: enemyRadius(cells),
-          speed:
-            (ENEMY_SPEED_BASE + battle.floor * ENEMY_SPEED_PER_FLOOR + battle.rng() * 4) *
-            (locks.includes('anchor') ? 0.7 : 1) *
-            (battle.modifier === 'frenzy' ? 1.3 : 1),
-          damage: enemyDamage(battle.floor) + (battle.modifier === 'frenzy' ? 1 : 0),
-          attackTimer: ENEMY_ATTACK_INTERVAL,
-          status: createStatus(),
-          freeze: 0,
-          root: 0,
-          vortex: 0,
-          wallCd: 0,
-          mark: 0,
-          markLeft: 0,
-          cleanseCd: 3,
-          devourCd: 6,
-          phaseCd: 4,
-          invuln: 0,
-          shield: 0,
-          genCd: 3,
-          reflectCd: 0,
-          flash: 0,
+    function statusTicks(battle, dt) {
+      const ticks = tickStatuses(battle, dt);
+      for (const tick of ticks) {
+        enqueue(battle, {
+          type: 'statusDamage',
+          targetId: tick.targetId,
+          sourceEntityId: tick.sourceEntityId,
+          skillInstanceId: tick.skillInstanceId,
+          rootEventId: tick.rootEventId ?? undefined,
+          tags: ['status', tick.statusId],
+          payload: { damage: tick.damage, statusId: tick.statusId },
         });
-        battle.spawned += 1;
-        if (hasCore(battle, 'core_anchor') && battle.time < 3) {
-          battle.enemies[battle.enemies.length - 1].freeze = 3;
-        }
-      }
-    }
-
-    function playerMove(battle, dt) {
-      const p = battle.player;
-      const nearest = nearestEnemy(battle, p);
-      let vx = 0;
-      let vy = 0;
-      if (nearest) {
-        const dx = p.x - nearest.x;
-        const dy = p.y - nearest.y;
-        const d = Math.hypot(dx, dy) || 1;
-        if (d < KEEP_DISTANCE - 8) {
-          vx += dx / d;
-          vy += dy / d;
-        } else if (d > KEEP_DISTANCE + 8) {
-          vx -= dx / d;
-          vy -= dy / d;
-        } else {
-          vx += -dy / d;
-          vy += dx / d;
-        }
-      }
-      const cx = ARENA.w / 2 - p.x;
-      const cy = ARENA.h / 2 - p.y;
-      const cd = Math.hypot(cx, cy) || 1;
-      if (cd > CENTER_PULL) {
-        vx += (cx / cd) * 0.7;
-        vy += (cy / cd) * 0.7;
-      }
-      const len = Math.hypot(vx, vy);
-      if (len < 0.001) return;
-      p.x = clamp(p.x + (vx / len) * p.speed * dt, 6, ARENA.w - 6);
-      p.y = clamp(p.y + (vy / len) * p.speed * dt, 6, ARENA.h - 6);
-    }
-
-    /** 敌方护盾先吸收，再扣格。所有伤害都走这里。 */
-    function applyDamage(enemy, amount) {
-      let left = amount;
-      if ((enemy.shield ?? 0) > 0) {
-        const absorbed = Math.min(enemy.shield, left);
-        enemy.shield -= absorbed;
-        left -= absorbed;
-      }
-      enemy.cells -= left;
-      return left;
-    }
-
-    function recordDamage(battle, id, amount) {
-      if (!(amount > 0)) return;
-      battle.stats.damage[id] = (battle.stats.damage[id] ?? 0) + amount;
-    }
-
-    function rawHit(battle, enemy, cells, burn = 0, source = 'bullet') {
-      if ((enemy.invuln ?? 0) > 0) {
-        battle.events.push({ type: 'phase', x: enemy.x, y: enemy.y });
-        return 0;
-      }
-      const dealt = resolveHit(enemy, cells, { main: true });
-      const applied = applyDamage(enemy, dealt);
-      recordDamage(battle, source, applied);
-      enemy.flash = 0.12;
-      if (burn) applyBurn(enemy.status, burn, battle.burnCap);
-      battle.events.push({ type: 'hit', x: enemy.x, y: enemy.y, cells: dealt });
-      return dealt;
-    }
-
-    function addMark(enemy, stacks) {
-      enemy.mark = Math.min(3, (enemy.mark ?? 0) + stacks);
-      enemy.markLeft = 6;
-    }
-
-    function hitEnemy(battle, enemy, card) {
-      let cells = attackCells(card, battle.attrs);
-      if (hasRule(battle, 'blood_debt') && battle.bloodStacks > 0) {
-        cells += battle.bloodStacks;
-        battle.bloodStacks = 0;
-      }
-      rawHit(battle, enemy, cells, card.burn ?? 0, card.id ?? 'bullet');
-
-      if (card.mark) addMark(enemy, card.mark);
-      if (hasRule(battle, 'mark_hunter')) addMark(enemy, 1);
-
-      if (hasRule(battle, 'rule_pin') && battle.pinCd <= 0) {
-        enemy.root = Math.max(enemy.root, 1);
-        battle.pinCd = 3;
-      }
-
-      if (hasRule(battle, 'rule_execute') && enemy.cells > 0 && enemy.cells <= EXECUTE_THRESHOLD) {
-        enemy.cells = 0;
-        battle.events.push({ type: 'execute', x: enemy.x, y: enemy.y });
-      }
-
-      if (
-        hasRule(battle, 'execute_mark') &&
-        (enemy.mark ?? 0) >= 3 &&
-        enemy.cells > 0 &&
-        enemy.cells <= 4
-      ) {
-        enemy.cells = 0;
-        battle.events.push({ type: 'execute', x: enemy.x, y: enemy.y });
-      }
-
-      if (hasRule(battle, 'rule_combo')) {
-        battle.hitCount += 1;
-        if (battle.hitCount % COMBO_EVERY === 0) {
-          const extra = pickTarget(battle, battle.player, orbRange(battle), enemy.id);
-          if (extra !== null && extra.cells > 0) rawHit(battle, extra, 1, 0, 'combo');
-        }
-      }
-    }
-
-    function fireBullet(battle, from, card, target) {
-      battle.bullets.push({
-        id: battle.nextId++,
-        x: from.x,
-        y: from.y,
-        targetId: target.id,
-        // 存基础格数：命中时 hitEnemy 会再走一次 attackCells，否则锋锐会被加成两次
-        cells: card.cells ?? 1,
-        burn: card.burn ?? 0,
-        mark: card.mark ?? 0,
-        pierce: hasCore(battle, 'core_pierce') ? 1 : 0,
-        life: 1.2,
-      });
-      battle.events.push({ type: 'shot', x: from.x, y: from.y, card: card.id });
-    }
-
-    function pulse(battle, card) {
-      const targets = battle.enemies
-        .filter((e) => e.cells > 0 && dist(battle.player, e) <= fieldRadius(battle) + e.r)
-        .slice(0, card.aoe || 1);
-      for (const e of targets) hitEnemy(battle, e, card);
-      if (targets.length > 0) {
-        battle.events.push({ type: 'pulse', x: battle.player.x, y: battle.player.y, card: card.id });
-      }
-    }
-
-    function attackTick(battle, dt) {
-      for (const source of battle.sources) {
-        if (battle.modifier === 'silent' && source.card.carrier === 'field') continue;
-        source.timer -= dt;
-        if (source.timer > 0) continue;
-        source.timer += cardCooldown(battle, source.card.cd);
-        if (source.card.carrier === 'field') {
-          pulse(battle, source.card);
-          continue;
-        }
-        const extra = hasRule(battle, 'chain') ? battle.chainStacks : 0;
-        if (extra > 0) battle.chainStacks = 0;
-        for (let shot = 0; shot < 1 + extra; shot += 1) {
-          const target = pickTarget(battle, battle.player, orbRange(battle));
-          if (target === null) break;
-          fireBullet(battle, battle.player, source.card, target);
-        }
-      }
-
-    }
-
-    function summonsTick(battle, dt) {
-      const p = battle.player;
-
-      if (hasRule(battle, 'merge')) {
-        for (let i = 0; i < battle.summons.length; i += 1) {
-          for (let j = i + 1; j < battle.summons.length; j += 1) {
-            const a = battle.summons[i];
-            const b = battle.summons[j];
-            if (dist(a, b) > 10) continue;
-            a.cells += b.cells;
-            a.maxCells += b.maxCells;
-            a.merged = true;
-            battle.summons.splice(j, 1);
-            j -= 1;
-            battle.events.push({ type: 'merge', x: a.x, y: a.y });
-          }
-        }
-      }
-
-      for (let i = battle.summons.length - 1; i >= 0; i -= 1) {
-        const summon = battle.summons[i];
-
-        if (summon.mode === 'totem') {
-          summon.timer -= dt;
-          if (summon.timer > 0) continue;
-          summon.timer += cardCooldown(battle, summon.card.cd);
-          for (const other of battle.summons) {
-            if (other === summon) continue;
-            if (dist(summon, other) > 30) continue;
-            other.cells = Math.min(other.maxCells, other.cells + 1);
-          }
-          continue;
-        }
-
-        if (summon.mode === 'charge') {
-          const target = nearestEnemy(battle, summon, 220);
-          if (target === null) continue;
-          const d = dist(summon, target) || 1;
-          if (d <= target.r + 4) {
-            for (const e of battle.enemies) {
-              if (e.cells <= 0) continue;
-              if (dist(e, summon) > (summon.card.radius ?? 18)) continue;
-              rawHit(battle, e, summon.card.blast ?? 3, 0, summon.card.id);
-            }
-            battle.events.push({ type: 'blast', x: summon.x, y: summon.y });
-            killSummon(battle, summon);
-            continue;
-          }
-          summon.x += ((target.x - summon.x) / d) * 60 * dt;
-          summon.y += ((target.y - summon.y) / d) * 60 * dt;
-          continue;
-        }
-
-        const tx = p.x - 10;
-        const ty = p.y - 10;
-        summon.x += (tx - summon.x) * Math.min(1, dt * 3);
-        summon.y += (ty - summon.y) * Math.min(1, dt * 3);
-        summon.timer -= dt;
-        if (summon.timer > 0) continue;
-        summon.timer += cardCooldown(battle, summon.card.cd);
-        const target = pickTarget(battle, summon, summonRange(battle));
-        if (target !== null) fireBullet(battle, summon, summon.card, target);
-      }
-    }
-
-    function selfTick(battle, dt) {
-      for (const self of battle.selfs) {
-        self.timer -= dt;
-        if (self.timer > 0) continue;
-        self.timer += cardCooldown(battle, self.card.cd);
-        const targets = battle.enemies.filter(
-          (e) => e.cells > 0 && dist(battle.player, e) <= selfRadius(battle) + e.r,
-        );
-        for (const e of targets) hitEnemy(battle, e, self.card);
-        if (targets.length > 0) {
-          battle.events.push({ type: 'pulse', x: battle.player.x, y: battle.player.y, card: self.card.id });
-        }
-      }
-    }
-
-    function freezeAll(battle, seconds) {
-      for (const e of battle.enemies) {
-        if (e.cells > 0) e.freeze = Math.max(e.freeze, seconds);
-      }
-      battle.events.push({ type: 'freeze' });
-    }
-
-    function rulesTick(battle, dt) {
-      if (hasRule(battle, 'rule_anchor')) {
-        battle.anchorTimer += dt;
-        if (battle.anchorTimer >= ANCHOR_SECONDS) {
-          battle.anchorTimer -= ANCHOR_SECONDS;
-          freezeAll(battle, FREEZE_SECONDS);
-        }
-      }
-      if (hasRule(battle, 'time_stop')) {
-        battle.timeStopTimer += dt;
-        if (battle.timeStopTimer >= 12) {
-          battle.timeStopTimer -= 12;
-          freezeAll(battle, 1.5);
-        }
-      }
-    }
-
-    function burstShield(battle) {
-      for (const e of battle.enemies) {
-        if (e.cells <= 0) continue;
-        if (dist(battle.player, e) > 24) continue;
-        rawHit(battle, e, 3, 0, 'burst');
-      }
-      battle.events.push({ type: 'burst', x: battle.player.x, y: battle.player.y });
-    }
-
-    function riskTick(battle, dt) {
-      if (!hasRule(battle, 'shield_burst')) return;
-      battle.shieldTimer -= dt;
-      if (battle.shieldTimer > 0) return;
-      battle.shieldTimer += 6;
-      battle.player.shield = Math.min(4, battle.player.shield + 2);
-      battle.events.push({ type: 'shield', x: battle.player.x, y: battle.player.y });
-    }
-
-    function trapTick(battle, dt) {
-      const p = battle.player;
-
-      for (const source of battle.trapSources) {
-        source.timer -= dt;
-        if (source.timer > 0) continue;
-        source.timer += cardCooldown(battle, source.card.cd);
-        battle.traps.push({ card: source.card, x: p.x, y: p.y, ttl: source.card.ttl });
-      }
-
-      for (let i = battle.traps.length - 1; i >= 0; i -= 1) {
-        const trap = battle.traps[i];
-        trap.ttl -= dt;
-        const triggered = battle.enemies.some(
-          (e) => e.cells > 0 && dist(trap, e) <= trap.card.radius + e.r,
-        );
-        if (triggered) {
-          for (const e of battle.enemies) {
-            if (e.cells <= 0) continue;
-            if (dist(trap, e) > trap.card.radius + e.r) continue;
-            if (trap.card.cells) rawHit(battle, e, trap.card.cells, 0, trap.card.id);
-            if (trap.card.burn) applyBurn(e.status, trap.card.burn, battle.burnCap);
-            if (trap.card.freeze) e.freeze = Math.max(e.freeze, trap.card.freeze);
-          }
-          battle.events.push({ type: 'trap', x: trap.x, y: trap.y });
-          battle.traps.splice(i, 1);
-          continue;
-        }
-        if (trap.ttl <= 0) battle.traps.splice(i, 1);
-      }
-
-      for (const source of battle.trailSources) {
-        source.timer -= dt;
-        if (source.timer > 0) continue;
-        source.timer += source.card.cd;
-        battle.trails.push({ card: source.card, x: p.x, y: p.y, ttl: source.card.ttl, tick: 0 });
-      }
-
-      for (let i = battle.trails.length - 1; i >= 0; i -= 1) {
-        const trail = battle.trails[i];
-        trail.ttl -= dt;
-        trail.tick -= dt;
-        if (trail.tick <= 0) {
-          trail.tick += 0.5;
-          for (const e of battle.enemies) {
-            if (e.cells <= 0) continue;
-            if (dist(trail, e) > trail.card.radius + e.r) continue;
-            rawHit(battle, e, trail.card.cells, trail.card.burn ?? 0, trail.card.id);
-          }
-        }
-        if (trail.ttl <= 0) battle.trails.splice(i, 1);
-      }
-    }
-
-    function bulletsTick(battle, dt) {
-      const alive = [];
-      for (const bullet of battle.bullets) {
-        const target = battle.enemies.find((e) => e.id === bullet.targetId && e.cells > 0);
-        if (!target) {
-          bullet.life -= dt;
-          if (bullet.life > 0) alive.push(bullet);
-          continue;
-        }
-        const dx = target.x - bullet.x;
-        const dy = target.y - bullet.y;
-        const d = Math.hypot(dx, dy) || 1;
-        const travel = BULLET_SPEED * dt;
-        if (d <= travel + BULLET_HIT_RADIUS) {
-          hitEnemy(battle, target, { cells: bullet.cells, burn: bullet.burn, mark: bullet.mark });
-          if (target.locks.includes('reflect') && (target.reflectCd ?? 0) <= 0) {
-            target.reflectCd = 1;
-            battle.player.cells -= 1;
-            battle.events.push({ type: 'reflect', x: battle.player.x, y: battle.player.y });
-          }
-          if (bullet.pierce > 0) {
-            const next = pickTarget(battle, bullet, orbRange(battle), target.id);
-            if (next !== null) {
-              bullet.pierce -= 1;
-              bullet.targetId = next.id;
-              alive.push(bullet);
-            }
-          }
-          continue;
-        }
-        bullet.x += (dx / d) * travel;
-        bullet.y += (dy / d) * travel;
-        alive.push(bullet);
-      }
-      battle.bullets = alive;
-    }
-
-    function placeEnemy(enemy, nx, ny) {
-      const cx = clamp(nx, enemy.r, ARENA.w - enemy.r);
-      const cy = clamp(ny, enemy.r, ARENA.h - enemy.r);
-      const hitWall = cx !== nx || cy !== ny;
-      enemy.x = cx;
-      enemy.y = cy;
-      return hitWall;
-    }
-
-    /** 撞墙伤害不看甲壳：位移是"撞"，不是"打"。 */
-    function wallSlam(battle, enemy) {
-      if (!hasRule(battle, 'rule_wall_slam')) return;
-      if (enemy.wallCd > 0) return;
-      enemy.wallCd = 1;
-      recordDamage(battle, 'wall', applyDamage(enemy, 2));
-      battle.events.push({ type: 'wall', x: enemy.x, y: enemy.y });
-    }
-
-    function displacementTick(battle, dt) {
-      const p = battle.player;
-      for (const verb of battle.verbs) {
-        verb.timer -= dt;
-        if (verb.timer > 0) continue;
-        verb.timer += verb.card.cd;
-        const radius = verb.card.radius * visionScale(battle.attrs);
-
-        if (verb.card.kind === 'pull') {
-          for (const e of battle.enemies) {
-            if (e.cells <= 0 || e.locks.includes('anchor')) continue;
-            const d = dist(p, e) || 1;
-            if (d > radius) continue;
-            const hit = placeEnemy(
-              e,
-              e.x + ((p.x - e.x) / d) * verb.card.strength,
-              e.y + ((p.y - e.y) / d) * verb.card.strength,
-            );
-            if (hit) wallSlam(battle, e);
-          }
-          battle.events.push({ type: 'pull', x: p.x, y: p.y });
-          continue;
-        }
-
-        if (verb.card.kind === 'push') {
-          for (const e of battle.enemies) {
-            if (e.cells <= 0 || e.locks.includes('anchor')) continue;
-            const d = dist(p, e) || 1;
-            if (d > radius) continue;
-            rawHit(battle, e, verb.card.cells, 0, verb.card.id);
-            const hit = placeEnemy(
-              e,
-              e.x + ((e.x - p.x) / d) * verb.card.strength,
-              e.y + ((e.y - p.y) / d) * verb.card.strength,
-            );
-            if (hit) wallSlam(battle, e);
-          }
-          battle.events.push({ type: 'push', x: p.x, y: p.y });
-          continue;
-        }
-
-        if (verb.card.kind === 'vortex') {
-          for (const e of battle.enemies) {
-            if (e.cells <= 0 || e.locks.includes('anchor')) continue;
-            if (dist(p, e) > radius) continue;
-            e.vortex = Math.max(e.vortex, verb.card.duration);
-          }
-          battle.events.push({ type: 'vortex', x: p.x, y: p.y });
-        }
-      }
-    }
-
-    function enemiesTick(battle, dt) {
-      const p = battle.player;
-      for (const e of battle.enemies) {
-        if (e.cells <= 0) continue;
-        e.flash = Math.max(0, e.flash - dt);
-        if (e.wallCd > 0) e.wallCd = Math.max(0, e.wallCd - dt);
-        if ((e.reflectCd ?? 0) > 0) e.reflectCd = Math.max(0, e.reflectCd - dt);
-        if (e.freeze > 0) {
-          e.freeze = Math.max(0, e.freeze - dt);
-          continue;
-        }
-        if (e.root > 0) {
-          e.root = Math.max(0, e.root - dt);
-          continue;
-        }
-        if (e.vortex > 0) {
-          e.vortex = Math.max(0, e.vortex - dt);
-          const dx = e.x - p.x;
-          const dy = e.y - p.y;
-          const d = Math.hypot(dx, dy) || 1;
-          const hit = placeEnemy(
-            e,
-            e.x + (-dy / d) * VORTEX_SPEED * dt,
-            e.y + (dx / d) * VORTEX_SPEED * dt,
-          );
-          if (hit) wallSlam(battle, e);
-          continue;
-        }
-        if (e.locks.includes('devour')) {
-          e.devourCd = (e.devourCd ?? 6) - dt;
-          if (e.devourCd <= 0) {
-            e.devourCd += 6;
-            const prey = nearestSummon(battle, e, 12);
-            if (prey !== null) {
-              e.cells = Math.min(e.maxCells, e.cells + 3);
-              killSummon(battle, prey);
-            }
-          }
-        }
-        const dx = p.x - e.x;
-        const dy = p.y - e.y;
-        const d = Math.hypot(dx, dy) || 1;
-        const reach = e.r + PLAYER_RADIUS + CONTACT_PAD;
-        if (d > reach) {
-          const step = Math.min(e.speed * dt, d - reach);
-          e.x += (dx / d) * step;
-          e.y += (dy / d) * step;
-          e.attackTimer = Math.min(e.attackTimer, ENEMY_ATTACK_INTERVAL);
-          continue;
-        }
-        e.attackTimer -= dt;
-        if (e.attackTimer > 0) continue;
-        e.attackTimer += ENEMY_ATTACK_INTERVAL;
-        let dmg = damageTaken(e.damage, battle.attrs);
-        if (hasRule(battle, 'link')) {
-          const linked = nearestSummon(battle, p, 40);
-          if (linked !== null) {
-            const transfer = dmg * 0.5;
-            linked.cells -= transfer;
-            dmg -= transfer;
-            if (linked.cells <= 0) killSummon(battle, linked);
-          }
-        }
-        if (battle.player.shield > 0 && dmg > 0) {
-          const absorbed = Math.min(battle.player.shield, dmg);
-          battle.player.shield -= absorbed;
-          dmg -= absorbed;
-          if (battle.player.shield <= 0 && hasRule(battle, 'shield_burst')) burstShield(battle);
-        }
-        if (dmg <= 0) continue;
-        if (hasRule(battle, 'delay')) {
-          battle.delayQueue.push({ due: battle.time + 2, amount: dmg, sourceId: e.id });
-          battle.events.push({ type: 'delay', x: p.x, y: p.y, cells: dmg });
-        } else {
-          p.cells -= dmg;
-          if (hasRule(battle, 'blood_debt')) {
-            battle.bloodStacks = Math.min(3, battle.bloodStacks + 1);
-          }
-          battle.events.push({ type: 'hurt', x: p.x, y: p.y, cells: dmg });
-        }
-        if (p.cells <= 0) {
-          p.cells = 0;
-          battle.state = 'dead';
-          return;
-        }
-      }
-    }
-
-    function statusTick(battle, dt) {
-      for (const e of battle.enemies) {
-        if (e.cells <= 0) continue;
-        if ((e.mark ?? 0) > 0) {
-          e.markLeft = (e.markLeft ?? 0) - dt;
-          if (e.markLeft <= 0) e.mark = 0;
-        }
-        if (e.locks.includes('generator')) {
-          e.genCd = (e.genCd ?? 3) - dt;
-          if (e.genCd <= 0) {
-            e.genCd += 3;
-            for (const ally of battle.enemies) {
-              if (ally === e || ally.cells <= 0) continue;
-              if (dist(e, ally) > 20) continue;
-              ally.shield = Math.min(4, (ally.shield ?? 0) + 2);
-            }
-          }
-        }
-        if (e.locks.includes('cleanse')) {
-          e.cleanseCd = (e.cleanseCd ?? 3) - dt;
-          if (e.cleanseCd <= 0) {
-            e.cleanseCd += 3;
-            e.status.burn = 0;
-            e.mark = 0;
-          }
-        }
-        if (e.locks.includes('phase')) {
-          e.phaseCd = (e.phaseCd ?? 4) - dt;
-          if (e.phaseCd <= 0) {
-            e.phaseCd += 4;
-            e.invuln = 1.5;
-          }
-          if (e.invuln > 0) {
-            e.invuln = Math.max(0, e.invuln - dt);
-            continue;
-          }
-        }
-        const burn = advanceStatus(e.status, dt);
-        if (burn <= 0) continue;
-        const dealt = resolveHit(e, burn, { main: false });
-        recordDamage(battle, 'burn', applyDamage(e, dealt));
-        battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: dealt });
-      }
-    }
-
-    function refreshCooldowns(battle) {
-      for (const source of battle.sources) source.timer = 0;
-      for (const summon of battle.summons) summon.timer = 0;
-      for (const self of battle.selfs) self.timer = 0;
-    }
-
-    function resolveDeaths(battle) {
-      const alive = [];
-      const booms = [];
-      const embers = [];
-      const marks = [];
-      for (const e of battle.enemies) {
-        if (e.cells > 0) {
-          alive.push(e);
-          continue;
-        }
-        battle.kills += 1;
-        battle.stats.kills = (battle.stats.kills ?? 0) + 1;
-        for (const lock of e.locks) {
-          battle.stats.killsByLock[lock] = (battle.stats.killsByLock[lock] ?? 0) + 1;
-        }
-        battle.events.push({ type: 'kill', x: e.x, y: e.y, id: e.id });
-        if (e.primary) {
-          awardXp(battle, Math.max(1, Math.round(e.maxCells / XP_PER_CELL)));
-          if (e.elite) {
-            battle.pending += 1;
-            battle.events.push({ type: 'elite', x: e.x, y: e.y });
-          }
-          if (hasRule(battle, 'rule_boom')) booms.push({ x: e.x, y: e.y });
-          if (hasCore(battle, 'core_siphon')) {
-            battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + 1);
-          }
-          if (e.status.burn > 0) embers.push({ x: e.x, y: e.y, burn: e.status.burn });
-          if ((e.mark ?? 0) > 0) marks.push({ x: e.x, y: e.y, stacks: e.mark });
-          if (hasCore(battle, 'core_echo')) {
-            battle.echoKills += 1;
-            if (battle.echoKills % 8 === 0) refreshCooldowns(battle);
-          }
-          if (hasRule(battle, 'chain')) {
-            battle.chainStacks = Math.min(3, battle.chainStacks + 1);
-          }
-          if (battle.delayQueue.length > 0) {
-            battle.delayQueue = battle.delayQueue.filter((item) => item.sourceId !== e.id);
-          }
-        }
-        if (e.canSplit && e.primary) {
-          const child = Math.max(1, Math.ceil(e.maxCells * 0.5));
-          for (let i = 0; i < 2; i += 1) {
-            alive.push({
-              ...e,
-              id: battle.nextId++,
-              cells: child,
-              maxCells: child,
-              primary: false,
-              canSplit: false,
-              locks: [],
-              r: enemyRadius(child),
-              status: createStatus(),
-              freeze: 0,
-              flash: 0,
-            });
-          }
-        }
-      }
-      battle.enemies = alive;
-
-      // 余烬：灼烧目标死亡时把层数传给最近的敌人（核心把 1 个变成 3 个）
-      for (const ember of embers) {
-        const targets = alive
-          .filter((other) => other.cells > 0)
-          .sort(
-            (a, b) =>
-              Math.hypot(a.x - ember.x, a.y - ember.y) - Math.hypot(b.x - ember.x, b.y - ember.y),
-          )
-          .slice(0, battle.emberSpread);
-        for (const target of targets) applyBurn(target.status, ember.burn, battle.burnCap);
-      }
-
-      // 引信：带标记的敌人死亡时按层数爆炸；传导：标记扩散给最近的两个
-      for (const mark of marks) {
-        if (hasRule(battle, 'fuse')) {
-          for (const other of alive) {
-            if (other.cells <= 0) continue;
-            if (Math.hypot(other.x - mark.x, other.y - mark.y) > 18) continue;
-            recordDamage(battle, 'fuse', applyDamage(other, mark.stacks));
-            battle.events.push({ type: 'burn', x: other.x, y: other.y, cells: mark.stacks });
-          }
-        }
-        if (hasRule(battle, 'spread')) {
-          const targets = alive
-            .filter((other) => other.cells > 0)
-            .sort(
-              (a, b) =>
-                Math.hypot(a.x - mark.x, a.y - mark.y) - Math.hypot(b.x - mark.x, b.y - mark.y),
-            )
-            .slice(0, 2);
-          for (const target of targets) addMark(target, mark.stacks);
-        }
-      }
-
-      for (const at of booms) {
-        for (const e of alive) {
-          if (e.cells <= 0) continue;
-          if (dist(e, at) > BOOM_RADIUS) continue;
-          recordDamage(battle, 'boom', applyDamage(e, 1) + applyDamage(e, 1));
-          e.flash = 0.1;
-          battle.events.push({ type: 'burn', x: e.x, y: e.y, cells: 2 });
-        }
       }
     }
 
@@ -2057,7 +4143,8 @@ window.__ModuleLoader__.load({
         battle.state = 'dead';
         return;
       }
-      if (battle.spawned >= enemyTotal(battle) && battle.enemies.length === 0) {
+      const total = enemyTotal(battle.def, { modifier: battle.modifier, extra: battle.extra });
+      if (battle.spawned >= total && battle.enemies.length === 0) {
         battle.state = 'cleared';
         if (battle.surge) {
           battle.surge = false;
@@ -2067,9 +4154,47 @@ window.__ModuleLoader__.load({
         }
         return;
       }
-      if (battle.time >= TIME_LIMIT) {
-        battle.state = 'timeout';
+      if (battle.time >= TIME_LIMIT) battle.state = 'timeout';
+    }
+
+    /** 推进一帧，返回这一帧产生的事件。 */
+    function step(battle, dt) {
+      if (battle.state !== 'fighting') return [];
+      ensureResolutionState(battle);
+      battle.events = [];
+      battle.time += dt;
+
+      // 1. 推进状态计时，周期伤害变成命令
+      statusTicks(battle, dt);
+
+      // 2. 刷怪与位置（常规移动由独立策略层统一处理）
+      spawnTick(battle);
+      movePlayer(battle, dt);
+      enemiesMove(battle, dt);
+
+      // 3. 到期技能产生动作，位移请求裁决，实体推进与碰撞
+      castDueSkills(battle, dt);
+      resolveDisplacements(battle);
+      updateEntities(battle, dt);
+      advanceDelayed(battle);
+
+      // 4. 处理命中、反应与后续命令
+      processAllCommands(battle);
+
+      // 5. 敌人攻击与敌方弹体
+      if (battle.state === 'fighting') {
+        enemiesAttack(battle, dt);
+        updateEnemyShots(battle, dt);
       }
+
+      checkEnd(battle);
+      return battle.events;
+    }
+
+    /** 一直跑到结束，返回同一场战斗。dt 固定，保证可复现。 */
+    function runToEnd(battle, { dt = 1 / 60, maxSeconds = 120 } = {}) {
+      while (battle.state === 'fighting' && battle.time < maxSeconds) step(battle, dt);
+      return battle;
     }
 
     /** 追加压力：token 换来的额外敌人，只加数量不改组成。 */
@@ -2091,133 +4216,78 @@ window.__ModuleLoader__.load({
       return true;
     }
 
-    /** 花 1 点属性。体魄当场提高上限并补回等量生命。 */
-    function spendPoint(battle, id) {
-      const attr = ATTRIBUTES.find((a) => a.id === id);
-      if (attr === undefined) return false;
-      if (battle.points <= 0) return false;
-      if ((battle.attrs[id] ?? 0) >= attr.max) return false;
-      const before = playerCells(battle.attrs);
-      battle.attrs[id] += 1;
-      battle.points -= 1;
-      const after = playerCells(battle.attrs);
-      if (after !== before) {
-        battle.player.maxCells = after;
-        battle.player.cells = Math.min(after, battle.player.cells + (after - before));
+    /** 切换移动策略；不改变已有构筑。 */
+    function setMovementStrategy(battle, strategy) {
+      battle.movement = createMovementState(battle.plans, strategy);
+      return battle.movement.strategy;
+    }
+
+    /** 选中一张升级：装入组件、重编译、保留飞行中的计划快照。 */
+    function chooseUpgrade(battle, id, placement) {
+      if (battle.offer === null || !battle.offer.includes(id)) return false;
+      const installed = installChoice(battle.build, id, placement);
+      if (!installed.ok) {
+        battle.lastUpgradeError = installed.reason ?? 'install-failed';
+        return false;
       }
-      battle.events.push({ type: 'spend', id });
+      const compiled = compileBuild(installed.build);
+      if (!compiled.ok || compiled.plans.length === 0) return false;
+      battle.build = compiled.build;
+      battle.plans = compiled.plans;
+      replaceSkillInstances(battle, compiled.plans);
+      refreshMovementState(battle);
+      battle.compileErrors = compiled.errors;
+      battle.compileWarnings = [...compiled.warnings, ...(installed.warnings ?? [])];
+      battle.offer = null;
+      battle.pending = Math.max(0, battle.pending - 1);
+      battle.draftCount += 1;
+      battle.lastUpgradeError = null;
+      battle.events.push({ type: 'upgrade', id });
+      rollOffer(battle);
       return true;
     }
 
-    /** 推进一帧，返回这一帧产生的事件。 */
-    function step(battle, dt) {
-      if (battle.state !== 'fighting') return [];
-      battle.events = [];
-      battle.time += dt;
-      spawnTick(battle);
-      for (let i = battle.respawns.length - 1; i >= 0; i -= 1) {
-        if (battle.time < battle.respawns[i].at) continue;
-        const dead = battle.respawns.splice(i, 1)[0];
-        if (battle.summons.length < 6) battle.summons.push(makeSummon(battle, dead.card));
-      }
-      playerMove(battle, dt);
-      attackTick(battle, dt);
-      summonsTick(battle, dt);
-      displacementTick(battle, dt);
-      if (battle.pinCd > 0) battle.pinCd -= dt;
-      selfTick(battle, dt);
-      rulesTick(battle, dt);
-      riskTick(battle, dt);
-      trapTick(battle, dt);
-      bulletsTick(battle, dt);
-      enemiesTick(battle, dt);
-      statusTick(battle, dt);
-      const regen = regenPerSecond(battle.attrs);
-      if (regen > 0 && battle.player.cells > 0 && battle.player.cells < battle.player.maxCells) {
-        battle.player.cells = Math.min(battle.player.maxCells, battle.player.cells + regen * dt);
-      }
-
-      for (let i = battle.delayQueue.length - 1; i >= 0; i -= 1) {
-        const item = battle.delayQueue[i];
-        if (battle.time < item.due) continue;
-        battle.delayQueue.splice(i, 1);
-        battle.player.cells -= item.amount;
-        battle.events.push({ type: 'hurt', x: battle.player.x, y: battle.player.y, cells: item.amount });
-      }
-
-      battle.snapshotTimer -= dt;
-      if (battle.snapshotTimer <= 0) {
-        battle.snapshotTimer += 0.25;
-        battle.snapshots.push({
-          t: battle.time,
-          x: battle.player.x,
-          y: battle.player.y,
-          cells: battle.player.cells,
-        });
-        if (battle.snapshots.length > 16) battle.snapshots.shift();
-      }
-      if (hasRule(battle, 'rewind')) {
-        battle.rewindCd -= dt;
-        const half = battle.player.maxCells * 0.5;
-        if (
-          !battle.rewindUsed &&
-          battle.rewindCd <= 0 &&
-          battle.player.cells > 0 &&
-          battle.player.cells < half
-        ) {
-          const target = battle.snapshots.find((snap) => snap.t <= battle.time - 3);
-          if (target !== undefined) {
-            battle.player.x = target.x;
-            battle.player.y = target.y;
-            battle.player.cells = Math.max(battle.player.cells, target.cells);
-            battle.rewindUsed = true;
-            battle.events.push({ type: 'rewind', x: target.x, y: target.y });
-          }
-        }
-      }
-
-      resolveDeaths(battle);
-      checkEnd(battle);
-      return battle.events;
+    /** 把备用栏组件装回战斗。 */
+    function equipReserve(battle, id) {
+      const result = equipReserveComponent(battle.build, id);
+      if (!result.ok) return false;
+      const compiled = compileBuild(result.build);
+      if (!compiled.ok || compiled.plans.length === 0) return false;
+      battle.build = compiled.build;
+      battle.plans = compiled.plans;
+      replaceSkillInstances(battle, compiled.plans);
+      refreshMovementState(battle);
+      battle.compileErrors = compiled.errors;
+      battle.compileWarnings = [...compiled.warnings, ...(result.warnings ?? [])];
+      battle.events.push({ type: 'upgrade', id });
+      return true;
     }
 
-    /** 一直跑到结束，返回同一场战斗。dt 固定，保证可复现。 */
-    function runToEnd(battle, { dt = 1 / 60, maxSeconds = 120 } = {}) {
-      while (battle.state === 'fighting' && battle.time < maxSeconds) {
-        step(battle, dt);
-      }
-      return battle;
+    /** 当前技能计划的可读摘要，供 UI 与报告使用。 */
+    function planSummary(battle) {
+      return battle.plans.map((plan) => ({
+        id: plan.id,
+        label: plan.label,
+        description: plan.description,
+        color: plan.element === null ? plan.action.color : plan.element.color,
+      }));
+    }
+
+    function upgradeChoices(battle) {
+      if (battle.offer === null) return [];
+      return battle.offer.map((id) => contentById(id)).filter((def) => def !== undefined);
     }
 // </core>
 
-    const W = ARENA.w
-    const H = ARENA.h
-    const STEP = 1 / 60
-    const POLL_MS = 800
-    const CLEAR_PAUSE = 1.1
-    const FAIL_PAUSE = 3.4
-    const MAX_FLOOR = 15
-    const TOKENS_PER_ENEMY = 500
+    const VIEW_W = ARENA.w
+    const VIEW_H = ARENA.h
+    const STEP_SECONDS = 1 / 60
+    const POLL_INTERVAL = 800
+    const PAUSE_CLEAR = 1.1
+    const PAUSE_FAIL = 3.2
+    const TOKENS_PER_SPAWN = 500
     const TYPE_ID = 'dsh-pet'
     const KIND = 'pet'
-
-    const BUILDS = {
-      lab: {
-        id: 'lab',
-        label: '实验',
-        cards: ['orb_phys', 'orb_fire', 'field_fire'],
-        pool: [...LAB_PACK],
-        families: [
-          [...FIRE_PACK],
-          [...GRAVITY_PACK],
-          [...MARK_PACK],
-          [...SUMMON_PACK],
-          [...TIME_PACK],
-          [...RISK_PACK],
-          [...ENV_PACK],
-        ],
-      },
-    }
 
     const COLORS = {
       bg: '#0a0d12',
@@ -2228,16 +4298,18 @@ window.__ModuleLoader__.load({
       eye: '#0a0d12',
       bullet: '#ffd166',
       burn: '#ff9f45',
-      enemy: { rim: '#7e312c', body: '#c4534b' },
-      carapace: { rim: '#2f4a5c', body: '#6f97b0' },
-      split: { rim: '#4d2379', body: '#8f4bd6' },
-      summon: { rim: '#7a5410', body: '#e0a526' },
+      chill: '#9fd8ff',
+      charge: '#ffe066',
+      enemyShot: '#e35d5d',
     }
+
+    const KIND_LABELS = { action: '动作', element: '属性', modifier: '修饰' }
+    const STATUS_ORDER = ['burn', 'chill', 'charge']
 
     const CSS = [
       '.dsh-pet{display:flex;flex-direction:column;gap:6px;padding:8px;color:#dbe7f0;font-size:11px;',
       'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;height:100%;box-sizing:border-box;overflow-y:auto}',
-      '.dsh-pet-top{display:flex;align-items:center;gap:6px}',
+      '.dsh-pet-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
       '.dsh-pet-floor{font-weight:700;color:#ffd166;letter-spacing:.04em}',
       '.dsh-pet-muted{color:#7f93a3}',
       '.dsh-pet-spacer{margin-left:auto}',
@@ -2249,14 +4321,14 @@ window.__ModuleLoader__.load({
       '.dsh-pet-stage{position:relative;border-radius:4px;overflow:hidden;background:#0a0d12}',
       '.dsh-pet-canvas{display:block;width:100%;height:auto;image-rendering:pixelated}',
       '.dsh-pet-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;',
-      'justify-content:center;gap:4px;padding:8px;text-align:center;background:rgba(8,12,18,.72)}',
+      'justify-content:center;gap:4px;padding:8px;text-align:center;background:rgba(8,12,18,.74)}',
       '.dsh-pet-overlay-title{font-size:15px;letter-spacing:.18em}',
       '.dsh-pet-overlay-title.bad{color:#e35d5d}',
       '.dsh-pet-overlay-title.good{color:#6ee7a8}',
       '.dsh-pet-overlay-sub{font-size:10px;color:#9fb2c2;line-height:1.5}',
       '.dsh-pet-cells{height:4px;background:#18212b;border-radius:2px;overflow:hidden}',
       '.dsh-pet-cells i{display:block;height:100%;background:#6ee7a8;transition:width .12s linear}',
-      '.dsh-pet-bottom{display:flex;gap:8px;color:#6c8091;font-size:10px}',
+      '.dsh-pet-bottom{display:flex;gap:8px;color:#6c8091;font-size:10px;flex-wrap:wrap}',
       '.dsh-pet-hot{color:#e35d5d}',
       '.dsh-pet-banner{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;',
       'justify-content:center;gap:2px;pointer-events:none;animation:bannerIn .28s ease-out both}',
@@ -2265,69 +4337,186 @@ window.__ModuleLoader__.load({
       '@keyframes bannerIn{from{opacity:0;transform:scale(1.35)}to{opacity:1;transform:scale(1)}}',
       '@keyframes pointsPulse{0%,100%{opacity:1}50%{opacity:.45}}',
       '.dsh-pet-points.ready{animation:pointsPulse 1.1s ease-in-out infinite}',
-      '.dsh-pet-card{transition:transform .12s ease,background .12s ease,border-color .12s ease}',
-      '.dsh-pet-card:hover{transform:translateY(-1px)}',
       '.dsh-pet-overlay{animation:overlayIn .16s ease-out}',
       '@keyframes overlayIn{from{opacity:0}to{opacity:1}}',
       '.dsh-pet-offer{position:absolute;left:5px;right:5px;bottom:5px;display:flex;flex-direction:column;gap:3px;',
-      'background:rgba(10,14,20,.94);border:1px solid #2a3a4a;border-radius:5px;padding:5px}',
-      '.dsh-pet-offer-title{font-size:9px;color:#ffd166;letter-spacing:.08em}',
+      'background:rgba(10,14,20,.95);border:1px solid #2a3a4a;border-radius:5px;padding:5px;max-height:92%;overflow-y:auto}',
+      '.dsh-pet-offer-title{font-size:9px;color:#ffd166;letter-spacing:.08em;display:flex;gap:6px;align-items:center}',
       '.dsh-pet-card{display:flex;flex-direction:column;gap:1px;text-align:left;font:inherit;font-size:10px;',
       'color:#dbe7f0;background:#111a24;border:1px solid #1f2a36;border-radius:4px;padding:3px 5px;cursor:pointer}',
       '.dsh-pet-card:hover{background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-card-head{display:flex;align-items:center;gap:5px}',
       '.dsh-pet-card-name{color:#ffd166;font-weight:700}',
-      '.dsh-pet-card-desc{color:#8fa4b5;font-size:9px}',
-      '.dsh-pet-attrs{display:flex;flex-direction:column;gap:3px}',
-      '.dsh-pet-attrs-head{display:flex;justify-content:space-between;font-size:10px;color:#7f93a3}',
-      '.dsh-pet-points{color:#ffd166}',
-      '.dsh-pet-attr-grid{display:grid;grid-template-columns:1fr 1fr;gap:3px}',
-      '.dsh-pet-attr{display:flex;justify-content:space-between;font:inherit;font-size:10px;color:#cfe3ef;',
-      'background:#111a24;border:1px solid #1f2a36;border-radius:4px;padding:2px 5px;cursor:pointer}',
-      '.dsh-pet-attr:hover:not(:disabled){background:#16222e;border-color:#3a5470}',
-      '.dsh-pet-attr:disabled{opacity:.45;cursor:default}',
-      '.dsh-pet-attr-val{color:#8fa4b5}',
-      '.dsh-pet-cores{display:flex;flex-direction:column;gap:3px}',
-      '.dsh-pet-cores-head{display:flex;justify-content:space-between;font-size:10px;color:#7f93a3}',
-      '.dsh-pet-core-pool{display:flex;flex-wrap:wrap;gap:3px}',
-      '.dsh-pet-core{font:inherit;font-size:9px;color:#8fa4b5;background:#111a24;',
-      'border:1px solid #1f2a36;border-radius:4px;padding:2px 5px;cursor:pointer}',
-      '.dsh-pet-core.on{color:#0a0d12;background:#ffd166;border-color:#ffd166}',
-      '.dsh-pet-core:disabled{opacity:.35;cursor:default}',
+      '.dsh-pet-card-desc{color:#8fa4b5;font-size:9px;line-height:1.4}',
+      '.dsh-pet-kind{font-size:8px;color:#0a0d12;border-radius:3px;padding:0 3px;letter-spacing:.04em}',
+      '.dsh-pet-slotpick{display:flex;flex-wrap:wrap;gap:3px;padding:2px 0 1px}',
+      '.dsh-pet-slotpick button{font:inherit;font-size:9px;color:#cfe3ef;background:#1a2733;',
+      'border:1px solid #31465a;border-radius:3px;padding:2px 5px;cursor:pointer}',
+      '.dsh-pet-slotpick button:hover{background:#233748}',
+      '.dsh-pet-build{display:flex;flex-direction:column;gap:4px}',
+      '.dsh-pet-build-head{display:flex;justify-content:space-between;font-size:10px;color:#7f93a3}',
+      '.dsh-pet-skill{background:#0e151d;border:1px solid #1d2935;border-radius:4px;padding:3px 5px;',
+      'display:flex;flex-direction:column;gap:2px}',
+      '.dsh-pet-skill-head{display:flex;justify-content:space-between;gap:6px;align-items:center}',
+      '.dsh-pet-skill-name{color:#ffd166;font-weight:700;font-size:10px}',
+      '.dsh-pet-skill-desc{color:#7f93a3;font-size:9px;line-height:1.4}',
+      '.dsh-pet-slots{display:flex;gap:3px;flex-wrap:wrap}',
+      '.dsh-pet-slot{font-size:9px;border-radius:3px;padding:1px 4px;border:1px solid #24313d;',
+      'background:#111a24;color:#cfe3ef}',
+      '.dsh-pet-slot.empty{color:#5f7282;border-style:dashed;background:transparent}',
+      '.dsh-pet-reserve{display:flex;flex-wrap:wrap;gap:3px;align-items:center}',
+      '.dsh-pet-chip{font:inherit;font-size:9px;color:#cfe3ef;background:#111a24;border:1px solid #24313d;',
+      'border-radius:3px;padding:1px 5px;cursor:pointer}',
+      '.dsh-pet-chip:hover{background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-chip:disabled{opacity:.4;cursor:default}',
+      '.dsh-pet-notice{font-size:9px;color:#ffd166;background:#161f16;border:1px solid #2f4a2f;',
+      'border-radius:4px;padding:2px 5px;cursor:pointer;line-height:1.4}',
+      '.dsh-pet-styles{display:flex;flex-direction:column;gap:3px}',
+      '.dsh-pet-style-row{display:flex;flex-wrap:wrap;gap:3px;align-items:center}',
+      '.dsh-pet-style{font:inherit;font-size:9px;color:#cfe3ef;background:#111a24;border:1px solid #24313d;',
+      'border-radius:3px;padding:1px 5px;cursor:pointer}',
+      '.dsh-pet-style:hover:not(:disabled){background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-style.on{color:#0a0d12;background:#ffd166;border-color:#ffd166}',
+      '.dsh-pet-style:disabled{opacity:.35;cursor:default}',
+      '.dsh-pet-reactions{color:#a0e7c8;font-size:9px}',
     ].join('')
 
-    // ---- 进度 ----
+    // ---- 存档 ----
 
-    const SAVE_PREFIX = 'dsh.pet.v3.'
+    const SAVE_PREFIX = 'dsh.pet.v5.'
+    const PREVIOUS_PREFIX = 'dsh.pet.v4.'
+    const LEGACY_PREFIX = 'dsh.pet.v3.'
+    const BACKUP_SUFFIX = '.bak'
 
-    function loadAccount(key) {
-      const empty = {
-        attrs: {},
-        points: 0,
-        cores: [],
-        stats: { kills: 0, bestFloor: 1, maxFloorKills: 0, drafts: 0 },
+    const toInt = (value, min, fallback) => {
+      const n = Math.floor(Number(value))
+      return Number.isFinite(n) && n >= min ? n : fallback
+    }
+
+    function emptyStats() {
+      return { kills: 0, bestFloor: 1, maxFloorKills: 0, drafts: 0 }
+    }
+
+    function emptyAccount() {
+      const style = defaultStyle()
+      return {
+        build: buildFromStyle(style),
+        style: style.id,
+        movement: style.movementPreference,
+        stats: emptyStats(),
+        floor: 1,
+        best: 1,
+        level: 1,
+        xp: 0,
+        xpNext: 8,
+        pending: 0,
+        draftCount: 0,
+        notice: '',
       }
+    }
+
+    function readStore(key) {
       try {
         const store = window.localStorage
-        if (store === undefined || store === null) return empty
-        const raw = store.getItem(SAVE_PREFIX + key)
-        if (raw === null) return empty
-        const parsed = JSON.parse(raw)
-        const src = parsed !== null && typeof parsed === 'object' ? parsed : {}
-        const stats = src.stats !== null && typeof src.stats === 'object' ? src.stats : {}
-        return {
-          attrs: normalizeAttrs(src.attrs),
-          points: Math.max(0, Math.floor(Number(src.points) || 0)),
-          cores: Array.isArray(src.cores) ? src.cores.filter((id) => CORE_CARDS[id]) : [],
-          stats: {
-            kills: Math.max(0, Math.floor(Number(stats.kills) || 0)),
-            bestFloor: Math.max(1, Math.floor(Number(stats.bestFloor) || 1)),
-            maxFloorKills: Math.max(0, Math.floor(Number(stats.maxFloorKills) || 0)),
-            drafts: Math.max(0, Math.floor(Number(stats.drafts) || 0)),
-          },
-        }
+        if (store === undefined || store === null) return null
+        const raw = store.getItem(key)
+        if (raw === null) return null
+        return JSON.parse(raw)
       } catch {
-        return empty
+        return null
       }
+    }
+
+    function backupSave(key, saved) {
+      try {
+        const store = window.localStorage
+        if (store === undefined || store === null) return
+        store.setItem(SAVE_PREFIX + key + BACKUP_SUFFIX, JSON.stringify(saved))
+      } catch {
+        // 备份失败不能阻止读档；原存档在修复前仍未被覆盖
+      }
+    }
+
+    function normalizeMovement(value, style) {
+      return MOVEMENT_STRATEGIES.includes(value) ? value : style.movementPreference
+    }
+
+    function applyOwnedBuild(key, account, saved, style, { backup } = {}) {
+      const hasBuild =
+        saved.build !== null && typeof saved.build === 'object' && Array.isArray(saved.build.skills)
+      if (hasBuild) {
+        const pruned = pruneBuild(saved.build)
+        account.build = pruned.build
+        if (pruned.removed.length > 0) {
+          if (backup === true) backupSave(key, saved)
+          account.notice = '旧构筑里有已移除的组件，已安全清空：' + pruned.removed.join('、')
+        }
+      } else {
+        account.build = buildFromStyle(style)
+      }
+    }
+
+    function normalizeStats(raw) {
+      const src = raw !== null && typeof raw === 'object' ? raw : {}
+      return {
+        kills: toInt(src.kills, 0, 0),
+        bestFloor: toInt(src.bestFloor, 1, 1),
+        maxFloorKills: toInt(src.maxFloorKills, 0, 0),
+        drafts: toInt(src.drafts, 0, 0),
+      }
+    }
+
+    function loadAccount(key) {
+      const account = emptyAccount()
+      const saved = readStore(SAVE_PREFIX + key)
+      if (saved !== null && typeof saved === 'object') {
+        account.stats = normalizeStats(saved.stats)
+        const style = resolveStyle(saved.style, account.stats)
+        account.style = style.id
+        account.movement = normalizeMovement(saved.movement, style)
+        account.floor = Math.min(MAX_FLOOR, toInt(saved.floor, 1, 1))
+        account.best = Math.max(account.floor, toInt(saved.best, 1, account.floor))
+        account.stats.bestFloor = Math.max(account.stats.bestFloor, account.best)
+        account.level = toInt(saved.level, 1, 1)
+        account.xp = toInt(saved.xp, 0, 0)
+        account.xpNext = Math.max(1, toInt(saved.xpNext, 1, 8))
+        account.pending = toInt(saved.pending, 0, 0)
+        account.draftCount = toInt(saved.draftCount, 0, 0)
+        applyOwnedBuild(key, account, saved, style, { backup: true })
+        return account
+      }
+
+      const previous = readStore(PREVIOUS_PREFIX + key)
+      if (previous !== null && typeof previous === 'object') {
+        // v4 账户迁移：构筑与进度原样保留，只补齐风格与移动策略；v4 键不删除。
+        account.stats = normalizeStats(previous.stats)
+        const style = resolveStyle(previous.style, account.stats)
+        account.style = style.id
+        account.movement = normalizeMovement(previous.movement, style)
+        account.floor = Math.min(MAX_FLOOR, toInt(previous.floor, 1, 1))
+        account.best = Math.max(account.floor, toInt(previous.best, 1, account.floor))
+        account.stats.bestFloor = Math.max(account.stats.bestFloor, account.best)
+        account.level = toInt(previous.level, 1, 1)
+        account.xp = toInt(previous.xp, 0, 0)
+        account.xpNext = Math.max(1, toInt(previous.xpNext, 1, 8))
+        account.pending = toInt(previous.pending, 0, 0)
+        account.draftCount = toInt(previous.draftCount, 0, 0)
+        applyOwnedBuild(key, account, previous, style, { backup: false })
+        const pruneNotice = account.notice
+        account.notice =
+          'v4 存档已迁移到 v5：构筑与进度保留，新增风格/移动策略使用默认值。' +
+          (pruneNotice === '' ? '' : ' ' + pruneNotice)
+        return account
+      }
+
+      const legacy = readStore(LEGACY_PREFIX + key)
+      if (legacy !== null && typeof legacy === 'object') {
+        // 旧卡牌/属性/核心不硬映射为新组件：只保留与旧系统无冲突的累计战绩。
+        account.stats = normalizeStats(legacy.stats)
+        account.best = account.stats.bestFloor
+        account.notice = '旧版存档已迁移：旧构筑与属性不再适用，只保留累计战绩。'
+      }
+      return account
     }
 
     function saveAccount(entry) {
@@ -2337,10 +4526,18 @@ window.__ModuleLoader__.load({
         store.setItem(
           SAVE_PREFIX + entry.key,
           JSON.stringify({
-            attrs: entry.attrs,
-            points: entry.points,
-            cores: entry.cores,
+            version: 5,
+            style: entry.style,
+            movement: entry.movement,
+            build: entry.build,
             stats: entry.stats,
+            floor: entry.floor,
+            best: entry.best,
+            level: entry.level,
+            xp: entry.xp,
+            xpNext: entry.xpNext,
+            pending: entry.pending,
+            draftCount: entry.draftCount,
           }),
         )
       } catch {
@@ -2350,15 +4547,17 @@ window.__ModuleLoader__.load({
 
     const ENTRIES = new Map()
 
+    // ---- 战斗循环 ----
+
     function drainTokens(entry) {
       const battle = entry.battle
       if (battle === null || entry.phase !== 'fight') return
-      while (entry.tokenQueue >= TOKENS_PER_ENEMY) {
+      while (entry.tokenQueue >= TOKENS_PER_SPAWN) {
         if (addPressure(battle, 1) === 0) {
           entry.tokenQueue = 0
           return
         }
-        entry.tokenQueue -= TOKENS_PER_ENEMY
+        entry.tokenQueue -= TOKENS_PER_SPAWN
       }
     }
 
@@ -2373,30 +4572,25 @@ window.__ModuleLoader__.load({
       drainTokens(entry)
     }
 
-    function syncAccount(entry) {
+    function settleBattle(entry) {
       const battle = entry.battle
-      if (battle === null) return
-      entry.points = battle.points
-      entry.attrs = { ...battle.attrs }
+      if (battle === null || battle.settled) return
+      battle.settled = true
+      entry.stats.kills += battle.kills
+      entry.stats.maxFloorKills = Math.max(entry.stats.maxFloorKills, battle.kills)
+      entry.build = battle.build
       entry.level = battle.level
       entry.xp = battle.xp
       entry.xpNext = battle.xpNext
       entry.pending = battle.pending
-      entry.stats.kills += battle.kills
-      entry.stats.maxFloorKills = Math.max(entry.stats.maxFloorKills, battle.kills)
-      if (battle.state === 'cleared') {
-        entry.stats.bestFloor = Math.max(entry.stats.bestFloor, entry.floor + 1)
-      }
+      entry.draftCount = battle.draftCount
+      entry.stats.bestFloor = Math.max(entry.stats.bestFloor, entry.best)
       saveAccount(entry)
     }
 
-    function startFloor(entry, floor) {
-      syncAccount(entry)
-      const build = BUILDS[entry.buildId]
-      entry.floor = floor
-      entry.phase = 'fight'
+    function resetVisuals(entry) {
       entry.fx = []
-      entry.acc = 0
+      entry.swingFx = []
       entry.particles = []
       entry.playerTrail = []
       entry.trailTimer = 0
@@ -2406,26 +4600,42 @@ window.__ModuleLoader__.load({
       entry.flash = 0
       entry.muzzle = 0
       entry.hurtT = 0
-      const mod = floorModifier(floor)
-      entry.banner = { text: '第 ' + floor + ' 层', sub: mod !== null ? MODIFIERS[mod].name : '', t: 1.3 }
-      entry.battle = createBattle({
+      entry.acc = 0
+    }
+
+    function startFloor(entry, floor) {
+      entry.floor = floor
+      entry.phase = 'fight'
+      entry.lastResult = null
+      entry.resultTimer = 0
+      entry.choosing = null
+      resetVisuals(entry)
+      const modifier = floorModifier(floor)
+      entry.banner = {
+        text: '第 ' + floor + ' 层',
+        sub: modifier !== null ? MODIFIERS[modifier].name : '',
+        t: 1.3,
+      }
+      const battle = createBattle({
         floor,
-        build: [...build.cards, ...entry.drafted],
-        attrs: entry.attrs,
-        points: entry.points,
-        cores: entry.cores,
+        build: entry.build,
+        seed: entry.seed++,
         level: entry.level,
         xp: entry.xp,
         xpNext: entry.xpNext,
         pending: entry.pending,
-        seed: entry.seed++,
-        pool: build.pool,
-        families: build.families,
-        pity: entry.pity,
-        drafted: entry.drafted,
+        draftCount: entry.draftCount,
+        movementStrategy: entry.movement,
+        styleId: entry.style,
       })
-      entry.pity = null
+      entry.battle = battle
+      const issue = battle.compileErrors[0] ?? battle.compileWarnings[0]
+      if (issue !== undefined) entry.notice = issue.message
+      entry.build = battle.build
+      entry.pending = battle.pending
+      entry.draftCount = battle.draftCount
       drainTokens(entry)
+      saveAccount(entry)
     }
 
     function createEntry(key, seed) {
@@ -2433,26 +4643,27 @@ window.__ModuleLoader__.load({
       const entry = {
         key,
         battle: null,
-        floor: 1,
-        best: 1,
-        buildId: 'lab',
-        attrs: account.attrs,
-        points: account.points,
-        cores: account.cores,
+        floor: account.floor,
+        best: account.best,
+        build: account.build,
+        style: account.style,
+        movement: account.movement,
         stats: account.stats,
-        level: 1,
-        xp: 0,
-        xpNext: 6,
-        pending: 0,
+        level: account.level,
+        xp: account.xp,
+        xpNext: account.xpNext,
+        pending: account.pending,
+        draftCount: account.draftCount,
+        notice: account.notice,
         tokenQueue: 0,
         tokenSeen: new Map(),
         surgeMeter: 0,
-        pity: null,
-        dropped: null,
         phase: 'fight',
         lastResult: null,
         resultTimer: 0,
+        choosing: null,
         fx: [],
+        swingFx: [],
         particles: [],
         playerTrail: [],
         trailTimer: 0,
@@ -2467,7 +4678,6 @@ window.__ModuleLoader__.load({
         hurtT: 0,
         moving: false,
         acc: 0,
-        drafted: [],
         seed: seed === undefined ? (Date.now() % 100000) + 1 : seed,
         running: false,
         online: true,
@@ -2476,77 +4686,89 @@ window.__ModuleLoader__.load({
         last: 0,
         subs: 0,
       }
-      startFloor(entry, 1)
+      startFloor(entry, entry.floor)
       return entry
     }
 
-    function resetRun(entry, floor) {
-      entry.drafted = []
+    function resetRun(entry) {
+      const style = styleById(entry.style) ?? defaultStyle()
+      entry.style = style.id
+      entry.build = buildFromStyle(style)
       entry.level = 1
       entry.xp = 0
-      entry.xpNext = 6
+      entry.xpNext = 8
       entry.pending = 0
+      entry.draftCount = 0
+      entry.choosing = null
       entry.battle = null
-      startFloor(entry, floor)
+      startFloor(entry, 1)
+    }
+
+    function setStyle(entry, id) {
+      const style = styleById(id)
+      if (style === undefined || !isStyleUnlocked(style, entry.stats)) return false
+      entry.style = style.id
+      entry.movement = style.movementPreference
+      resetRun(entry)
+      saveAccount(entry)
+      return true
+    }
+
+    function setMovement(entry, strategy) {
+      if (!MOVEMENT_STRATEGIES.includes(strategy)) return false
+      entry.movement = strategy
+      if (entry.battle !== null) setMovementStrategy(entry.battle, strategy)
+      saveAccount(entry)
+      return true
     }
 
     function advance(entry) {
-      const cleared = entry.lastResult !== null && entry.lastResult.kind === 'cleared'
-      if (!cleared) {
-        // 失败不再回第 1 层：停在失败层，保留 build 与属性，
-        // 下一次三选一保底给一张能解致死锁的卡。
-        const def = floorDef(entry.floor)
-        entry.pity = def.locks.length > 0 ? def.locks[0] : null
-        syncAccount(entry)
-        // 槽位满时没有地方放保底卡：弃置最早的一张，换一次重抽机会
-        if (entry.drafted.length >= 3) entry.dropped = entry.drafted.shift()
-        entry.pending = 1
+      const result = entry.lastResult
+      settleBattle(entry)
+      if (result !== null && result.kind === 'cleared') {
+        const next = entry.floor + 1
         entry.battle = null
-        startFloor(entry, entry.floor)
+        if (next > MAX_FLOOR) {
+          resetRun(entry)
+          return
+        }
+        startFloor(entry, next)
         return
       }
-      // 没选的三选一跨层保留，否则玩家一不留神就丢了这次升级。
-      const carried = entry.battle === null ? null : entry.battle.offer
-      const carriedPending = entry.battle === null ? 0 : entry.battle.pending
-      const next = entry.floor + 1
-      if (next > MAX_FLOOR) {
-        resetRun(entry, 1)
-        return
-      }
-      startFloor(entry, next)
-      if (carried !== null && entry.battle !== null && entry.battle.offer === null) {
-        entry.battle.offer = carried
-        entry.battle.pending = Math.max(1, carriedPending)
-      }
+      entry.battle = null
+      entry.pending = Math.max(1, entry.pending + 1)
+      startFloor(entry, entry.floor)
     }
 
-    function pickCard(entry, id) {
+    function pickUpgrade(entry, id, placement) {
       const battle = entry.battle
       if (battle === null) return false
-      if (!chooseCard(battle, id)) return false
-      entry.drafted.push(id)
+      if (!chooseUpgrade(battle, id, placement)) {
+        const reason = battle.lastUpgradeError
+        if (reason === 'reserve-full') entry.notice = '备用栏空间不足，无法替换动作或组件'
+        else if (reason === 'capability-mismatch') entry.notice = '该动作不支持当前属性或修饰'
+        else if (reason === 'duplicate-action') entry.notice = '该动作已经在构筑中'
+        else if (reason !== undefined && reason !== null) entry.notice = '无法装入该位置：' + reason
+        return false
+      }
+      entry.build = battle.build
+      entry.pending = battle.pending
+      entry.draftCount = battle.draftCount
       entry.stats.drafts += 1
+      entry.choosing = null
+      const warning = (battle.compileWarnings ?? [])[0]
+      if (warning !== undefined) entry.notice = warning.message
       saveAccount(entry)
       return true
     }
 
-    function toggleCore(entry, id) {
-      if (!unlockedCores(entry.stats).includes(id)) return false
-      const index = entry.cores.indexOf(id)
-      if (index >= 0) entry.cores.splice(index, 1)
-      else if (entry.cores.length < 3) entry.cores.push(id)
-      else return false
-      saveAccount(entry)
-      resetRun(entry, 1)
-      return true
-    }
-
-    function spend(entry, id) {
+    function equipFromReserve(entry, id) {
       const battle = entry.battle
       if (battle === null) return false
-      if (!spendPoint(battle, id)) return false
-      entry.attrs = { ...battle.attrs }
-      entry.points = battle.points
+      if (!equipReserve(battle, id)) return false
+      entry.build = battle.build
+      const warning = (battle.compileWarnings ?? [])[0]
+      if (warning !== undefined) entry.notice = warning.message
       saveAccount(entry)
       return true
     }
@@ -2572,31 +4794,89 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** 把战斗事件翻译成场面反馈：粒子、震屏、闪白、横幅。 */
+    function ring(entry, x, y, radius, life, color) {
+      entry.fx.push({ x, y, r: radius, life, maxLife: life, color })
+    }
+
     function juice(entry, ev) {
+      const color = ev.element === undefined || ev.element === null
+        ? null
+        : (contentById(ev.element)?.color ?? null)
       switch (ev.type) {
         case 'hit':
-          addParticles(entry, ev.x, ev.y, ev.cells >= 3 ? 5 : 3, '#ffe9b0', 44, 0.28, 30)
+          addParticles(entry, ev.x, ev.y, ev.cells >= 3 ? 5 : 3, color ?? '#ffe9b0', 44, 0.28, 30)
           if (ev.cells >= 3) entry.shake = Math.max(entry.shake, 1.4)
+          break
+        case 'status':
+          addParticles(entry, ev.x, ev.y, 1, contentById(ev.status)?.color ?? '#ff9f45', 16, 0.4, -18)
           break
         case 'burn':
           addParticles(entry, ev.x, ev.y, 1, '#ff9f45', 12, 0.5, -22)
           break
         case 'kill':
           addParticles(entry, ev.x, ev.y, 5, '#ffd166', 52, 0.35, 40)
-          entry.fx.push({ x: ev.x, y: ev.y, r: 2, life: 0.3 })
+          ring(entry, ev.x, ev.y, 2, 0.3, '#ffd166')
           break
         case 'shot':
           entry.muzzle = 0.06
           break
         case 'pulse':
-          entry.fx.push({ x: ev.x, y: ev.y, r: 5, life: 0.45 })
-          addParticles(entry, ev.x, ev.y, 3, '#ffd166', 30, 0.3, 0)
+          ring(entry, ev.x, ev.y, ev.radius, 0.42, ev.color ?? '#ffd166')
+          addParticles(entry, ev.x, ev.y, 3, ev.color ?? '#ffd166', 30, 0.3, 0)
           break
-        case 'blast':
-          entry.fx.push({ x: ev.x, y: ev.y, r: 8, life: 0.5 })
-          addParticles(entry, ev.x, ev.y, 8, '#ffb347', 62, 0.4, 50)
+        case 'swing':
+          entry.swingFx.push({
+            x: ev.x,
+            y: ev.y,
+            angle: ev.angle,
+            half: ev.half,
+            radius: ev.radius,
+            color: ev.color ?? '#ffb347',
+            life: 0.2,
+          })
+          addParticles(entry, ev.x, ev.y, 4, ev.color ?? '#ffb347', 34, 0.24, 0)
+          entry.shake = Math.max(entry.shake, 0.8)
+          break
+        case 'swordSummon':
+          ring(entry, ev.x, ev.y, 10, 0.4, ev.color ?? '#a0e7c8')
+          addParticles(entry, ev.x, ev.y, 3, ev.color ?? '#a0e7c8', 26, 0.3, 0)
+          break
+        case 'swordShot':
+          entry.muzzle = 0.06
+          addParticles(entry, ev.x, ev.y, 2, ev.color ?? '#9fd8ff', 30, 0.22, 0)
+          break
+        case 'swordArray':
+          ring(entry, ev.x, ev.y, ev.radius, 0.45, ev.color ?? '#c9b3ff')
+          addParticles(entry, ev.x, ev.y, 5, ev.color ?? '#c9b3ff', 30, 0.32, 0)
+          break
+        case 'swordArrayPulse':
+          ring(entry, ev.x, ev.y, ev.radius, 0.28, ev.color ?? '#c9b3ff')
+          break
+        case 'detonate':
+          ring(entry, ev.x, ev.y, ev.radius, 0.4, '#ff6b6b')
+          addParticles(entry, ev.x, ev.y, 7, '#ff6b6b', 44, 0.32, 20)
+          entry.shake = Math.max(entry.shake, 1.6)
+          break
+        case 'trapPlaced':
+          ring(entry, ev.x, ev.y, 6, 0.32, ev.color ?? '#c9b3ff')
+          addParticles(entry, ev.x, ev.y, 2, ev.color ?? '#c9b3ff', 16, 0.3, 0)
+          break
+        case 'trapTrigger':
+          ring(entry, ev.x, ev.y, ev.radius, 0.48, ev.color ?? '#c9b3ff')
+          addParticles(entry, ev.x, ev.y, 8, ev.color ?? '#c9b3ff', 48, 0.35, 30)
+          entry.shake = Math.max(entry.shake, 2)
+          break
+        case 'impact':
+          ring(entry, ev.x, ev.y, ev.radius, 0.5, ev.color ?? '#ff8f6b')
+          addParticles(entry, ev.x, ev.y, 10, ev.color ?? '#ff8f6b', 62, 0.4, 50)
           entry.shake = Math.max(entry.shake, 3)
+          break
+        case 'reaction':
+          addParticles(entry, ev.x, ev.y, 6, contentById(ev.id)?.color ?? '#a0e7c8', 46, 0.36, 10)
+          ring(entry, ev.x, ev.y, 4, 0.32, contentById(ev.id)?.color ?? '#a0e7c8')
+          break
+        case 'pull':
+          addParticles(entry, ev.x, ev.y, 1, '#8fd8ff', 14, 0.22, 0)
           break
         case 'hurt':
           entry.shake = Math.max(entry.shake, 2.4)
@@ -2604,9 +4884,11 @@ window.__ModuleLoader__.load({
           entry.flashColor = '#e35d5d'
           entry.hurtT = 0.2
           break
-        case 'freeze':
-          entry.flash = Math.max(entry.flash, 0.16)
-          entry.flashColor = '#9fd8ff'
+        case 'enemyShot':
+          addParticles(entry, ev.x, ev.y, 1, COLORS.enemyShot, 14, 0.2, 0)
+          break
+        case 'levelUp':
+          entry.banner = { text: '升级', sub: 'Lv.' + ev.level, t: 1.1 }
           break
         case 'surge':
           entry.banner = { text: '过载潮', sub: 'token 压力', t: 1.6 }
@@ -2615,28 +4897,15 @@ window.__ModuleLoader__.load({
           entry.shake = Math.max(entry.shake, 3)
           break
         case 'elite':
-          entry.banner = { text: '精英', sub: '双锁', t: 1.2 }
+          entry.banner = { text: '精英', sub: '强化敌人', t: 1.2 }
           entry.flash = Math.max(entry.flash, 0.3)
           entry.flashColor = '#ffd166'
           break
-        case 'merge':
-          addParticles(entry, ev.x, ev.y, 4, '#9fd8ff', 34, 0.3, 0)
+        case 'eliteDown':
+          entry.banner = { text: '精英击破', sub: '额外选择', t: 1.2 }
           break
-        case 'summonDown':
-          addParticles(entry, ev.x, ev.y, 3, '#ffb347', 40, 0.3, 30)
-          break
-        case 'execute':
-          addParticles(entry, ev.x, ev.y, 6, '#ff6b6b', 55, 0.35, 30)
-          entry.shake = Math.max(entry.shake, 1.6)
-          break
-        case 'wall':
-          addParticles(entry, ev.x, ev.y, 3, '#8fa4b5', 30, 0.25, 20)
-          break
-        case 'reflect':
-          addParticles(entry, ev.x, ev.y, 2, '#9fd8ff', 28, 0.25, 0)
-          break
-        case 'phase':
-          addParticles(entry, ev.x, ev.y, 1, '#c9b3ff', 18, 0.3, 0)
+        case 'surgeReward':
+          entry.banner = { text: '过载清场', sub: '额外选择', t: 1.2 }
           break
         default:
           break
@@ -2672,6 +4941,10 @@ window.__ModuleLoader__.load({
         f.r += dt * 46
       }
       if (entry.fx.length > 0) entry.fx = entry.fx.filter((f) => f.life > 0)
+      for (const f of entry.swingFx ?? []) f.life -= dt
+      if ((entry.swingFx ?? []).length > 0) {
+        entry.swingFx = entry.swingFx.filter((f) => f.life > 0)
+      }
 
       if (entry.phase === 'result') {
         entry.resultTimer -= dt
@@ -2692,8 +4965,8 @@ window.__ModuleLoader__.load({
         entry.playerTrail.push({ x: battle.player.x, y: battle.player.y, life: 0.32 })
         if (entry.playerTrail.length > 14) entry.playerTrail.shift()
       }
-      for (const e of battle.enemies) {
-        if (!entry.spawnAt.has(e.id)) entry.spawnAt.set(e.id, entry.time)
+      for (const enemy of battle.enemies) {
+        if (!entry.spawnAt.has(enemy.id)) entry.spawnAt.set(enemy.id, entry.time)
       }
       for (const ev of events) juice(entry, ev)
       if (battle.state !== 'fighting') {
@@ -2704,8 +4977,12 @@ window.__ModuleLoader__.load({
           cells: battle.player.cells,
         }
         entry.phase = 'result'
-        entry.resultTimer = battle.state === 'cleared' ? CLEAR_PAUSE : FAIL_PAUSE
-        if (battle.state === 'cleared') entry.best = Math.max(entry.best, entry.floor)
+        entry.resultTimer = battle.state === 'cleared' ? PAUSE_CLEAR : PAUSE_FAIL
+        if (battle.state === 'cleared') {
+          entry.best = Math.max(entry.best, entry.floor)
+          entry.stats.bestFloor = Math.max(entry.stats.bestFloor, entry.floor)
+        }
+        settleBattle(entry)
       }
     }
 
@@ -2718,9 +4995,9 @@ window.__ModuleLoader__.load({
         entry.last = now
         entry.acc += dt
         let guard = 0
-        while (entry.acc >= STEP && guard < 8) {
-          tick(entry, STEP)
-          entry.acc -= STEP
+        while (entry.acc >= STEP_SECONDS && guard < 8) {
+          tick(entry, STEP_SECONDS)
+          entry.acc -= STEP_SECONDS
           guard += 1
         }
         if (guard >= 8) entry.acc = 0
@@ -2755,27 +5032,25 @@ window.__ModuleLoader__.load({
       const spawn = entry.spawnAt.get(e.id)
       const age = spawn === undefined ? 1 : entry.time - spawn
       const grow = Math.min(1, age / 0.22)
-      const base = Math.round(5 + Math.min(7, e.cells / 4))
+      const base = Math.round((5 + Math.min(7, e.cells / 4)) * (e.elite ? 1.25 : 1))
       const size = Math.max(1, Math.round(base * (0.45 + grow * 0.55)))
       const half = Math.floor(size / 2)
       const x = Math.round(e.x) - half
       const y = Math.round(e.y) - half
-      const style = e.locks.includes('carapace')
-        ? COLORS.carapace
-        : e.locks.includes('split')
-          ? COLORS.split
-          : COLORS.enemy
+      const type = ENEMY_TYPES[e.type]
+      const style = type === undefined ? ENEMY_TYPES.swarm.color : type.color
       const lit = e.flash > 0
-      const phased = (e.invuln ?? 0) > 0
-      c.globalAlpha = (phased ? 0.45 : 1) * (0.35 + grow * 0.65)
+      const chilled = (e.statuses?.chill?.stacks ?? 0) > 0
+      c.globalAlpha = (0.35 + grow * 0.65)
 
-      // 落地阴影
       c.fillStyle = '#05070a'
       c.fillRect(x, y + size, size, 1)
 
-      if (e.freeze > 0) {
-        c.fillStyle = '#9fd8ff'
+      if (chilled) {
+        c.fillStyle = COLORS.chill
+        c.globalAlpha *= 0.55
         c.fillRect(x - 1, y - 1, size + 2, size + 2)
+        c.globalAlpha = (0.35 + grow * 0.65)
       }
 
       c.fillStyle = lit ? '#ffffff' : style.rim
@@ -2788,13 +5063,12 @@ window.__ModuleLoader__.load({
         c.fillRect(x + 2, y + 2, 1, 1)
         c.fillRect(x + size - 3, y + 2, 1, 1)
       }
-      if (e.locks.includes('carapace') && size >= 5 && !lit) {
-        c.fillStyle = '#2f4a5c'
-        c.fillRect(x + 1, y + Math.floor(size / 2), size - 2, 1)
+      if (e.elite) {
+        c.fillStyle = '#ffd166'
+        c.fillRect(x + half - 1, y - 3, 2, 1)
       }
       c.globalAlpha = 1
 
-      // 格数条
       const barW = Math.max(3, size)
       c.fillStyle = '#101820'
       c.fillRect(x, y - 4, barW, 1)
@@ -2802,45 +5076,16 @@ window.__ModuleLoader__.load({
       const filled = Math.max(1, Math.round((e.cells / e.maxCells) * barW))
       c.fillRect(x, y - 4, Math.min(barW, filled), 1)
 
-      // 锁标记
-      if (e.locks.includes('carapace')) {
-        c.fillStyle = '#8fd8ff'
-        c.fillRect(x - 2, y - 2, 1, 2)
-      }
-      // 灼烧标记（闪烁）
-      if (e.status.burn > 0) {
-        c.fillStyle = Math.sin(entry.time * 18 + e.id) > 0 ? '#ff9f45' : '#ffcf8a'
-        c.fillRect(x + size + 1, y, 1, 1)
-        if (e.status.burn >= 3) c.fillRect(x + size + 1, y + 2, 1, 1)
-      }
-      // 标记（脉冲）
-      if ((e.mark ?? 0) > 0) {
-        c.globalAlpha = 0.45 + 0.55 * Math.abs(Math.sin(entry.time * 8))
-        c.fillStyle = '#ff6b6b'
-        c.fillRect(x + Math.floor(size / 2), y - 6, 1, 1)
-        c.globalAlpha = 1
-      }
-      // 护盾描边（呼吸）
-      if ((e.shield ?? 0) > 0) {
-        c.globalAlpha = 0.5 + 0.5 * Math.abs(Math.sin(entry.time * 5))
-        c.fillStyle = '#9fd8ff'
-        c.fillRect(x - 1, y - 1, size + 2, 1)
-        c.fillRect(x - 1, y + size, size + 2, 1)
-        c.fillRect(x - 1, y - 1, 1, size + 2)
-        c.fillRect(x + size, y - 1, 1, size + 2)
-        c.globalAlpha = 1
-      }
-    }
-
-    function drawSummon(c, s) {
-      const x = Math.round(s.x) - 2
-      const y = Math.round(s.y) - 2
-      c.fillStyle = '#05070a'
-      c.fillRect(x - 1, y - 1, 6, 6)
-      c.fillStyle = COLORS.summon.rim
-      c.fillRect(x, y, 5, 5)
-      c.fillStyle = COLORS.summon.body
-      c.fillRect(x + 1, y + 1, 3, 3)
+      const statuses = e.statuses ?? {}
+      STATUS_ORDER.forEach((id, index) => {
+        const instance = statuses[id]
+        if (instance === undefined || instance.stacks <= 0) return
+        c.fillStyle = contentById(id)?.color ?? '#ffffff'
+        c.globalAlpha = 0.55 + 0.45 * Math.abs(Math.sin(entry.time * 8 + e.id + index))
+        c.fillRect(x + size + 1, y + index * 2, 1, 1)
+        if (instance.stacks >= 3) c.fillRect(x + size + 2, y + index * 2, 1, 1)
+      })
+      c.globalAlpha = 1
     }
 
     function drawPlayer(c, p, entry) {
@@ -2865,6 +5110,23 @@ window.__ModuleLoader__.load({
       }
     }
 
+    function drawAura(c, entry, plan) {
+      const color = plan.element === null ? plan.action.color : plan.element.color
+      c.globalAlpha = 0.26 + 0.08 * Math.sin(entry.time * 2.4)
+      c.fillStyle = color
+      const radius = plan.radius
+      for (let i = 0; i < 24; i += 1) {
+        const a = (i / 24) * Math.PI * 2
+        c.fillRect(
+          Math.round(entry.battle.player.x + Math.cos(a) * radius),
+          Math.round(entry.battle.player.y + Math.sin(a) * radius),
+          1,
+          1,
+        )
+      }
+      c.globalAlpha = 1
+    }
+
     function draw(c, entry) {
       const shake = entry.shake
       const ox = shake > 0 ? Math.sin(entry.time * 130) * shake : 0
@@ -2872,41 +5134,27 @@ window.__ModuleLoader__.load({
       c.setTransform(2, 0, 0, 2, Math.round(ox * 2), Math.round(oy * 2))
       c.imageSmoothingEnabled = false
       c.fillStyle = COLORS.bg
-      c.fillRect(-8, -8, W + 16, H + 16)
+      c.fillRect(-8, -8, VIEW_W + 16, VIEW_H + 16)
 
-      // 环境浮尘
       c.fillStyle = '#22303f'
       for (let i = 0; i < 12; i += 1) {
-        const x = (i * 37 + entry.time * (4 + (i % 3))) % W
-        const y = (i * 53 + Math.sin(entry.time * 0.6 + i) * 6 + H) % H
+        const x = (i * 37 + entry.time * (4 + (i % 3))) % VIEW_W
+        const y = (i * 53 + Math.sin(entry.time * 0.6 + i) * 6 + VIEW_H) % VIEW_H
         c.fillRect(Math.round(x), Math.round(y), 1, 1)
       }
 
-      // 背景余烬：缓慢上升，给空场一点呼吸
-      c.fillStyle = '#ff9f45'
-      for (let i = 0; i < 7; i += 1) {
-        const t = (entry.time * 0.28 + i * 0.143) % 1
-        const x = (i * 23 + Math.sin(entry.time * 0.4 + i) * 9 + W) % W
-        const y = H - t * H
-        c.globalAlpha = 0.22 * (1 - t)
-        c.fillRect(Math.round(x), Math.round(y), 1, 1)
-      }
-      c.globalAlpha = 1
-
-      // 网格呼吸
       c.globalAlpha = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(entry.time * 2))
       c.fillStyle = COLORS.grid
-      for (let x = 8; x < W; x += 8) for (let y = 8; y < H; y += 8) c.fillRect(x, y, 1, 1)
+      for (let x = 8; x < VIEW_W; x += 8) for (let y = 8; y < VIEW_H; y += 8) c.fillRect(x, y, 1, 1)
       c.globalAlpha = 1
 
-      // 场地标记：中心环 + 四角括号
       c.globalAlpha = 0.22
       c.fillStyle = '#2a3a4a'
       for (let i = 0; i < 28; i += 1) {
         const a = (i / 28) * Math.PI * 2
         c.fillRect(
-          Math.round(W / 2 + Math.cos(a) * 30),
-          Math.round(H / 2 + Math.sin(a) * 30),
+          Math.round(VIEW_W / 2 + Math.cos(a) * 30),
+          Math.round(VIEW_H / 2 + Math.sin(a) * 30),
           1,
           1,
         )
@@ -2915,62 +5163,67 @@ window.__ModuleLoader__.load({
       c.fillStyle = COLORS.frame
       c.fillRect(4, 4, 8, 1)
       c.fillRect(4, 4, 1, 8)
-      c.fillRect(W - 12, 4, 8, 1)
-      c.fillRect(W - 5, 4, 1, 8)
-      c.fillRect(4, H - 5, 8, 1)
-      c.fillRect(4, H - 12, 1, 8)
-      c.fillRect(W - 12, H - 5, 8, 1)
-      c.fillRect(W - 5, H - 12, 1, 8)
-
-      c.fillStyle = COLORS.frame
-      c.fillRect(0, 0, W, 1)
-      c.fillRect(0, H - 1, W, 1)
-      c.fillRect(0, 0, 1, H)
-      c.fillRect(W - 1, 0, 1, H)
+      c.fillRect(VIEW_W - 12, 4, 8, 1)
+      c.fillRect(VIEW_W - 5, 4, 1, 8)
+      c.fillRect(4, VIEW_H - 5, 8, 1)
+      c.fillRect(4, VIEW_H - 12, 1, 8)
+      c.fillRect(VIEW_W - 12, VIEW_H - 5, 8, 1)
+      c.fillRect(VIEW_W - 5, VIEW_H - 12, 1, 8)
+      c.fillRect(0, 0, VIEW_W, 1)
+      c.fillRect(0, VIEW_H - 1, VIEW_W, 1)
+      c.fillRect(0, 0, 1, VIEW_H)
+      c.fillRect(VIEW_W - 1, 0, 1, VIEW_H)
 
       const battle = entry.battle
       if (battle === null) return
 
-      // 冲击环
+      for (const plan of battle.plans) {
+        if (plan.action.handler === 'aura') drawAura(c, entry, plan)
+      }
+
       for (const f of entry.fx) {
         c.globalAlpha = Math.max(0, Math.min(1, f.life * 2.4))
-        c.fillStyle = '#ffd166'
-        for (let i = 0; i < 12; i += 1) {
-          const a = (i / 12) * Math.PI * 2
-          c.fillRect(
-            Math.round(f.x + Math.cos(a) * f.r),
-            Math.round(f.y + Math.sin(a) * f.r),
-            1,
-            1,
-          )
+        c.fillStyle = f.color ?? '#ffd166'
+        const points = 16
+        for (let i = 0; i < points; i += 1) {
+          const a = (i / points) * Math.PI * 2
+          c.fillRect(Math.round(f.x + Math.cos(a) * f.r), Math.round(f.y + Math.sin(a) * f.r), 1, 1)
         }
       }
       c.globalAlpha = 1
 
-      // 轨迹：外层柔光 + 内层实心
-      for (const trail of battle.trails) {
-        const alpha = Math.max(0.12, Math.min(1, trail.ttl / 2))
-        c.fillStyle = trail.card.kind === 'shock' ? '#9fd8ff' : '#ff9f45'
-        c.globalAlpha = alpha * 0.3
-        c.fillRect(Math.round(trail.x) - 3, Math.round(trail.y) - 3, 6, 6)
-        c.globalAlpha = alpha
-        c.fillRect(Math.round(trail.x) - 2, Math.round(trail.y) - 2, 4, 4)
+      for (const f of entry.swingFx ?? []) {
+        c.globalAlpha = Math.max(0, Math.min(1, f.life / 0.2))
+        c.fillStyle = f.color
+        const steps = 14
+        for (let i = 0; i <= steps; i += 1) {
+          const a = f.angle - f.half + (i / steps) * f.half * 2
+          const r = f.radius * (0.65 + 0.35 * (i / steps))
+          c.fillRect(Math.round(f.x + Math.cos(a) * r), Math.round(f.y + Math.sin(a) * r), 1, 1)
+        }
       }
       c.globalAlpha = 1
 
-      // 陷阱：呼吸光晕
       for (const trap of battle.traps) {
+        const color = trap.plan.element === null ? trap.plan.action.color : trap.plan.element.color
         const pulse = 0.5 + 0.5 * Math.sin(entry.time * 6)
-        c.fillStyle = trap.card.kind === 'frost' ? '#9fd8ff' : '#e35d5d'
-        c.globalAlpha = 0.25 + pulse * 0.3
-        c.fillRect(Math.round(trap.x) - 3, Math.round(trap.y) - 3, 6, 6)
-        c.globalAlpha = 0.75
+        c.globalAlpha = 0.14 + pulse * 0.12
+        c.fillStyle = color
+        for (let i = 0; i < 16; i += 1) {
+          const a = (i / 16) * Math.PI * 2
+          c.fillRect(
+            Math.round(trap.x + Math.cos(a) * trap.triggerRadius),
+            Math.round(trap.y + Math.sin(a) * trap.triggerRadius),
+            1,
+            1,
+          )
+        }
+        c.globalAlpha = 0.7
         c.fillRect(Math.round(trap.x) - 1, Math.round(trap.y) - 1, 3, 3)
       }
       c.globalAlpha = 1
 
       for (const e of battle.enemies) drawEnemy(c, e, entry)
-      for (const s of battle.summons) drawSummon(c, s)
       for (const t of entry.playerTrail) {
         c.globalAlpha = Math.max(0, t.life / 0.32) * 0.65
         c.fillStyle = COLORS.playerDark
@@ -2979,16 +5232,61 @@ window.__ModuleLoader__.load({
       c.globalAlpha = 1
       drawPlayer(c, battle.player, entry)
 
-      // 弹丸：拖尾
+      for (const sword of battle.orbitSwords) {
+        const color = sword.plan.element === null ? sword.plan.action.color : sword.plan.element.color
+        c.fillStyle = color
+        c.fillRect(Math.round(sword.x) - 1, Math.round(sword.y) - 1, 3, 3)
+        c.fillStyle = '#ffffff'
+        c.fillRect(Math.round(sword.x), Math.round(sword.y), 1, 1)
+      }
+
+      for (const sword of battle.piercingSwords) {
+        const color = sword.plan.element === null ? sword.plan.action.color : sword.plan.element.color
+        c.fillStyle = color
+        for (let i = 0; i < 4; i += 1) {
+          c.fillRect(
+            Math.round(sword.x - sword.dirX * i),
+            Math.round(sword.y - sword.dirY * i),
+            1,
+            1,
+          )
+        }
+        c.fillStyle = '#ffffff'
+        c.fillRect(Math.round(sword.x), Math.round(sword.y), 1, 1)
+      }
+
+      for (const array of battle.swordArrays) {
+        const color = array.plan.element === null ? array.plan.action.color : array.plan.element.color
+        c.globalAlpha = 0.2 + 0.1 * Math.sin(entry.time * 5)
+        c.fillStyle = color
+        for (let i = 0; i < 20; i += 1) {
+          const a = (i / 20) * Math.PI * 2 + entry.time * 0.8
+          c.fillRect(
+            Math.round(array.x + Math.cos(a) * array.radius),
+            Math.round(array.y + Math.sin(a) * array.radius),
+            1,
+            1,
+          )
+        }
+        c.globalAlpha = 0.8
+        for (let i = 0; i < 4; i += 1) {
+          const a = (i / 4) * Math.PI * 2 + entry.time * 1.6
+          c.fillRect(Math.round(array.x + Math.cos(a) * array.radius * 0.45), Math.round(array.y + Math.sin(a) * array.radius * 0.45), 1, 2)
+        }
+        c.globalAlpha = 1
+      }
+
       const next = new Map()
-      c.fillStyle = COLORS.bullet
-      for (const b of battle.bullets) {
+      for (const b of battle.projectiles) {
+        const color = b.plan.element === null ? b.plan.action.color : b.plan.element.color
         const prev = entry.bulletPrev.get(b.id)
         if (prev !== undefined) {
           c.globalAlpha = 0.35
+          c.fillStyle = color
           c.fillRect(Math.round((prev.x + b.x) / 2), Math.round((prev.y + b.y) / 2), 1, 1)
           c.globalAlpha = 1
         }
+        c.fillStyle = color
         c.globalAlpha = 0.22
         c.fillRect(Math.round(b.x) - 1, Math.round(b.y) - 1, 3, 3)
         c.globalAlpha = 1
@@ -2997,21 +5295,11 @@ window.__ModuleLoader__.load({
       }
       entry.bulletPrev = next
 
-      if (battle.player.shield > 0) {
-        const radius = 7 + Math.sin(entry.time * 6) * 0.8
-        c.fillStyle = '#9fd8ff'
-        for (let i = 0; i < 8; i += 1) {
-          const a = (i / 8) * Math.PI * 2 + entry.time * 1.5
-          c.fillRect(
-            Math.round(battle.player.x + Math.cos(a) * radius),
-            Math.round(battle.player.y + Math.sin(a) * radius),
-            1,
-            1,
-          )
-        }
+      c.fillStyle = COLORS.enemyShot
+      for (const shot of battle.enemyShots) {
+        c.fillRect(Math.round(shot.x), Math.round(shot.y), 2, 1)
       }
 
-      // 粒子
       for (const p of entry.particles) {
         c.globalAlpha = Math.max(0, Math.min(1, p.life / p.maxLife))
         c.fillStyle = p.color
@@ -3019,63 +5307,37 @@ window.__ModuleLoader__.load({
       }
       c.globalAlpha = 1
 
-      // 像素暗角
       for (let i = 0; i < 6; i += 1) {
         c.globalAlpha = 0.055
         c.fillStyle = '#000000'
-        c.fillRect(i, i, W - i * 2, 1)
-        c.fillRect(i, H - 1 - i, W - i * 2, 1)
-        c.fillRect(i, i, 1, H - i * 2)
-        c.fillRect(W - 1 - i, i, 1, H - i * 2)
+        c.fillRect(i, i, VIEW_W - i * 2, 1)
+        c.fillRect(i, VIEW_H - 1 - i, VIEW_W - i * 2, 1)
+        c.fillRect(i, i, 1, VIEW_H - i * 2)
+        c.fillRect(VIEW_W - 1 - i, i, 1, VIEW_H - i * 2)
       }
       c.globalAlpha = 1
 
-      // 低血预警：红色边缘呼吸
       const hpRatio = battle.player.maxCells > 0 ? battle.player.cells / battle.player.maxCells : 1
       if (hpRatio < 0.35) {
         const pulse = 0.5 + 0.5 * Math.sin(entry.time * 6)
         c.globalAlpha = 0.06 + pulse * 0.09
         c.fillStyle = '#e35d5d'
-        c.fillRect(0, 0, W, 4)
-        c.fillRect(0, H - 4, W, 4)
-        c.fillRect(0, 0, 4, H)
-        c.fillRect(W - 4, 0, 4, H)
+        c.fillRect(0, 0, VIEW_W, 4)
+        c.fillRect(0, VIEW_H - 4, VIEW_W, 4)
+        c.fillRect(0, 0, 4, VIEW_H)
+        c.fillRect(VIEW_W - 4, 0, 4, VIEW_H)
         c.globalAlpha = 1
       }
 
-      // 全屏闪
       if (entry.flash > 0) {
         c.globalAlpha = Math.min(0.4, entry.flash)
         c.fillStyle = entry.flashColor
-        c.fillRect(0, 0, W, H)
+        c.fillRect(0, 0, VIEW_W, VIEW_H)
         c.globalAlpha = 1
       }
     }
 
-    // ---- 诊断 ----
-
-    const LOCK_NAMES = {
-      carapace: '甲壳',
-      split: '分裂',
-      regen: '再生',
-      shield: '护盾',
-      anchor: '锚定',
-      cleanse: '净化',
-      devour: '吞噬',
-      phase: '相位',
-      reflect: '反射',
-      generator: '发生器',
-    }
-
-    const DAMAGE_LABELS = {
-      burn: '灼烧',
-      wall: '撞墙',
-      boom: '尸爆',
-      fuse: '引信',
-      burst: '护盾爆',
-      combo: '连击',
-      bullet: '弹丸',
-    }
+    // ---- 报告 ----
 
     function damageReport(entry) {
       const battle = entry.battle
@@ -3084,29 +5346,46 @@ window.__ModuleLoader__.load({
       if (entries.length === 0) return ''
       entries.sort((a, b) => b[1] - a[1])
       const total = entries.reduce((sum, [, value]) => sum + value, 0) || 1
-      return entries
+      const labels = new Map(battle.plans.map((plan) => [plan.id, plan.label]))
+      const shares = entries
         .slice(0, 3)
         .map(([id, value]) => {
-          const card = cardById(id)
-          const name = card !== undefined ? card.name : DAMAGE_LABELS[id] ?? id
-          return name + ' ' + Math.round((value / total) * 100) + '%'
+          const label = labels.get(id) ?? contentById(id)?.label ?? (id.startsWith('reaction:') ? id.slice(9) : id)
+          return label + ' ' + Math.round((value / total) * 100) + '%'
         })
         .join(' / ')
+      const overflow = battle.stats.overflow ?? 0
+      return overflow > 0 ? shares + ' · 溢出 ' + Math.round(overflow) : shares
     }
 
-    function diagnose(entry) {
-      const r = entry.lastResult
-      if (r === null) return ''
-      if (r.kind === 'cleared') return '进入第 ' + (entry.floor + 1) + ' 层'
-      const def = floorDef(r.floor)
-      const lock = def.locks.length > 0 ? def.locks[0] : null
-      if (lock !== null) {
-        return '死因：' + (LOCK_NAMES[lock] ?? lock) + ' · 重试保底给解卡'
+    function reactionReport(entry) {
+      const battle = entry.battle
+      if (battle === null) return ''
+      const parts = []
+      for (const [id, stat] of Object.entries(battle.stats.reactions)) {
+        if (stat.count > 0) {
+          const label = contentById(id)?.label ?? id
+          parts.push(label + ' ×' + stat.count)
+        }
       }
+      for (const [id, count] of Object.entries(battle.stats.modifiers ?? {})) {
+        if (count > 0) {
+          const label = contentById(id)?.label ?? id
+          parts.push(label + ' ×' + count)
+        }
+      }
+      return parts.join(' · ')
+    }
+
+    function diagnoseRun(entry) {
+      const result = entry.lastResult
+      if (result === null) return ''
+      if (result.kind === 'cleared') return '进入第 ' + Math.min(MAX_FLOOR, entry.floor + 1) + ' 层'
+      if (result.kind === 'dead') return '生命耗尽 · 重试本层，并补一次升级选择'
+      const modifier = floorModifier(result.floor)
+      if (modifier !== null) return TIME_LIMIT + ' 秒内没清完：' + MODIFIERS[modifier].desc
       return TIME_LIMIT + ' 秒内没清完：输出不够。'
     }
-
-    // ---- 界面 ----
 
     function formatTokens(n) {
       if (!Number.isFinite(n) || n <= 0) return '0'
@@ -3116,6 +5395,185 @@ window.__ModuleLoader__.load({
       return String(Math.round(n))
     }
 
+    // ---- 界面 ----
+
+    function slotChip(kind, id) {
+      const def = id === null ? null : contentById(id)
+      const label = def === undefined || def === null ? '空' : def.label
+      const color = def !== undefined && def !== null && def.color !== undefined ? def.color : '#cfe3ef'
+      return h('span', {
+        className: 'dsh-pet-slot' + (def === null || def === undefined ? ' empty' : ''),
+        style: def === null || def === undefined ? undefined : { borderColor: color, color },
+        title: def === undefined || def === null ? '空槽：升级时可以装入' : def.desc,
+      }, KIND_LABELS[kind] + ' · ' + label)
+    }
+
+    const MOVEMENT_LABELS = { approach: '接近', keepDistance: '保持距离', auto: '自动' }
+
+    function stylePanel(entry, bump) {
+      const styleButtons = listStyles().map((style) => {
+        const unlocked = isStyleUnlocked(style, entry.stats)
+        return h('button', {
+          key: style.id,
+          type: 'button',
+          className: 'dsh-pet-style' + (entry.style === style.id ? ' on' : ''),
+          disabled: !unlocked,
+          title: unlocked
+            ? style.desc + '（切换会重开本轮）'
+            : '未解锁：最高层达到 ' + style.unlockedBy.bestFloor,
+          onClick: () => {
+            if (setStyle(entry, style.id)) bump()
+          },
+        }, style.label)
+      })
+      const movementButtons = MOVEMENT_STRATEGIES.map((strategy) =>
+        h('button', {
+          key: strategy,
+          type: 'button',
+          className: 'dsh-pet-style' + (entry.movement === strategy ? ' on' : ''),
+          title: strategy === 'approach'
+            ? '偏向进入近战技能范围'
+            : strategy === 'keepDistance'
+              ? '优先利用远程技能射程'
+              : '按已装备技能的距离折中选择',
+          onClick: () => {
+            if (setMovement(entry, strategy)) bump()
+          },
+        }, MOVEMENT_LABELS[strategy] ?? strategy),
+      )
+      return h('div', { className: 'dsh-pet-styles' },
+        h('div', { className: 'dsh-pet-style-row' },
+          h('span', { className: 'dsh-pet-muted' }, '风格'),
+          ...styleButtons,
+        ),
+        h('div', { className: 'dsh-pet-style-row' },
+          h('span', { className: 'dsh-pet-muted' }, '移动'),
+          ...movementButtons,
+        ),
+      )
+    }
+
+    function buildPanel(entry, bump) {
+      const battle = entry.battle
+      const build = battle === null ? entry.build : battle.build
+      const plans = battle === null ? [] : battle.plans
+      const planById = new Map(plans.map((plan) => [plan.id, plan]))
+      const skills = build.skills.map((skill, index) => {
+        const plan = planById.get(skill.id)
+        return h('div', { className: 'dsh-pet-skill', key: skill.id },
+          h('div', { className: 'dsh-pet-skill-head' },
+            h('span', { className: 'dsh-pet-skill-name' }, plan === undefined ? '技能 ' + (index + 1) + ' · 未运行' : plan.label),
+            h('span', { className: 'dsh-pet-muted' }, index === 0 ? '主技能' : '副技能'),
+          ),
+          h('div', { className: 'dsh-pet-slots' },
+            slotChip('action', skill.action),
+            slotChip('element', skill.element),
+            slotChip('modifier', skill.modifier),
+          ),
+          plan === undefined ? null : h('div', { className: 'dsh-pet-skill-desc' }, plan.description),
+        )
+      })
+      if (skills.length < MAX_SKILLS) {
+        skills.push(h('div', { className: 'dsh-pet-skill muted', key: 'empty-skill' },
+          h('div', { className: 'dsh-pet-skill-head' },
+            h('span', { className: 'dsh-pet-skill-name muted' }, '空技能槽'),
+            h('span', { className: 'dsh-pet-muted' }, '升级时选择动作'),
+          ),
+        ))
+      }
+      const reserve = build.reserve.length === 0
+        ? [h('span', { className: 'dsh-pet-muted', key: 'empty' }, '空')]
+        : build.reserve.map((id) => {
+            const def = contentById(id)
+            return h('button', {
+              key: id,
+              type: 'button',
+              className: 'dsh-pet-chip',
+              title: def === undefined ? id : def.desc + '（点击装回）',
+              onClick: () => {
+                if (equipFromReserve(entry, id)) bump()
+              },
+            }, def === undefined ? id : def.label)
+          })
+      return h('div', { className: 'dsh-pet-build' },
+        h('div', { className: 'dsh-pet-build-head' },
+          h('span', null, '构筑'),
+          h('span', null, build.skills.length + '/' + MAX_SKILLS + ' 技能 · 备用 ' + build.reserve.length),
+        ),
+        ...skills,
+        h('div', { className: 'dsh-pet-reserve' },
+          h('span', { className: 'dsh-pet-muted' }, '备用：'),
+          ...reserve,
+        ),
+      )
+    }
+
+    function offerPanel(entry, choosing, setChoosing, bump) {
+      const battle = entry.battle
+      if (battle === null || battle.offer === null || entry.phase === 'result') return null
+      const build = battle.build
+      const rows = battle.offer.map((id) => {
+        const info = choiceInfo(build, id)
+        if (info === null) return null
+        const active = choosing !== null && choosing.id === id
+        const card = h('button', {
+          key: id,
+          type: 'button',
+          className: 'dsh-pet-card',
+          onClick: () => {
+            const slots = upgradeSlots(build, id)
+            if (slots.length === 0) return
+            if (slots.length === 1) {
+              if (pickUpgrade(entry, id, slots[0])) {
+                setChoosing(null)
+                bump()
+              }
+              return
+            }
+            setChoosing({ id, slots })
+          },
+        },
+          h('span', { className: 'dsh-pet-card-head' },
+            h('span', { className: 'dsh-pet-card-name' }, info.baseLabel),
+            h('span', {
+              className: 'dsh-pet-kind',
+              style: { background: info.color },
+            }, KIND_LABELS[info.kind] ?? info.kind),
+          ),
+          h('span', { className: 'dsh-pet-card-desc' }, info.description),
+          info.note !== '' ? h('span', { className: 'dsh-pet-card-desc' }, info.note) : null,
+        )
+        if (!active) return card
+        return h('div', { key: id }, card,
+          h('div', { className: 'dsh-pet-slotpick' },
+            choosing.slots.map((slot) => h('button', {
+              key: slot.skillIndex + ':' + slot.kind,
+              type: 'button',
+              onClick: () => {
+                if (pickUpgrade(entry, id, slot)) {
+                  setChoosing(null)
+                  bump()
+                }
+              },
+            }, placementLabel(build, slot) + (slot.replacing ? '（替换）' : ''))),
+            h('button', {
+              key: 'cancel',
+              type: 'button',
+              onClick: () => setChoosing(null),
+            }, '取消'),
+          ),
+        )
+      })
+      return h('div', { className: 'dsh-pet-offer' },
+        h('div', { className: 'dsh-pet-offer-title' },
+          h('span', null, (battle.lastStage ?? stageLabel(build, battle.draftCount)) + ' · 三选一'),
+          h('span', { className: 'dsh-pet-muted' }, '剩余 ' + battle.pending),
+          choosing !== null ? h('span', { className: 'dsh-pet-muted' }, '选择装入位置') : null,
+        ),
+        ...rows,
+      )
+    }
+
     function PetBody(props) {
       const sessionId = props !== null && props !== undefined && props.sessionId !== undefined
         ? String(props.sessionId)
@@ -3123,6 +5581,7 @@ window.__ModuleLoader__.load({
       const canvasRef = React.useRef(null)
       const entryRef = React.useRef(null)
       const [key, setKey] = React.useState(null)
+      const [choosing, setChoosing] = React.useState(null)
       const bump = React.useReducer((n) => n + 1, 0)[1]
 
       React.useEffect(() => {
@@ -3190,7 +5649,6 @@ window.__ModuleLoader__.load({
               const out = typeof row.outputTokens === 'number' ? row.outputTokens : 0
               const seen = entry.tokenSeen.get(sid)
               if (seen === undefined) {
-                // 第一次见到这个会话只记基线，不把历史 token 一次性倒进战场
                 entry.tokenSeen.set(sid, out)
               } else if (out > seen) {
                 entry.tokenSeen.set(sid, out)
@@ -3206,7 +5664,7 @@ window.__ModuleLoader__.load({
           }
         }
         poll()
-        const id = window.setInterval(poll, POLL_MS)
+        const id = window.setInterval(poll, POLL_INTERVAL)
         return () => {
           disposed = true
           window.clearInterval(id)
@@ -3226,28 +5684,35 @@ window.__ModuleLoader__.load({
       const maxCells = battle === null ? 1 : battle.player.maxCells
       const pct = Math.max(0, Math.min(100, (cells / maxCells) * 100))
       const hpColor = pct > 50 ? '#6ee7a8' : pct > 25 ? '#ffd166' : '#e35d5d'
-      const build = BUILDS[entry.buildId]
-      const attrs = battle !== null ? battle.attrs : entry.attrs
-      const points = battle !== null ? battle.points : entry.points
-      const unlocked = unlockedCores(entry.stats)
       const result = entry.phase === 'result' ? entry.lastResult : null
-      const lockName = battle !== null && battle.def.locks.length > 0 ? battle.def.locks[0] : '—'
       const modifier = battle !== null ? battle.modifier : floorModifier(entry.floor)
+      const reactions = reactionReport(entry)
+      const notice = entry.notice
+      const offerIds = battle !== null && Array.isArray(battle.offer) ? battle.offer : []
+      const activeChoosing =
+        choosing !== null && offerIds.includes(choosing.id) ? choosing : null
 
       return h('div', { className: 'dsh-pet' },
         h('style', { key: 'style' }, CSS),
         h('div', { className: 'dsh-pet-top' },
           h('span', { className: 'dsh-pet-floor' }, '第 ' + entry.floor + ' 层'),
-          h('span', { className: 'dsh-pet-muted' }, 'Lv.' + (battle === null ? 1 : battle.level)),
+          h('span', { className: 'dsh-pet-muted' }, 'Lv.' + (battle === null ? entry.level : battle.level)),
           h('span', { className: 'dsh-pet-muted' }, '最佳 ' + entry.best),
-          h('span', { className: 'dsh-pet-muted' }, '锁 ' + lockName),
           modifier !== null ? h('span', { className: 'dsh-pet-hot' }, MODIFIERS[modifier].name) : null,
           h('span', { className: 'dsh-pet-spacer' }),
-          h('span', { className: 'dsh-pet-muted' }, build.label),
+          h('span', { className: 'dsh-pet-muted' }, '技能 ' + (battle === null ? entry.build.skills.length : battle.build.skills.length) + '/' + MAX_SKILLS),
           h('span', { className: 'dsh-pet-dot' + (entry.online ? ' on' : '') }),
         ),
+        notice !== '' ? h('div', {
+          className: 'dsh-pet-notice',
+          title: '点击关闭',
+          onClick: () => {
+            entry.notice = ''
+            bump()
+          },
+        }, notice) : null,
         h('div', { className: 'dsh-pet-stage' },
-          h('canvas', { ref: canvasRef, width: W * 2, height: H * 2, className: 'dsh-pet-canvas' }),
+          h('canvas', { ref: canvasRef, width: VIEW_W * 2, height: VIEW_H * 2, className: 'dsh-pet-canvas' }),
           entry.banner !== null
             ? h('div', { className: 'dsh-pet-banner' },
                 h('div', { className: 'dsh-pet-banner-text' }, entry.banner.text),
@@ -3261,90 +5726,21 @@ window.__ModuleLoader__.load({
                 h('div', {
                   className: 'dsh-pet-overlay-title ' + (result.kind === 'cleared' ? 'good' : 'bad'),
                 }, result.kind === 'cleared' ? '清层' : result.kind === 'dead' ? '阵亡' : '超时'),
-                h('div', { className: 'dsh-pet-overlay-sub' }, diagnose(entry)),
+                h('div', { className: 'dsh-pet-overlay-sub' }, diagnoseRun(entry)),
                 h('div', { className: 'dsh-pet-overlay-sub' }, damageReport(entry)),
+                reactions !== '' ? h('div', { className: 'dsh-pet-reactions' }, reactions) : null,
               )
-            : null,
-          result === null && battle !== null && battle.offer !== null
-            ? h('div', { className: 'dsh-pet-offer' },
-                h('div', { className: 'dsh-pet-offer-title' },
-                  '升级 · 三选一（剩余 ' + battle.pending + '）'),
-                battle.offer.map((id) => {
-                  const card = CARDS[id]
-                  return h('button', {
-                    key: id,
-                    type: 'button',
-                    className: 'dsh-pet-card',
-                    onClick: () => {
-                      if (pickCard(entry, id)) bump()
-                    },
-                  },
-                    h('span', { className: 'dsh-pet-card-name' }, card.name),
-                    h('span', { className: 'dsh-pet-card-desc' }, card.desc),
-                  )
-                }),
-              )
-            : null,
+            : offerPanel(entry, activeChoosing, setChoosing, bump),
         ),
         h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%', background: hpColor } })),
-        h('div', { className: 'dsh-pet-attrs' },
-          h('div', { className: 'dsh-pet-attrs-head' },
-            h('span', null, '属性'),
-            h('span', { className: 'dsh-pet-points' + (points > 0 ? ' ready' : '') }, '可分配 ' + points),
-          ),
-          h('div', { className: 'dsh-pet-attr-grid' },
-            ATTRIBUTES.map((attr) =>
-              h('button', {
-                key: attr.id,
-                type: 'button',
-                className: 'dsh-pet-attr',
-                title: attr.desc,
-                disabled: points <= 0 || attrs[attr.id] >= attr.max,
-                onClick: () => {
-                  if (spend(entry, attr.id)) bump()
-                },
-              },
-                h('span', null, attr.label),
-                h('span', { className: 'dsh-pet-attr-val' }, attrs[attr.id] + '/' + attr.max),
-              ),
-            ),
-          ),
-        ),
-        unlocked.length > 0
-          ? h('div', { className: 'dsh-pet-cores' },
-              h('div', { className: 'dsh-pet-cores-head' },
-                h('span', null, '核心'),
-                h('span', { className: 'dsh-pet-muted' }, entry.cores.length + '/3'),
-              ),
-              h('div', { className: 'dsh-pet-core-pool' },
-                CORES.map((core) => {
-                  const def = CORE_CARDS[core.id]
-                  const ready = unlocked.includes(core.id)
-                  const on = entry.cores.includes(core.id)
-                  return h('button', {
-                    key: core.id,
-                    type: 'button',
-                    className: 'dsh-pet-core' + (on ? ' on' : ''),
-                    title: ready ? def.desc : '未解锁：' + core.condText,
-                    disabled: !ready,
-                    onClick: () => {
-                      if (toggleCore(entry, core.id)) bump()
-                    },
-                  }, def.name)
-                }),
-              ),
-            )
-          : null,
+        stylePanel(entry, bump),
+        buildPanel(entry, bump),
         h('div', { className: 'dsh-pet-bottom' },
-          h('span', null, '格 ' + Math.max(0, cells) + '/' + maxCells),
-          h('span', null, '槽 ' + (battle === null ? 0 : battle.slots.length) + '/' + MAX_SLOTS),
+          h('span', null, '生命 ' + Math.max(0, Math.ceil(cells)) + '/' + maxCells),
           h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
           h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
           h('span', null, '压力 +' + (battle === null ? 0 : battle.extra)),
           battle !== null && battle.surge ? h('span', { className: 'dsh-pet-hot' }, '过载') : null,
-          battle !== null && battle.player.shield > 0
-            ? h('span', null, '盾 ' + Math.ceil(battle.player.shield))
-            : null,
           h('span', { className: 'dsh-pet-spacer' }),
           h('span', null, formatTokens(entry.consumed) + ' token'),
         ),
@@ -3388,7 +5784,7 @@ window.__ModuleLoader__.load({
             kind: KIND,
             title: () => '宠物',
             keepMounted: true,
-            guide: [{ id: 'pet', title: '宠物', description: '按层推进的自动战斗' }],
+            guide: [{ id: 'pet', title: '宠物', description: '按层推进的技能自动战斗' }],
           }),
         )
 
@@ -3413,16 +5809,18 @@ window.__ModuleLoader__.load({
         tick,
         startFloor,
         draw,
-        BUILDS,
-        pickCard,
-        awardXp,
-        chooseCard,
-        spend,
-        pushTokens,
-        toggleCore,
-        unlockedCores,
+        pickUpgrade,
+        equipFromReserve,
         advance,
+        awardXp,
+        pushTokens,
         damageReport,
+        reactionReport,
+        loadAccount,
+        setStyle,
+        setMovement,
+        listStyles,
+        isStyleUnlocked,
       },
     }
   },
