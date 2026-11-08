@@ -84,10 +84,45 @@ export function movePlayer(world, dt) {
     vx += (cx / cd) * 0.7;
     vy += (cy / cd) * 0.7;
   }
-  const len = Math.hypot(vx, vy);
+  let len = Math.hypot(vx, vy);
+  if (len < 0.001 && nearest !== null) {
+    vx = player.x - nearest.x || 1;
+    vy = player.y - nearest.y;
+    len = Math.hypot(vx, vy);
+  }
   if (len < 0.001) return;
-  player.x = clampValue(player.x + (vx / len) * player.speed * dt, PLAYER_MARGIN, ARENA.w - PLAYER_MARGIN);
-  player.y = clampValue(player.y + (vy / len) * player.speed * dt, PLAYER_MARGIN, ARENA.h - PLAYER_MARGIN);
+  let directionX = vx / len;
+  let directionY = vy / len;
+  const distance = nearest && Math.hypot(player.x - nearest.x, player.y - nearest.y);
+  if (nearest && distance < desired - 8) {
+    // 预判周围方向，同时考虑墙和所有存活敌人，避免退向死角或另一只敌人。
+    const intendedX = directionX;
+    const intendedY = directionY;
+    const baseAngle = Math.atan2(directionY, directionX);
+    const living = world.enemies.filter((enemy) => enemy.cells > 0 && !enemy.dead && !enemy.deathHandled);
+    let bestScore = -Infinity;
+    for (let i = 0; i < 16; i += 1) {
+      const offset = i === 0 ? 0 : Math.ceil(i / 2) * (i % 2 ? 1 : -1);
+      const angle = baseAngle + offset * Math.PI / 8;
+      const x = clampValue(player.x + Math.cos(angle) * 12, PLAYER_MARGIN, ARENA.w - PLAYER_MARGIN);
+      const y = clampValue(player.y + Math.sin(angle) * 12, PLAYER_MARGIN, ARENA.h - PLAYER_MARGIN);
+      const mx = x - player.x;
+      const my = y - player.y;
+      const progress = Math.hypot(mx, my);
+      let clearance = Infinity;
+      for (const enemy of living) {
+        clearance = Math.min(clearance, Math.hypot(x - enemy.x, y - enemy.y) - (enemy.r ?? enemy.radius ?? 0));
+      }
+      const score = clearance + progress * 0.3 + (mx * intendedX + my * intendedY) * 0.15;
+      if (score > bestScore) {
+        bestScore = score;
+        directionX = progress > 0 ? mx / progress : 0;
+        directionY = progress > 0 ? my / progress : 0;
+      }
+    }
+  }
+  player.x = clampValue(player.x + directionX * player.speed * dt, PLAYER_MARGIN, ARENA.w - PLAYER_MARGIN);
+  player.y = clampValue(player.y + directionY * player.speed * dt, PLAYER_MARGIN, ARENA.h - PLAYER_MARGIN);
 }
 
 function compareRequests(a, b) {

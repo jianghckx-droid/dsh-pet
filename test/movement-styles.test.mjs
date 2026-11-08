@@ -88,6 +88,16 @@ test('没有敌人时移动到中心区域，且不会越界', () => {
   assert.ok(battle.player.y > 10 && battle.player.y < 144);
 });
 
+test('墙边遇敌时沿空位脱离，避开其他敌人', () => {
+  const battle = battleWith(['projectile'], 'keepDistance');
+  battle.player.x = 6;
+  battle.player.y = 72;
+  battle.enemies = [makeEnemy(1, 20, 72), makeEnemy(2, 10, 62)];
+  for (let i = 0; i < 60; i += 1) movePlayer(battle, 1 / 60);
+  assert.ok(battle.player.y > 80, '应沿墙向没有敌人的方向移动');
+  assert.ok(battle.player.x >= 6);
+});
+
 test('位移请求按优先级、来源 ID、入队顺序裁决并限制落点', () => {
   const battle = battleWith(['projectile'], 'keepDistance');
   battle.player.x = 80;
