@@ -54,6 +54,18 @@ function loadModule(store = new Map()) {
   });
 }
 
+function collectButtons(node, out = []) {
+  if (node === null || node === undefined || node === false) return out;
+  if (typeof node === 'string' || typeof node === 'number') return out;
+  if (Array.isArray(node)) {
+    for (const item of node) collectButtons(item, out);
+    return out;
+  }
+  if (node.type === 'button') out.push(node);
+  for (const child of node.children ?? []) collectButtons(child, out);
+  return out;
+}
+
 function fakeContext() {
   const calls = [];
   return {
@@ -401,6 +413,76 @@ test('存档：v5 保存风格与移动策略，重新进入角色仍在', () =>
   assert.equal(second.movement, 'auto');
   assert.equal(second.battle.build.skills[0].action, 'swing');
   assert.equal(second.battle.movement.strategy, 'auto');
+});
+
+test('开发者模式：开启后解锁全部风格，关闭后恢复门槛', () => {
+  const store = new Map();
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('dev-style-key', 7);
+  assert.equal(entry.stats.bestFloor, 1);
+  assert.equal(mod.__debug.setStyle(entry, 'sword'), false);
+  assert.equal(mod.__debug.debugEnabled(), false);
+
+  assert.equal(mod.__debug.setDebugEnabled(true), true);
+  assert.equal(mod.__debug.debugEnabled(), true);
+  assert.equal(JSON.parse(store.get('dsh.pet.debug')), true);
+  assert.equal(mod.__debug.setStyle(entry, 'sword'), true);
+  assert.equal(entry.style, 'sword');
+  assert.equal(entry.battle.build.skills[0].action, 'arcSword');
+
+  assert.equal(mod.__debug.setDebugEnabled(false), true);
+  assert.equal(mod.__debug.debugEnabled(), false);
+  assert.equal(JSON.parse(store.get('dsh.pet.debug')), false);
+  assert.equal(mod.__debug.setStyle(entry, 'trapper'), false);
+});
+
+test('开发者模式：新游戏界面的锁定风格按钮变为可选', () => {
+  const store = new Map();
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('dev-menu-key', 7, { autostart: false });
+  mod.__debug.openNewGameMenu(entry, 0);
+
+  const styleButtons = () => collectButtons(mod.__debug.menuPanel(entry, () => {}))
+    .filter((node) => String(node.props.className ?? '').includes('dsh-pet-style'))
+    .map((node) => ({ label: node.children.join(''), disabled: node.props.disabled === true }));
+
+  const before = styleButtons();
+  assert.equal(before.find((row) => row.label === '剑修').disabled, true);
+  assert.equal(before.find((row) => row.label === '陷阱师').disabled, true);
+
+  mod.__debug.setDebugEnabled(true);
+  const after = styleButtons();
+  assert.equal(after.find((row) => row.label === '剑修').disabled, false);
+  assert.equal(after.find((row) => row.label === '陷阱师').disabled, false);
+});
+
+test('开发者模式：锁定的存档风格在开启后仍能读取', () => {
+  const store = new Map();
+  store.set(
+    'dsh.pet.v5.dev-saved-style',
+    JSON.stringify({
+      version: 5,
+      style: 'sword',
+      movement: 'keepDistance',
+      build: { version: 3, skills: [{ id: 'skill-1', action: 'arcSword', element: 'fire', modifier: null }], reserve: [] },
+      stats: { kills: 2, bestFloor: 1, maxFloorKills: 1, drafts: 0 },
+      floor: 1,
+      best: 1,
+      level: 2,
+      xp: 0,
+      xpNext: 10,
+      pending: 0,
+      draftCount: 0,
+    }),
+  );
+  const off = loadModule(store).__debug.createEntry('dev-saved-style', 7, { autostart: false });
+  assert.equal(off.style, 'ranged');
+
+  const mod = loadModule(store);
+  mod.__debug.setDebugEnabled(true);
+  const on = mod.__debug.createEntry('dev-saved-style', 7, { autostart: false });
+  assert.equal(on.style, 'sword');
+  assert.equal(on.build.skills[0].action, 'arcSword');
 });
 
 test('新动作接入：御剑与陷阱能创建实体并完成战斗绘制', () => {

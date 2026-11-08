@@ -4703,9 +4703,17 @@ window.__ModuleLoader__.load({
       '.dsh-pet-menu-btn:hover{background:#16222e;border-color:#3a5470}',
       '.dsh-pet-menu-btn.primary{color:#0a0d12;background:#ffd166;border-color:#ffd166;font-weight:700}',
       '.dsh-pet-menu-btn.primary:hover{background:#ffe08a}',
+      '.dsh-pet-menu-btn.on{color:#0a0d12;background:#6ee7a8;border-color:#6ee7a8;font-weight:700}',
+      '.dsh-pet-menu-btn.on:hover{background:#8ff0bd}',
       '.dsh-pet-menu-btn.danger{color:#ffb4b4;border-color:#573030}',
       '.dsh-pet-menu-btn:disabled{opacity:.35;cursor:default}',
       '.dsh-pet-menu-head{font-size:9px;color:#7f93a3;letter-spacing:.08em;margin-top:1px}',
+      '.dsh-pet-menu-debug{border-top:1px solid #1d2935;padding-top:4px;margin-top:1px;',
+      'display:flex;flex-direction:column;gap:3px}',
+      '.dsh-pet-menu-debug-row{display:flex;align-items:center;gap:5px;justify-content:space-between}',
+      '.dsh-pet-menu-hint{font-size:8px;color:#7f93a3;line-height:1.4}',
+      '.dsh-pet-dev{font-size:8px;color:#0a0d12;background:#ffd166;border-radius:3px;padding:0 3px;',
+      'letter-spacing:.06em;margin-left:auto}',
       '.dsh-pet-menu-slot{background:#0e151d;border:1px solid #1d2935;border-radius:4px;padding:4px 5px;',
       'display:flex;flex-direction:column;gap:3px}',
       '.dsh-pet-menu-slot.on{border-color:#3f5a36;background:#111b16}',
@@ -4739,6 +4747,7 @@ window.__ModuleLoader__.load({
     const ACTIVE_SUFFIX = '.active'
     const SLOT_SUFFIX = '.slot'
     const SAVE_SLOTS = 3
+    const DEBUG_KEY = 'dsh.pet.debug'
 
     const toInt = (value, min, fallback) => {
       const n = Math.floor(Number(value))
@@ -4805,6 +4814,35 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 开发者调试开关：本机全局，不写入存档、不计入累计战绩。 */
+    function debugEnabled() {
+      const value = readStore(DEBUG_KEY)
+      return value === true || value === 1 || value === '1'
+    }
+
+    function setDebugEnabled(value) {
+      try {
+        const store = window.localStorage
+        if (store === undefined || store === null) return false
+        store.setItem(DEBUG_KEY, JSON.stringify(value === true))
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    function styleAvailable(style, stats) {
+      if (style === undefined) return false
+      return debugEnabled() || isStyleUnlocked(style, stats)
+    }
+
+    /** 存档里的风格解析；开发者模式可以保留原本锁定的风格。 */
+    function resolveAccountStyle(id, stats) {
+      const style = styleById(id)
+      if (style !== undefined && styleAvailable(style, stats)) return style
+      return defaultStyle()
+    }
+
     function backupSave(key, slot, saved) {
       try {
         const store = window.localStorage
@@ -4862,7 +4900,7 @@ window.__ModuleLoader__.load({
       const saved = readStore(saveKey(key, index))
       if (saved !== null && typeof saved === 'object') {
         account.stats = normalizeStats(saved.stats)
-        const style = resolveStyle(saved.style, account.stats)
+        const style = resolveAccountStyle(saved.style, account.stats)
         account.style = style.id
         account.movement = normalizeMovement(saved.movement, style)
         account.floor = Math.min(MAX_FLOOR, toInt(saved.floor, 1, 1))
@@ -4884,7 +4922,7 @@ window.__ModuleLoader__.load({
       if (previous !== null && typeof previous === 'object') {
         // v4 账户迁移：构筑与进度原样保留，只补齐风格与移动策略；v4 键不删除。
         account.stats = normalizeStats(previous.stats)
-        const style = resolveStyle(previous.style, account.stats)
+        const style = resolveAccountStyle(previous.style, account.stats)
         account.style = style.id
         account.movement = normalizeMovement(previous.movement, style)
         account.floor = Math.min(MAX_FLOOR, toInt(previous.floor, 1, 1))
@@ -4967,7 +5005,7 @@ window.__ModuleLoader__.load({
 
     function makeSaveInfo(key, slot, saved, legacyLabel) {
       const stats = normalizeStats(saved.stats)
-      const style = resolveStyle(saved.style, stats)
+      const style = resolveAccountStyle(saved.style, stats)
       const floor = Math.min(MAX_FLOOR, toInt(saved.floor, 1, 1))
       const best = Math.max(floor, toInt(saved.best, 1, Math.max(1, stats.bestFloor)))
       return {
@@ -5267,7 +5305,7 @@ window.__ModuleLoader__.load({
       const best = Math.max(1, entry.best, target.best, merged.bestFloor)
       merged.bestFloor = best
       const wanted = styleById(styleId) ?? styleById(entry.style) ?? defaultStyle()
-      const style = isStyleUnlocked(wanted, merged) ? wanted : defaultStyle()
+      const style = styleAvailable(wanted, merged) ? wanted : defaultStyle()
       entry.slot = index
       entry.stats = merged
       entry.best = best
@@ -5376,7 +5414,7 @@ window.__ModuleLoader__.load({
 
     function setStyle(entry, id) {
       const style = styleById(id)
-      if (style === undefined || !isStyleUnlocked(style, entry.stats)) return false
+      if (style === undefined || !styleAvailable(style, entry.stats)) return false
       entry.style = style.id
       entry.movement = style.movementPreference
       resetRun(entry)
@@ -6131,15 +6169,17 @@ window.__ModuleLoader__.load({
     const MOVEMENT_LABELS = { approach: '接近', keepDistance: '保持距离', auto: '自动' }
 
     function stylePanel(entry, bump) {
+      const debug = debugEnabled()
       const styleButtons = listStyles().map((style) => {
-        const unlocked = isStyleUnlocked(style, entry.stats)
+        const naturallyUnlocked = isStyleUnlocked(style, entry.stats)
+        const unlocked = debug || naturallyUnlocked
         return h('button', {
           key: style.id,
           type: 'button',
           className: 'dsh-pet-style' + (entry.style === style.id ? ' on' : ''),
           disabled: !unlocked,
           title: unlocked
-            ? style.desc + '（切换会重开本轮）'
+            ? style.desc + (debug && !naturallyUnlocked ? '（开发者模式已解锁）' : '') + '（切换会重开本轮）'
             : '未解锁：最高层达到 ' + style.unlockedBy.bestFloor,
           onClick: () => {
             if (setStyle(entry, style.id)) bump()
@@ -6165,6 +6205,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dsh-pet-style-row' },
           h('span', { className: 'dsh-pet-muted' }, '风格'),
           ...styleButtons,
+          debug ? h('span', { className: 'dsh-pet-dev', title: '开发者调试已开启' }, 'DEV') : null,
         ),
         h('div', { className: 'dsh-pet-style-row' },
           h('span', { className: 'dsh-pet-muted' }, '移动'),
@@ -6334,6 +6375,28 @@ window.__ModuleLoader__.load({
       }
     }
 
+    function debugToggle(bump) {
+      const on = debugEnabled()
+      return h('div', { className: 'dsh-pet-menu-debug' },
+        h('div', { className: 'dsh-pet-menu-debug-row' },
+          h('span', { className: 'dsh-pet-menu-label' }, '开发者调试'),
+          h('button', {
+            type: 'button',
+            className: 'dsh-pet-menu-btn' + (on ? ' on' : ''),
+            title: '仅影响本机 UI，不写入存档',
+            onClick: () => {
+              setDebugEnabled(!debugEnabled())
+              bump()
+            },
+          }, on ? '开发者模式：开' : '开发者模式：关'),
+        ),
+        h('div', { className: 'dsh-pet-menu-hint' },
+          on
+            ? '已解锁全部风格（本机全局，不写入存档）'
+            : '开启后可选择剑修 / 陷阱师等未解锁风格'),
+      )
+    }
+
     function slotCard(entry, info, menu, bump) {
       const current = entry.battle !== null && normalizeSlot(entry.slot) === info.slot
       const confirming = menu.confirmDelete === info.slot
@@ -6423,6 +6486,7 @@ window.__ModuleLoader__.load({
         menu.message !== '' ? h('div', { className: 'dsh-pet-menu-msg' }, menu.message) : null,
         h('div', { className: 'dsh-pet-menu-head' }, '存档槽位'),
         ...slots.map((info) => slotCard(entry, info, menu, bump)),
+        debugToggle(bump),
         h('div', { className: 'dsh-pet-menu-foot' },
           '进入新层、升级或结算时自动保存到当前槽位；读取其他槽位会从该存档所在层开始。'),
       )
@@ -6434,16 +6498,20 @@ window.__ModuleLoader__.load({
       const target = normalizeSlot(menu.newSlot === null ? entry.slot : menu.newSlot)
       const info = slots[target]
       const stats = statsForNewGame(entry, info)
+      const debug = debugEnabled()
       const wanted = styleById(menu.newStyle) ?? styleById(entry.style) ?? defaultStyle()
-      const selected = isStyleUnlocked(wanted, stats) ? wanted : defaultStyle()
+      const selected = styleAvailable(wanted, stats) ? wanted : defaultStyle()
       const styleButtons = listStyles().map((style) => {
-        const unlocked = isStyleUnlocked(style, stats)
+        const naturallyUnlocked = isStyleUnlocked(style, stats)
+        const unlocked = debug || naturallyUnlocked
         return h('button', {
           key: style.id,
           type: 'button',
           className: 'dsh-pet-style' + (selected.id === style.id ? ' on' : ''),
           disabled: !unlocked,
-          title: unlocked ? style.desc : '未解锁：最高层达到 ' + style.unlockedBy.bestFloor,
+          title: unlocked
+            ? style.desc + (debug && !naturallyUnlocked ? '（开发者模式已解锁）' : '')
+            : '未解锁：最高层达到 ' + style.unlockedBy.bestFloor,
           onClick: () => {
             menu.newStyle = style.id
             bump()
@@ -6458,13 +6526,16 @@ window.__ModuleLoader__.load({
           menu.newSlot = slotInfo.slot
           const nextStats = statsForNewGame(entry, slotInfo)
           const current = styleById(menu.newStyle)
-          if (current === undefined || !isStyleUnlocked(current, nextStats)) {
+          if (current === undefined || !styleAvailable(current, nextStats)) {
             menu.newStyle = defaultStyle().id
           }
           bump()
         },
       }, '存档 ' + (slotInfo.slot + 1) + ' · ' +
         (slotInfo.empty ? '空档' : '覆盖 · 第 ' + slotInfo.floor + ' 层')))
+      const lockedStyles = debug
+        ? []
+        : listStyles().filter((style) => !isStyleUnlocked(style, stats))
       return h('div', { className: 'dsh-pet-menu' },
         h('div', { className: 'dsh-pet-menu-title' }, '新游戏'),
         h('div', { className: 'dsh-pet-menu-sub' }, '选择存档位置与起始风格；累计战绩与解锁保留'),
@@ -6476,6 +6547,13 @@ window.__ModuleLoader__.load({
               '将覆盖存档 ' + (target + 1) + '，重开第 1 层；该档的累计战绩会合并保留。'),
         h('div', { className: 'dsh-pet-menu-label' }, '战斗风格'),
         h('div', { className: 'dsh-pet-style-row' }, ...styleButtons),
+        lockedStyles.length > 0
+          ? h('div', { className: 'dsh-pet-menu-hint' },
+              '未解锁：' + lockedStyles.map((style) =>
+                style.label + '（最佳 ' + style.unlockedBy.bestFloor + ' 层）').join(' · ') +
+              '；当前最佳 ' + stats.bestFloor + ' 层')
+          : null,
+        debugToggle(bump),
         h('div', { className: 'dsh-pet-menu-actions' },
           menuButton('开始游戏', () => {
             startNewGame(entry, target, selected.id)
@@ -6780,6 +6858,9 @@ window.__ModuleLoader__.load({
         saveSummary,
         menuPanel,
         css: CSS,
+        debugEnabled,
+        setDebugEnabled,
+        styleAvailable,
       },
     }
   },
