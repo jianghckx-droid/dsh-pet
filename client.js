@@ -81,6 +81,328 @@ window.__ModuleLoader__.load({
       return fmtNumber(Math.round(scale * 100));
     }
 
+    // ---- attributes.js ----
+    // 角色属性：基础属性 → 战斗属性 → 伤害、减伤与施放节奏。
+    //
+    // 换算、上限与公式来自 docs/character-attributes-design.md。这里只放纯函数：
+    // 不持有战斗状态，也不读全局 RNG。战斗层把 createCombatStats() 的结果放进
+    // world.combat，公共结算入口再按命令标注的伤害通道读取它：
+    //
+    //   最终伤害 = 基础伤害 × (1 + 通用伤害加成 + 满足条件的伤害加成)
+    //            × 暴击倍率
+    //   护甲减伤 = min(60%, 护甲 / (护甲 + 100))
+    //   实际冷却 = 基础冷却 / (1 + 攻击速度)
+    //
+    // 装备尚未实现；装备词条通过 bonuses 参数直接加在战斗属性上，条件伤害用
+    // 规则数组表达，等到装备系统落地时只需往这里传数据，不改结算代码。
+
+    /** 四项基础属性；顺序即升级界面的展示顺序。 */
+    const ATTRIBUTES = Object.freeze({
+      strength: Object.freeze({
+        id: 'strength',
+        label: '力量',
+        affects: Object.freeze(['armor']),
+        summary: '护甲 +2',
+      }),
+      agility: Object.freeze({
+        id: 'agility',
+        label: '敏捷',
+        affects: Object.freeze(['attackSpeed', 'critChance']),
+        summary: '攻击速度 +1%，暴击率 +0.5 个百分点',
+      }),
+      intellect: Object.freeze({
+        id: 'intellect',
+        label: '智力',
+        affects: Object.freeze(['damageBonus']),
+        summary: '通用伤害加成 +2%',
+      }),
+      vitality: Object.freeze({
+        id: 'vitality',
+        label: '体魄',
+        affects: Object.freeze(['maxLife']),
+        summary: '最大生命 +1',
+      }),
+    });
+
+    const ATTRIBUTE_IDS = Object.freeze(Object.keys(ATTRIBUTES));
+
+    /** 每投入 1 点的换算。所有战斗风格共用同一份。 */
+    const POINT_EFFECTS = Object.freeze({
+      strength: Object.freeze({ armor: 2 }),
+      agility: Object.freeze({ attackSpeed: 0.01, critChance: 0.005 }),
+      intellect: Object.freeze({ damageBonus: 0.02 }),
+      vitality: Object.freeze({ maxLife: 1 }),
+    });
+
+    /** 未装备任何物品时也保留的基础值。 */
+    const COMBAT_BASE = Object.freeze({
+      maxLife: 24,
+      armor: 0,
+      damageBonus: 0,
+      attackSpeed: 0,
+      critChance: 0.05,
+      critDamage: 0.5,
+    });
+
+    const COMBAT_CAPS = Object.freeze({
+      armorReduction: 0.6,
+      attackSpeed: 1,
+      critChance: 1,
+    });
+
+    /**
+     * 伤害通道：决定这一条伤害能不能暴击。
+     * 元素标签由命令自带，条件伤害按标签匹配，与通道无关。
+     */
+    const DAMAGE_CHANNELS = Object.freeze({
+      direct: Object.freeze({ id: 'direct', label: '直接命中', crit: true }),
+      derived: Object.freeze({ id: 'derived', label: '派生命中', crit: true }),
+      dot: Object.freeze({ id: 'dot', label: '持续伤害', crit: false }),
+      reaction: Object.freeze({ id: 'reaction', label: '反应伤害', crit: false }),
+    });
+
+    const COMBAT_LABELS = Object.freeze({
+      armor: '护甲',
+      maxLife: '生命',
+      damageBonus: '伤害',
+      attackSpeed: '攻速',
+      critChance: '暴击',
+      critDamage: '暴击伤害',
+    });
+
+    const clampCombat = (value, lo, hi) => (value < lo ? lo : value > hi ? hi : value);
+
+    const finite = (value, fallback = 0) =>
+      typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+
+    function normalizeCount(value) {
+      const n = Math.floor(Number(value));
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    }
+
+    function emptyAttributes() {
+      const out = {};
+      for (const id of ATTRIBUTE_IDS) out[id] = 0;
+      return out;
+    }
+
+    /** 把存档 / UI 输入收敛成"四项非负整数"；未知字段丢弃。 */
+    function normalizeAttributes(raw) {
+      const out = emptyAttributes();
+      if (raw === null || typeof raw !== 'object') return out;
+      for (const id of ATTRIBUTE_IDS) out[id] = normalizeCount(raw[id]);
+      return out;
+    }
+
+    function spentPoints(attributes) {
+      const attrs = normalizeAttributes(attributes);
+      let total = 0;
+      for (const id of ATTRIBUTE_IDS) total += attrs[id];
+      return total;
+    }
+
+    /** 等级对应的总点数：1 级 0 点，每升一级 +1。 */
+    function totalPointsFor(level) {
+      return Math.max(0, Math.floor(finite(level, 1)) - 1);
+    }
+
+    /** 存档迁移用：按等级推算还没花掉的点数，已投入的部分扣掉。 */
+    function unspentPointsFor(level, attributes) {
+      return Math.max(0, totalPointsFor(level) - spentPoints(attributes));
+    }
+
+    function armorReductionOf(armor) {
+      const value = Math.max(0, finite(armor));
+      if (value <= 0) return 0;
+      return Math.min(COMBAT_CAPS.armorReduction, value / (value + 100));
+    }
+
+    /** 条件伤害规则是否可用：必须至少写一个条件，否则等于无条件加成。 */
+    function validConditional(rule) {
+      if (rule === null || typeof rule !== 'object') return false;
+      if (!(finite(rule.damage) > 0)) return false;
+      const hasElement = typeof rule.element === 'string' && rule.element.length > 0;
+      const hasTag = typeof rule.tag === 'string' && rule.tag.length > 0;
+      const hasStatus = typeof rule.status === 'string' && rule.status.length > 0;
+      return hasElement || hasTag || hasStatus;
+    }
+
+    /**
+     * 基础属性 + 装备词条 → 最终战斗属性。
+     * bonuses 是装备系统的接入点：{ maxLife, armor, damageBonus, attackSpeed,
+     * critChance, critDamage, conditional: [{ damage, element?, tag?, status? }] }。
+     */
+    function createCombatStats(attributes, bonuses = {}) {
+      const attrs = normalizeAttributes(attributes);
+      const extra = bonuses === null || typeof bonuses !== 'object' ? {} : bonuses;
+      const effects = POINT_EFFECTS;
+
+      const armor = Math.max(0, COMBAT_BASE.armor + attrs.strength * effects.strength.armor + finite(extra.armor));
+      const maxLife = Math.max(1, COMBAT_BASE.maxLife + attrs.vitality * effects.vitality.maxLife + finite(extra.maxLife));
+      const damageBonus = Math.max(
+        0,
+        COMBAT_BASE.damageBonus + attrs.intellect * effects.intellect.damageBonus + finite(extra.damageBonus),
+      );
+      const attackSpeed = clampCombat(
+        COMBAT_BASE.attackSpeed + attrs.agility * effects.agility.attackSpeed + finite(extra.attackSpeed),
+        0,
+        COMBAT_CAPS.attackSpeed,
+      );
+      const critChance = clampCombat(
+        COMBAT_BASE.critChance + attrs.agility * effects.agility.critChance + finite(extra.critChance),
+        0,
+        COMBAT_CAPS.critChance,
+      );
+      const critDamage = Math.max(0, COMBAT_BASE.critDamage + finite(extra.critDamage));
+      const conditional = Array.isArray(extra.conditional)
+        ? extra.conditional.filter(validConditional).map((rule) => ({ ...rule }))
+        : [];
+
+      return {
+        attributes: attrs,
+        spent: spentPoints(attrs),
+        maxLife,
+        armor,
+        armorReduction: armorReductionOf(armor),
+        damageBonus,
+        attackSpeed,
+        critChance,
+        critDamage,
+        conditional,
+      };
+    }
+
+    /** 没有战斗对象时（UI 预览、纯函数调用）使用的基准。 */
+    const DEFAULT_COMBAT = createCombatStats();
+
+    /** 命中上下文里满足条件的伤害加成之和；同一条规则只算一次。 */
+    function conditionalBonus(combat, context = {}) {
+      const rules = combat === null || combat === undefined ? null : combat.conditional;
+      if (!Array.isArray(rules) || rules.length === 0) return 0;
+      const element = context.element ?? null;
+      const tags = Array.isArray(context.tags) ? context.tags : [];
+      const target = context.target ?? null;
+      let sum = 0;
+      for (const rule of rules) {
+        if (typeof rule.element === 'string' && rule.element !== element) continue;
+        if (typeof rule.tag === 'string' && !tags.includes(rule.tag)) continue;
+        if (typeof rule.status === 'string') {
+          const stacks = target === null || target.statuses === undefined
+            ? 0
+            : target.statuses[rule.status]?.stacks ?? 0;
+          if (stacks <= 0) continue;
+        }
+        sum += finite(rule.damage);
+      }
+      return sum;
+    }
+
+    /**
+     * 把一条伤害折算成最终值。属性在公共入口统一应用，各动作不重复实现。
+     * @returns {{amount:number, base:number, scaling:number, crit:boolean,
+     *            critMultiplier:number, channel:string}}
+     */
+    function resolveDamage(combat, options = {}) {
+      const stats = combat === null || combat === undefined ? DEFAULT_COMBAT : combat;
+      const base = Math.max(0, finite(options.amount));
+      const channel = typeof options.channel === 'string' ? options.channel : 'direct';
+      const spec = DAMAGE_CHANNELS[channel] ?? DAMAGE_CHANNELS.direct;
+      const scaling =
+        1 +
+        finite(stats.damageBonus) +
+        conditionalBonus(stats, {
+          element: options.element ?? null,
+          tags: options.tags,
+          target: options.target ?? null,
+        });
+      let crit = false;
+      if (spec.crit && finite(stats.critChance) > 0 && typeof options.rng === 'function') {
+        crit = options.rng() < stats.critChance;
+      }
+      const critMultiplier = crit ? 1 + Math.max(0, finite(stats.critDamage)) : 1;
+      return {
+        amount: base * scaling * critMultiplier,
+        base,
+        scaling,
+        crit,
+        critMultiplier,
+        channel: spec.id,
+      };
+    }
+
+    /** 受到伤害：护甲对当前所有敌人伤害统一生效。 */
+    function mitigateDamage(amount, combat) {
+      const raw = Math.max(0, finite(amount));
+      const stats = combat === null || combat === undefined ? DEFAULT_COMBAT : combat;
+      const reduction = clampCombat(finite(stats.armorReduction), 0, COMBAT_CAPS.armorReduction);
+      return raw * (1 - reduction);
+    }
+
+    /** 攻击速度只作用于施放冷却，不改变实体内部计时。 */
+    function effectiveCooldown(baseCooldown, combat) {
+      const base = Math.max(0, finite(baseCooldown));
+      const stats = combat === null || combat === undefined ? DEFAULT_COMBAT : combat;
+      const speed = clampCombat(finite(stats.attackSpeed), 0, COMBAT_CAPS.attackSpeed);
+      return base / (1 + speed);
+    }
+
+    function percentValue(scale) {
+      const pct = Math.round(finite(scale) * 1000) / 10;
+      return (Number.isInteger(pct) ? String(pct) : pct.toFixed(1)) + '%';
+    }
+
+    function formatCombatValue(key, value) {
+      if (key === 'armor' || key === 'maxLife') return String(Math.round(finite(value)));
+      if (key === 'damageBonus') return '+' + percentValue(value);
+      return percentValue(value);
+    }
+
+    /** 一条战斗属性的可读文本，例如「护甲 6 → 8」。 */
+    function describeCombat(key, before, after) {
+      const label = COMBAT_LABELS[key] ?? key;
+      return `${label} ${formatCombatValue(key, before)} → ${formatCombatValue(key, after)}`;
+    }
+
+    /**
+     * 投入 1 点后的预览：升级界面用它显示「力量 3 → 4，护甲 6 → 8」。
+     * 返回 null 表示未知属性。
+     */
+    function previewAttribute(attributes, id, bonuses = {}) {
+      const def = ATTRIBUTES[id];
+      if (def === undefined) return null;
+      const current = normalizeAttributes(attributes);
+      const before = createCombatStats(current, bonuses);
+      const next = { ...current, [id]: current[id] + 1 };
+      const after = createCombatStats(next, bonuses);
+      const changes = def.affects.map((key) => ({
+        key,
+        label: COMBAT_LABELS[key] ?? key,
+        before: before[key],
+        after: after[key],
+        text: describeCombat(key, before[key], after[key]),
+      }));
+      return {
+        id,
+        label: def.label,
+        points: current[id],
+        nextPoints: next[id],
+        changes,
+        text: changes.map((change) => change.text).join(' · '),
+      };
+    }
+
+    /** 战斗属性的一行摘要；顶部与属性面板共用。 */
+    function describeCombatStats(combat) {
+      const stats = combat === null || combat === undefined ? DEFAULT_COMBAT : combat;
+      return [
+        '护甲 ' + formatCombatValue('armor', stats.armor),
+        '伤害 ' + formatCombatValue('damageBonus', stats.damageBonus),
+        '攻速 ' + formatCombatValue('attackSpeed', stats.attackSpeed),
+        '暴击 ' + formatCombatValue('critChance', stats.critChance) +
+          ' ×' + String(Math.round((1 + finite(stats.critDamage)) * 100) / 100),
+      ].join(' · ');
+    }
+
     // ---- skills/content/statuses.js ----
     // 状态定义：层数、时长、重复施加策略与周期处理器都由定义说明，不隐式继承。
     //
@@ -750,6 +1072,8 @@ window.__ModuleLoader__.load({
                 damageScale: (ctx.payload.damageScale ?? 1) * transform.damageScale,
                 noSplit: true,
                 noEcho: true,
+                // 分裂是派生命中：从基础伤害出发单独结算属性，可以暴击。
+                channel: 'derived',
                 centerX: center.x,
                 centerY: center.y,
               },
@@ -780,6 +1104,8 @@ window.__ModuleLoader__.load({
             damageScale: (ctx.payload.damageScale ?? 1) * transform.damageScale,
             noEcho: true,
             noSplit: true,
+            // 回响同样是派生命中：单独结算属性，可以暴击。
+            channel: 'derived',
           };
           // 单目标飞剑沿用弹体的同目标延迟命中语义；不复制飞剑实体。
           if (ctx.payload.action === 'projectile' || ctx.payload.action === 'arcSword') {
@@ -917,6 +1243,8 @@ window.__ModuleLoader__.load({
                 noDetonate: true,
                 noSplit: true,
                 noEcho: true,
+                // 引爆伤害是修饰产生的独立命中，与分裂/回响同属派生通道。
+                channel: 'derived',
                 centerX: center.x,
                 centerY: center.y,
               },
@@ -2354,6 +2682,8 @@ window.__ModuleLoader__.load({
           damageScale: 1,
           element: null,
           heavy: false,
+          // 反应伤害吃通用与条件加成，不暴击。
+          channel: 'reaction',
           sourceTag: 'reaction:conductive',
         },
       }));
@@ -2379,6 +2709,8 @@ window.__ModuleLoader__.load({
           damageScale: 1,
           element: null,
           heavy: false,
+          // 反应伤害吃通用与条件加成，不暴击。
+          channel: 'reaction',
           sourceTag: 'reaction:shatter',
         },
       }));
@@ -2427,6 +2759,24 @@ window.__ModuleLoader__.load({
 
     const DEFAULT_BOUNDS = Object.freeze({ w: 160, h: 144 });
 
+    /**
+     * 伤害通道：命中命令可以显式标注，缺省时按命令类型与标签推断。
+     * 直接命中与派生命中（分裂、回响）可以暴击；持续伤害与反应伤害不暴击。
+     */
+    function damageChannelOf(command) {
+      const explicit = command?.payload?.channel;
+      if (typeof explicit === 'string') return explicit;
+      if (command.type === 'statusDamage') return 'dot';
+      if (Array.isArray(command.tags) && command.tags.includes('reaction')) return 'reaction';
+      return 'direct';
+    }
+
+    function combatRngOf(world) {
+      if (typeof world.combatRng === 'function') return world.combatRng;
+      if (typeof world.rng === 'function') return world.rng;
+      return null;
+    }
+
     function boundsOf(world) {
       return world.bounds ?? DEFAULT_BOUNDS;
     }
@@ -2446,6 +2796,9 @@ window.__ModuleLoader__.load({
       if (!world.stats.casts) world.stats.casts = {};
       if (!world.stats.modifiers) world.stats.modifiers = {};
       if (typeof world.stats.overflow !== 'number') world.stats.overflow = 0;
+      if (typeof world.stats.crits !== 'number') world.stats.crits = 0;
+      if (typeof world.stats.critExtra !== 'number') world.stats.critExtra = 0;
+      if (typeof world.stats.mitigated !== 'number') world.stats.mitigated = 0;
       if (!Array.isArray(world.events)) world.events = [];
     }
 
@@ -2525,14 +2878,24 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function applyDamage(world, enemy, amount, command) {
+    /**
+     * 扣血只做有符号结算；伤害数值已经由 resolveDamage 折算过属性与暴击。
+     * 统计同时记录有效伤害、溢出、暴击次数与被暴击多打出的部分。
+     */
+    function applyDamage(world, enemy, resolved, command) {
+      const amount = resolved.amount ?? resolved;
       if (!(amount > 0)) return 0;
       const before = Math.max(0, enemy.cells);
       const effective = Math.min(before, amount);
       const overflow = amount - effective;
       enemy.cells -= amount;
       enemy.flash = 0.12;
+      if (!world.stats) world.stats = {};
       world.stats.overflow = (world.stats.overflow ?? 0) + overflow;
+      if (resolved.crit === true) {
+        world.stats.crits = (world.stats.crits ?? 0) + 1;
+        world.stats.critExtra = (world.stats.critExtra ?? 0) + effective * (1 - 1 / resolved.critMultiplier);
+      }
       recordDamage(world, command, effective);
       return effective;
     }
@@ -2578,8 +2941,16 @@ window.__ModuleLoader__.load({
         ? null
         : contentById(payload.element);
       const beforeCharge = stacksOf(target, 'charge');
-      const damage = (payload.damage ?? 0) * (payload.damageScale ?? 1);
-      const dealt = applyDamage(world, target, damage, command);
+      // 属性在公共伤害入口统一应用：通用加成、条件加成与暴击都由这里折算。
+      const resolved = resolveDamage(world.combat, {
+        amount: (payload.damage ?? 0) * (payload.damageScale ?? 1),
+        channel: damageChannelOf(command),
+        element: element === null ? null : element.id,
+        tags: command.tags,
+        target,
+        rng: combatRngOf(world),
+      });
+      const dealt = applyDamage(world, target, resolved, command);
 
       // 死亡目标仍完成本次状态施加：先结算效果，再标记待死亡。
       if (element !== null) {
@@ -2624,6 +2995,8 @@ window.__ModuleLoader__.load({
         skillId: command.skillInstanceId,
         depth: command.depth,
         reaction: command.reactionId,
+        channel: resolved.channel,
+        crit: resolved.crit,
       });
 
       const reactions = evaluateReactions(world, {
@@ -2711,13 +3084,23 @@ window.__ModuleLoader__.load({
     function executeStatusDamage(world, command) {
       const target = findEnemy(world, command.targetId);
       if (target === undefined || target.dead || target.cells <= 0) return;
-      const dealt = applyDamage(world, target, command.payload.damage ?? 0, command);
+      // 持续伤害吃通用与条件加成，不暴击；通道显式标注为 dot。
+      const resolved = resolveDamage(world.combat, {
+        amount: command.payload.damage ?? 0,
+        channel: damageChannelOf(command),
+        element: command.payload.element ?? null,
+        tags: command.tags,
+        target,
+        rng: combatRngOf(world),
+      });
+      const dealt = applyDamage(world, target, resolved, command);
       world.events.push({
         type: 'burn',
         status: command.payload.statusId,
         x: target.x,
         y: target.y,
         cells: dealt,
+        channel: resolved.channel,
       });
       if (target.cells <= 0) target.dead = true;
     }
@@ -2974,6 +3357,8 @@ window.__ModuleLoader__.load({
           modifierTransform: plan.transform,
           castId: opts.castId ?? null,
           action: plan.action.handler,
+          // 技能直接命中：吃通用与条件加成，可以暴击。
+          channel: 'direct',
           centerX: opts.center?.x ?? 0,
           centerY: opts.center?.y ?? 0,
           radius: plan.radius,
@@ -3407,17 +3792,18 @@ window.__ModuleLoader__.load({
         if (!implementation.handler.canCast(context)) continue;
         if (!implementation.handler.cast(context)) continue;
         skill.castCount += 1;
-        skill.timer = plan.cooldown;
+        // 攻击速度只缩短施放冷却，实体内部计时（灼烧跳伤、飞剑接触间隔）不受影响。
+        skill.timer = effectiveCooldown(plan.cooldown, world.combat);
         world.stats.casts[plan.id] = (world.stats.casts[plan.id] ?? 0) + 1;
       }
     }
 
     /** 新建技能实例：开局给一小段预热，避免同时开火。 */
-    function createSkillInstances(plans) {
+    function createSkillInstances(plans, combat = null) {
       return plans.map((plan) => ({
         id: plan.id,
         plan,
-        timer: plan.cooldown * 0.35,
+        timer: effectiveCooldown(plan.cooldown * 0.35, combat),
         castCount: 0,
       }));
     }
@@ -3430,10 +3816,11 @@ window.__ModuleLoader__.load({
       const previous = new Map(world.skills.map((skill) => [skill.plan.id, skill]));
       world.skills = plans.map((plan) => {
         const old = previous.get(plan.id);
+        const cooldown = effectiveCooldown(plan.cooldown, world.combat);
         return {
           id: plan.id,
           plan,
-          timer: old === undefined ? plan.cooldown * 0.35 : Math.min(old.timer, plan.cooldown),
+          timer: old === undefined ? effectiveCooldown(plan.cooldown * 0.35, world.combat) : Math.min(old.timer, cooldown),
           castCount: old === undefined ? 0 : old.castCount,
         };
       });
@@ -4040,15 +4427,28 @@ window.__ModuleLoader__.load({
       return def;
     }
 
-    /** 按层成长；同一层的不同敌人共享倍率，保持相对关系。 */
+    /**
+     * 按层成长；同一层的不同敌人共享倍率，保持相对关系。
+     * 第 1–15 层沿用原系数；深层改走更缓的曲线，否则体魄与技能成长追不上
+     * 指数式的生命膨胀，99 层会变成纯数值墙。
+     */
     function enemyCellsAt(floor, type) {
       const def = enemyType(type);
-      return Math.max(1, Math.round(def.cells * (1 + 0.13 * (floor - 1))));
+      const depth = Math.max(1, Math.floor(Number(floor) || 1));
+      const growth = depth <= 15
+        ? 0.13 * (depth - 1)
+        : 0.13 * 14 + 0.045 * (depth - 15);
+      return Math.max(1, Math.round(def.cells * (1 + growth)));
     }
 
     function enemyDamageAt(floor, type) {
       const def = enemyType(type);
-      return def.damage + (floor >= 10 ? 1 : 0);
+      const depth = Math.max(1, Math.floor(Number(floor) || 1));
+      let bonus = depth >= 10 ? 1 : 0;
+      if (depth >= 30) bonus += 1;
+      if (depth >= 55) bonus += 1;
+      if (depth >= 80) bonus += 1;
+      return def.damage + bonus;
     }
 
     /** 层定义给出权重表，刷新时按权重循环取类型，保证同层混合稳定可复现。 */
@@ -4075,6 +4475,7 @@ window.__ModuleLoader__.load({
       crowded: Object.freeze({ name: '拥挤', desc: '敌人 +50%，生命 −30%' }),
       frenzy: Object.freeze({ name: '狂暴', desc: '敌人移速 +30%，伤害 +1' }),
       elite: Object.freeze({ name: '精英', desc: '最后一只敌人强化，清层后额外给一次三选一' }),
+      boss: Object.freeze({ name: '最终怪物', desc: '末位 Boss 大幅强化，击败后给两次三选一' }),
     });
 
     const FLOOR_MODIFIERS = Object.freeze({ 4: 'crowded', 7: 'frenzy', 10: 'elite', 13: 'elite' });
@@ -4103,10 +4504,36 @@ window.__ModuleLoader__.load({
 
     const MAX_FLOOR = 15;
 
+    /** 地图系统的最深层数；第 99 层为最终 Boss。 */
+    const MAP_DEPTH = 99;
+
+    /**
+     * 深层构成。地图会把第 1–99 层都当作可能的战斗层，所以第 16 层起不再逐层手写，
+     * 而是沿用第 15 层的数量与混合继续平滑成长。数量在 16 只封顶：
+     * 45 秒时限与护甲减伤共同决定上限，避免深层变成纯数值墙。
+     */
+    function deepFloorPlan(floor) {
+      const def = FLOORS.find((entry) => entry.floor === floor);
+      if (def !== undefined) return def;
+      const depth = Math.max(16, Math.floor(floor));
+      const count = Math.min(16, 14 + Math.floor((depth - 15) / 14));
+      const mix = { swarm: 2, brute: 2, skirmisher: 2 };
+      if (depth >= 30) mix.brute = 3;
+      if (depth >= 45) mix.swarm = 3;
+      if (depth >= 60) mix.skirmisher = 3;
+      if (depth >= 75) {
+        mix.swarm = 3;
+        mix.brute = 3;
+        mix.skirmisher = 3;
+      }
+      return { floor: depth, count, mix };
+    }
+
     function floorDef(n) {
       const def = FLOORS.find((entry) => entry.floor === n);
-      if (def === undefined) throw new Error(`floor not in table: ${n}`);
-      return def;
+      if (def !== undefined) return def;
+      if (Number.isInteger(n) && n >= 16 && n <= MAP_DEPTH) return deepFloorPlan(n);
+      throw new Error(`floor not in table: ${n}`);
     }
 
     function enemyTotal(def, { modifier, extra = 0 } = {}) {
@@ -4119,6 +4546,1874 @@ window.__ModuleLoader__.load({
       return FLOOR_SECONDS / def.count;
     }
 
+    // ---- map/rng.js ----
+    // 地图随机数：显式种子 + 哈希派生。
+    //
+    // 地图生成不使用 Math.random()。所有结构、类型与内容都从主种子经
+    // hashSeed(...) 派生，同版本生成器、配置和内容池使用相同种子时结果完全一致。
+    // 固定算法：FNV-1a（32 位）哈希 + mulberry32 序列，参数属于存档兼容范围，
+    // 修改会改变同种子生成的地图，必须同时提升 MAP_VERSION。
+
+    const MAP_RNG_VERSION = 1;
+
+    /** 把任意串与多个部分拼成稳定的 32 位种子。 */
+    function hashSeed(...parts) {
+      let hash = 0x811c9dc5;
+      for (const part of parts) {
+        const text = String(part);
+        for (let i = 0; i < text.length; i += 1) {
+          hash ^= text.charCodeAt(i);
+          hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        // 分隔符：避免 ("ab","c") 与 ("a","bc") 派生出同一序列。
+        hash ^= 0x1f;
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+      }
+      return hash >>> 0;
+    }
+
+    /** mulberry32：固定序列、无隐藏状态、跨平台一致。 */
+    function createRng(seed) {
+      let state = Number(seed) >>> 0;
+      return function rng() {
+        state = (state + 0x6d2b79f5) | 0;
+        let t = Math.imul(state ^ (state >>> 15), 1 | state);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    /** 闭区间整数。 */
+    function rngInt(rng, min, max) {
+      const lo = Math.ceil(min);
+      const hi = Math.floor(max);
+      if (hi <= lo) return lo;
+      return lo + Math.floor(rng() * (hi - lo + 1));
+    }
+
+    function rngPick(rng, list) {
+      if (!Array.isArray(list) || list.length === 0) return undefined;
+      return list[Math.min(list.length - 1, Math.floor(rng() * list.length))];
+    }
+
+    /** 按权重取一项：entries 形如 [[value, weight], ...]，权重必须为正。 */
+    function pickWeighted(rng, entries) {
+      let total = 0;
+      for (const entry of entries) {
+        const weight = Number(entry[1]);
+        if (Number.isFinite(weight) && weight > 0) total += weight;
+      }
+      if (total <= 0) return entries.length === 0 ? undefined : entries[0][0];
+      let roll = rng() * total;
+      for (const entry of entries) {
+        const weight = Number(entry[1]);
+        if (!Number.isFinite(weight) || weight <= 0) continue;
+        roll -= weight;
+        if (roll <= 0) return entry[0];
+      }
+      return entries[entries.length - 1][0];
+    }
+
+    function rngShuffle(rng, list) {
+      const out = [...list];
+      for (let i = out.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(rng() * (i + 1));
+        const tmp = out[i];
+        out[i] = out[j];
+        out[j] = tmp;
+      }
+      return out;
+    }
+
+    // ---- map/config.js ----
+    // 地图配置：层数、宽度、类型权重、保底间隔与奖励基数。
+    //
+    // 数值来自 docs/map-system-design.md 与 docs/map-generation-design.md，
+    // 属于待试玩验证的原型参数。改动权重或间隔会改变同种子生成的地图，
+    // 必须同步提升 MAP_VERSION，并在分享种子时标明版本。
+    //
+    // 由 45% 普通 / 20% 事件 / 12% 休息 / 10% 商店 / 13% 精英的参考权重估算，
+    // 一局约经历 44 场普通战斗与 13 场精英战斗。
+
+    const MAP_VERSION = 1;
+
+    /** 地点类型：全部对 UI 暴露图标、颜色与说明，不只靠颜色区分。 */
+    const NODE_TYPES = Object.freeze({
+      normal: Object.freeze({
+        id: 'normal',
+        label: '普通怪物',
+        icon: '⚔',
+        color: '#9fb2c2',
+        desc: '稳定成长：胜利后获得金币与经验，可能拿到小型成长',
+      }),
+      elite: Object.freeze({
+        id: 'elite',
+        label: '精英怪物',
+        icon: '◆',
+        color: '#ffd166',
+        desc: '高风险高回报：敌人有额外强化，胜利后金币更多并补一次构筑选择',
+      }),
+      rest: Object.freeze({
+        id: 'rest',
+        label: '休息点',
+        icon: '☾',
+        color: '#6ee7a8',
+        desc: '二选一：恢复 30% 最大生命，或获得一次构筑强化',
+      }),
+      event: Object.freeze({
+        id: 'event',
+        label: '事件点',
+        icon: '?',
+        color: '#8fd8ff',
+        desc: '带代价的选择：选项会展示已知代价，也可以直接离开',
+      }),
+      shop: Object.freeze({
+        id: 'shop',
+        label: '商店',
+        icon: '$',
+        color: '#c9b3ff',
+        desc: '把金币换成恢复、组件或属性点，可以只看不买',
+      }),
+      boss: Object.freeze({
+        id: 'boss',
+        label: '最终怪物',
+        icon: '☠',
+        color: '#e35d5d',
+        desc: '第 99 层的最终考验：规则固定，至少两种应对思路',
+      }),
+    });
+
+    const NODE_TYPE_IDS = Object.freeze(['normal', 'elite', 'rest', 'event', 'shop', 'boss']);
+
+    /** 自动路线偏好。手动接管随时可用。 */
+    const AUTO_MODES = Object.freeze({
+      manual: Object.freeze({ id: 'manual', label: '手动', desc: '每到分叉都停下，由玩家自己选择' }),
+      steady: Object.freeze({ id: 'steady', label: '稳健', desc: '低生命优先休息，尽量避开精英' }),
+      balanced: Object.freeze({ id: 'balanced', label: '均衡', desc: '兼顾恢复、商店与成长，状态好时才考虑精英' }),
+      risky: Object.freeze({ id: 'risky', label: '冒险', desc: '优先精英和高风险事件' }),
+    });
+
+    const AUTO_MODE_IDS = Object.freeze(['manual', 'steady', 'balanced', 'risky']);
+
+    const BASE_CONFIG = {
+      version: MAP_VERSION,
+      depth: 99,
+      width: { min: 3, max: 5 },
+      weights: { normal: 45, elite: 13, rest: 12, event: 20, shop: 10 },
+      // 休息点与商店用「锚点」保证每条路线都经过：随机权重无法满足
+      // 「任意连续 12 层至少一个休息点」这类逐路线约束（12% 权重下一条 12 层
+      // 路线仍有两成概率没有休息点）。row 模式整排同类型（长地图用，保证成立），
+      // node 模式只在锚点层放一个节点（层数很少的原型用，靠事后修正补足）。
+      anchors: {
+        mode: 'row',
+        restSpacing: { min: 7, max: 10 },
+        shopSpacing: { min: 8, max: 11 },
+        minSeparation: 2,
+      },
+      guards: { eliteFrom: 4, restGap: 12, shopGap: 18, maxElitePerFloor: 2 },
+      attempts: 24,
+      repairPasses: 16,
+      reward: { normal: 22, elite: 58, boss: 220, spread: 0.3, eliteDraft: 1 },
+      rest: { healRatio: 0.3 },
+      shop: { items: 3 },
+      auto: { lookahead: 3, pauseLowLife: 0.2, pauseAllElite: 0.35 },
+    };
+
+    function mergeSection(base, extra) {
+      const out = {};
+      for (const key of Object.keys(base)) {
+        const value = base[key];
+        out[key] = value !== null && typeof value === 'object' && !Array.isArray(value)
+          ? { ...value }
+          : value;
+      }
+      if (extra === null || typeof extra !== 'object') return out;
+      for (const key of Object.keys(extra)) {
+        if (extra[key] === undefined) continue;
+        out[key] = extra[key];
+      }
+      return out;
+    }
+
+    /**
+     * 生成一份完整配置。允许按段覆盖，但版本号始终取 MAP_VERSION：
+     * 版本是生成规则的唯一标识，不接受外部随意指定。
+     */
+    function mapConfig(overrides = {}) {
+      const src = overrides === null || typeof overrides !== 'object' ? {} : overrides;
+      const config = {
+        version: MAP_VERSION,
+        depth: Math.max(3, Math.floor(Number(src.depth ?? BASE_CONFIG.depth)) || BASE_CONFIG.depth),
+        width: mergeSection(BASE_CONFIG.width, src.width),
+        weights: mergeSection(BASE_CONFIG.weights, src.weights),
+        anchors: mergeSection(BASE_CONFIG.anchors, src.anchors),
+        guards: mergeSection(BASE_CONFIG.guards, src.guards),
+        attempts: Math.max(1, Math.floor(Number(src.attempts ?? BASE_CONFIG.attempts)) || 1),
+        repairPasses: Math.max(1, Math.floor(Number(src.repairPasses ?? BASE_CONFIG.repairPasses)) || 1),
+        reward: mergeSection(BASE_CONFIG.reward, src.reward),
+        rest: mergeSection(BASE_CONFIG.rest, src.rest),
+        shop: mergeSection(BASE_CONFIG.shop, src.shop),
+        auto: mergeSection(BASE_CONFIG.auto, src.auto),
+      };
+      config.width.min = Math.max(1, Math.floor(config.width.min));
+      config.width.max = Math.max(config.width.min, Math.floor(config.width.max));
+      config.guards.eliteFrom = Math.max(2, Math.floor(config.guards.eliteFrom));
+      // 休息 / 商店间隔必须能放进当前深度，否则原型地图永远无法满足保底。
+      const span = config.depth - 2;
+      config.guards.restGap = Math.max(2, Math.min(Math.floor(config.guards.restGap), span));
+      config.guards.shopGap = Math.max(2, Math.min(Math.floor(config.guards.shopGap), span));
+      config.guards.maxElitePerFloor = Math.max(1, Math.floor(config.guards.maxElitePerFloor));
+      config.reward.normal = Math.max(0, Math.floor(config.reward.normal));
+      config.reward.elite = Math.max(0, Math.floor(config.reward.elite));
+      config.reward.boss = Math.max(0, Math.floor(config.reward.boss));
+      config.reward.spread = Math.max(0, Math.min(1, Number(config.reward.spread) || 0));
+      config.rest.healRatio = Math.max(0, Math.min(1, Number(config.rest.healRatio) || 0));
+      config.shop.items = Math.max(1, Math.floor(config.shop.items));
+      return Object.freeze(config);
+    }
+
+    /** 11 层原型：第 1 层普通战斗，第 10 层休息，第 11 层测试 Boss。 */
+    function prototypeConfig(overrides = {}) {
+      return mapConfig({
+        depth: 11,
+        width: { min: 3, max: 4 },
+        anchors: {
+          mode: 'node',
+          restSpacing: { min: 3, max: 4 },
+          shopSpacing: { min: 5, max: 7 },
+          minSeparation: 1,
+        },
+        reward: { ...BASE_CONFIG.reward, boss: 90 },
+        ...overrides,
+      });
+    }
+
+    /** 默认配置（99 层）。 */
+    const MAP_CONFIG = mapConfig();
+
+    /** 存档里保存的配置快照：只保留影响生成的字段。 */
+    function snapshotMapConfig(config) {
+      const cfg = mapConfig(config);
+      return {
+        version: cfg.version,
+        depth: cfg.depth,
+        width: { ...cfg.width },
+        weights: { ...cfg.weights },
+        anchors: {
+          mode: cfg.anchors.mode,
+          restSpacing: { ...cfg.anchors.restSpacing },
+          shopSpacing: { ...cfg.anchors.shopSpacing },
+          minSeparation: cfg.anchors.minSeparation,
+        },
+        guards: { ...cfg.guards },
+        reward: { ...cfg.reward },
+        rest: { ...cfg.rest },
+        shop: { ...cfg.shop },
+      };
+    }
+
+    /** 每层的固定规则：第 1 层普通战斗，倒数第 2 层休息，最后一层 Boss。 */
+    function fixedNodeType(floor, config) {
+      if (floor <= 1) return 'normal';
+      if (floor === config.depth) return 'boss';
+      if (floor === config.depth - 1) return 'rest';
+      return null;
+    }
+
+    // ---- map/topology.js ----
+    // 地图结构：分层有向图。
+    //
+    // 第 1 层只有起点，第 2–depth-2 层每层 3–5 个节点，倒数第 2 层单个休息点，
+    // 最后一层单个最终 Boss。连线只指向下一层，允许分叉与汇合，不允许横移或跳层。
+    // 构建阶段就保证：每个节点至少有一条入边（起点除外）、至少一条出边（Boss 除外）。
+
+    function nodeId(floor, column) {
+      return `${floor}-${column}`;
+    }
+
+    /** 每层宽度：起点、休息、Boss 固定 1，其余在配置区间内取，并偏好与上一层相近。 */
+    function floorWidths(rng, config) {
+      const widths = new Array(config.depth + 1).fill(1);
+      let previous = rngInt(rng, config.width.min, config.width.max);
+      for (let floor = 2; floor <= config.depth - 2; floor += 1) {
+        // 70% 沿用上一层宽度，避免整张图锯齿状抖动。
+        const next = rng() < 0.7 ? previous : rngInt(rng, config.width.min, config.width.max);
+        widths[floor] = next;
+        previous = next;
+      }
+      return widths;
+    }
+
+    const mapClamp = (value, lo, hi) => (value < lo ? lo : value > hi ? hi : value);
+
+    /**
+     * 按「比例映射 + 覆盖补边」连线：
+     * 1. 每个源节点先连到比例位置对应的目标节点；
+     * 2. 45% 概率再连到相邻目标，形成分叉；
+     * 3. 任何没有入边的目标补一条最近源的边，避免孤立节点。
+     */
+    function buildTopology(rng, config) {
+      const widths = floorWidths(rng, config);
+      const byFloor = new Map();
+      const nodes = [];
+      for (let floor = 1; floor <= config.depth; floor += 1) {
+        const width = widths[floor];
+        const row = [];
+        for (let column = 0; column < width; column += 1) {
+          const node = {
+            id: nodeId(floor, column),
+            floor,
+            column,
+            type: null,
+            next: [],
+            content: {},
+          };
+          row.push(node);
+          nodes.push(node);
+        }
+        byFloor.set(floor, row);
+      }
+
+      for (let floor = 1; floor < config.depth; floor += 1) {
+        const from = byFloor.get(floor);
+        const to = byFloor.get(floor + 1);
+        const positions = from.map((source) => (from.length === 1 ? 0 : (source.column + 0.5) / from.length));
+        const incoming = new Set();
+
+        from.forEach((source, index) => {
+          const base = mapClamp(Math.round(positions[index] * (to.length - 1)), 0, to.length - 1);
+          const targets = new Set([base]);
+          if (to.length > 1 && rng() < 0.45) {
+            const offset = rng() < 0.5 ? -1 : 1;
+            targets.add(mapClamp(base + offset, 0, to.length - 1));
+          }
+          for (const target of [...targets].sort((a, b) => a - b)) {
+            source.next.push(to[target].id);
+            incoming.add(target);
+          }
+        });
+
+        // 覆盖补边：没有入边的目标节点接回最近源，保证不会产生无法进入的节点。
+        for (let target = 0; target < to.length; target += 1) {
+          if (incoming.has(target)) continue;
+          let bestIndex = 0;
+          let bestDistance = Infinity;
+          positions.forEach((position, index) => {
+            const distance = Math.abs(position * (to.length - 1) - target);
+            if (distance < bestDistance) {
+              bestDistance = distance;
+              bestIndex = index;
+            }
+          });
+          from[bestIndex].next.push(to[target].id);
+          incoming.add(target);
+        }
+      }
+
+      return { nodes, byFloor, width: widths };
+    }
+
+    /** 按层分组的只读视图；nodes 顺序即生成顺序。 */
+    function groupNodesByFloor(nodes, depth) {
+      const byFloor = new Map();
+      for (let floor = 1; floor <= depth; floor += 1) byFloor.set(floor, []);
+      for (const node of nodes) {
+        if (!byFloor.has(node.floor)) byFloor.set(node.floor, []);
+        byFloor.get(node.floor).push(node);
+      }
+      for (const row of byFloor.values()) row.sort((a, b) => a.column - b.column);
+      return byFloor;
+    }
+
+    // ---- map/validate.js ----
+    // 地图验证：结构、可达性、固定层与「每条有效路线」的保底约束。
+    //
+    // 保底不能只看某一层有没有休息点：必须覆盖每条从起点到终点的路线。
+    // 这里用逐层传播状态集合来精确判定 —— 每个节点保留所有可能到达的状态
+    // （距离上次休息 / 商店的层数、上一节点是否精英），并按 Pareto 支配剪枝。
+    // 只保留「最优历史」会漏判，所以剪枝只丢弃被完全支配的状态。
+
+    function indexNodeMap(nodes) {
+      const map = new Map();
+      for (const node of nodes) map.set(node.id, node);
+      return map;
+    }
+
+    function floorRows(nodes, depth) {
+      return groupNodesByFloor(nodes, depth);
+    }
+
+    const encodeState = (state) => `${state.restGap},${state.shopGap},${state.prevElite ? 1 : 0}`;
+
+    /** 同 prevElite 下，restGap 与 shopGap 都不大于另一状态时才被支配。 */
+    function pushState(store, state, limit = 48) {
+      for (const existing of store.values()) {
+        if (
+          existing.prevElite === state.prevElite &&
+          existing.restGap <= state.restGap &&
+          existing.shopGap <= state.shopGap
+        ) return;
+      }
+      for (const [key, existing] of [...store]) {
+        if (
+          existing.prevElite === state.prevElite &&
+          state.restGap <= existing.restGap &&
+          state.shopGap <= existing.shopGap
+        ) store.delete(key);
+      }
+      if (store.size >= limit) {
+        // 兜底：状态数上限只为防止病态图，正常地图远达不到。
+        const first = store.keys().next();
+        if (!first.done) store.delete(first.value);
+      }
+      store.set(encodeState(state), state);
+    }
+
+    /**
+     * 逐层传播所有路线的状态，返回每个节点的后状态集合与违规列表。
+     * 只处理从起点可达的节点；不可达节点由 validateMap 单独报错。
+     */
+    function routeStates(nodes, config) {
+      const rows = floorRows(nodes, config.depth);
+      const states = new Map();
+      const violations = new Map();
+      const incoming = new Map();
+
+      const startRow = rows.get(1) ?? [];
+      for (const node of startRow) {
+        incoming.set(node.id, [{ restGap: 0, shopGap: 0, prevElite: false }]);
+      }
+
+      for (let floor = 1; floor <= config.depth; floor += 1) {
+        const row = rows.get(floor) ?? [];
+        for (const node of row) {
+          const list = incoming.get(node.id);
+          if (list === undefined || list.length === 0) continue;
+          const post = new Map();
+          for (const state of list) {
+            const restGap = node.type === 'rest' ? 0 : state.restGap + 1;
+            const shopGap = node.type === 'shop' ? 0 : state.shopGap + 1;
+            const prevElite = node.type === 'elite';
+            if (restGap >= config.guards.restGap) {
+              violations.set('rest:' + node.id, { kind: 'rest-gap', nodeId: node.id, value: restGap });
+            }
+            if (shopGap >= config.guards.shopGap) {
+              violations.set('shop:' + node.id, { kind: 'shop-gap', nodeId: node.id, value: shopGap });
+            }
+            if (state.prevElite && prevElite) {
+              violations.set('elite:' + node.id, { kind: 'elite-chain', nodeId: node.id });
+            }
+            if (prevElite && node.floor < config.guards.eliteFrom) {
+              violations.set('early:' + node.id, { kind: 'elite-early', nodeId: node.id });
+            }
+            pushState(post, { restGap, shopGap, prevElite });
+          }
+          states.set(node.id, [...post.values()]);
+          for (const nextId of node.next) {
+            const bucket = incoming.get(nextId) ?? [];
+            for (const state of post.values()) bucket.push(state);
+            // 入边最多 5 条、状态已被支配剪枝，这里只做去重上限保护。
+            incoming.set(nextId, bucket.length > 96 ? bucket.slice(-96) : bucket);
+          }
+        }
+      }
+
+      return { states, violations: [...violations.values()], rows };
+    }
+
+    function forwardReach(nodes, startId) {
+      const byId = indexNodeMap(nodes);
+      const seen = new Set();
+      const stack = [startId];
+      while (stack.length > 0) {
+        const id = stack.pop();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const node = byId.get(id);
+        if (node === undefined) continue;
+        for (const nextId of node.next) stack.push(nextId);
+      }
+      return seen;
+    }
+
+    function backwardReach(nodes, endId) {
+      const parents = new Map();
+      for (const node of nodes) {
+        for (const nextId of node.next) {
+          const list = parents.get(nextId) ?? [];
+          list.push(node.id);
+          parents.set(nextId, list);
+        }
+      }
+      const seen = new Set();
+      const stack = [endId];
+      while (stack.length > 0) {
+        const id = stack.pop();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        for (const prevId of parents.get(id) ?? []) stack.push(prevId);
+      }
+      return seen;
+    }
+
+    /** 统计从起点到终点的有效路线数量（饱和计数，避免天文数字溢出）。 */
+    function countRoutes(nodes, config) {
+      const rows = floorRows(nodes, config.depth);
+      const counts = new Map();
+      for (const node of rows.get(1) ?? []) counts.set(node.id, 1);
+      for (let floor = 1; floor < config.depth; floor += 1) {
+        for (const node of rows.get(floor) ?? []) {
+          const value = counts.get(node.id) ?? 0;
+          if (value === 0) continue;
+          for (const nextId of node.next) {
+            counts.set(nextId, Math.min(1e9, (counts.get(nextId) ?? 0) + value));
+          }
+        }
+      }
+      const bossRow = rows.get(config.depth) ?? [];
+      return bossRow.reduce((sum, node) => sum + (counts.get(node.id) ?? 0), 0);
+    }
+
+    /** 结构 + 类型 + 保底验证。返回可诊断的错误列表，不做隐式修正。 */
+    function validateMap(nodes, config) {
+      const errors = [];
+      const byId = indexNodeMap(nodes);
+      const rows = floorRows(nodes, config.depth);
+
+      if (!Array.isArray(nodes) || nodes.length === 0) {
+        return { ok: false, errors: [{ code: 'empty-map', message: '地图没有节点' }], stats: null };
+      }
+      if (byId.size !== nodes.length) {
+        errors.push({ code: 'duplicate-id', message: '节点 ID 不唯一' });
+      }
+
+      const startRow = rows.get(1) ?? [];
+      const bossRow = rows.get(config.depth) ?? [];
+      const preBossRow = rows.get(config.depth - 1) ?? [];
+      if (startRow.length !== 1) {
+        errors.push({ code: 'start-count', message: `第 1 层应只有 1 个节点，实际 ${startRow.length}` });
+      }
+      if (bossRow.length !== 1) {
+        errors.push({ code: 'boss-count', message: `第 ${config.depth} 层应只有 1 个节点，实际 ${bossRow.length}` });
+      }
+      if (preBossRow.length !== 1) {
+        errors.push({
+          code: 'rest-count',
+          message: `第 ${config.depth - 1} 层应只有 1 个休息节点，实际 ${preBossRow.length}`,
+        });
+      }
+
+      for (let floor = 1; floor <= config.depth; floor += 1) {
+        const row = rows.get(floor) ?? [];
+        if (row.length === 0) {
+          errors.push({ code: 'floor-empty', message: `第 ${floor} 层没有节点`, floor });
+          continue;
+        }
+        const columns = new Set();
+        for (const node of row) {
+          if (node.floor !== floor) {
+            errors.push({ code: 'floor-mismatch', message: `节点 ${node.id} 的层数不一致`, nodeId: node.id });
+          }
+          if (!Number.isInteger(node.column) || node.column < 0 || columns.has(node.column)) {
+            errors.push({ code: 'bad-column', message: `节点 ${node.id} 的列号非法`, nodeId: node.id });
+          }
+          columns.add(node.column);
+          if (NODE_TYPES[node.type] === undefined) {
+            errors.push({ code: 'bad-type', message: `节点 ${node.id} 类型未知：${String(node.type)}`, nodeId: node.id });
+          }
+          if (!Array.isArray(node.next)) {
+            errors.push({ code: 'bad-next', message: `节点 ${node.id} 缺少连线数组`, nodeId: node.id });
+            continue;
+          }
+          const seen = new Set();
+          for (const nextId of node.next) {
+            if (seen.has(nextId)) {
+              errors.push({ code: 'duplicate-edge', message: `节点 ${node.id} 有重复连线 ${nextId}`, nodeId: node.id });
+            }
+            seen.add(nextId);
+            const target = byId.get(nextId);
+            if (target === undefined) {
+              errors.push({ code: 'dangling-edge', message: `节点 ${node.id} 指向不存在的 ${nextId}`, nodeId: node.id });
+              continue;
+            }
+            if (target.floor !== node.floor + 1) {
+              errors.push({ code: 'edge-floor', message: `节点 ${node.id} 跨越了层数指向 ${nextId}`, nodeId: node.id });
+            }
+          }
+          if (floor < config.depth && node.next.length === 0) {
+            errors.push({ code: 'dead-end', message: `节点 ${node.id} 没有通往下一层的路`, nodeId: node.id });
+          }
+        }
+        if (floor < config.depth) {
+          const elites = row.filter((node) => node.type === 'elite');
+          if (elites.length === row.length && row.length > 0) {
+            errors.push({ code: 'all-elite', message: `第 ${floor} 层全部是精英`, floor });
+          }
+          if (elites.length > config.guards.maxElitePerFloor) {
+            errors.push({
+              code: 'elite-cap',
+              message: `第 ${floor} 层精英过多（${elites.length} > ${config.guards.maxElitePerFloor}）`,
+              floor,
+            });
+          }
+        }
+      }
+
+      for (const node of nodes) {
+        const fixed = fixedNodeType(node.floor, config);
+        if (fixed !== null && node.type !== fixed) {
+          errors.push({
+            code: 'fixed-type',
+            message: `第 ${node.floor} 层必须是 ${fixed}，实际 ${String(node.type)}`,
+            nodeId: node.id,
+          });
+        }
+      }
+
+      if (errors.length > 0) {
+        return { ok: false, errors, stats: null };
+      }
+
+      const startId = startRow[0].id;
+      const bossId = bossRow[0].id;
+      const forward = forwardReach(nodes, startId);
+      const backward = backwardReach(nodes, bossId);
+      for (const node of nodes) {
+        if (!forward.has(node.id)) {
+          errors.push({ code: 'unreachable', message: `节点 ${node.id} 无法从起点到达`, nodeId: node.id });
+        } else if (!backward.has(node.id)) {
+          errors.push({ code: 'no-exit', message: `节点 ${node.id} 无法通往 Boss`, nodeId: node.id });
+        }
+      }
+
+      const route = routeStates(nodes, config);
+      for (const violation of route.violations) {
+        errors.push({
+          code: 'route-' + violation.kind,
+          message: constraintMessage(violation, config),
+          nodeId: violation.nodeId,
+        });
+      }
+
+      const typeCounts = {};
+      for (const node of nodes) typeCounts[node.type] = (typeCounts[node.type] ?? 0) + 1;
+      const edges = nodes.reduce((sum, node) => sum + node.next.length, 0);
+
+      return {
+        ok: errors.length === 0,
+        errors,
+        stats: {
+          floors: config.depth,
+          nodes: nodes.length,
+          edges,
+          routes: countRoutes(nodes, config),
+          typeCounts,
+        },
+      };
+    }
+
+    function constraintMessage(violation, config) {
+      if (violation.kind === 'rest-gap') {
+        return `连续 ${config.guards.restGap} 层没有休息点（${violation.nodeId}）`;
+      }
+      if (violation.kind === 'shop-gap') {
+        return `连续 ${config.guards.shopGap} 层没有商店（${violation.nodeId}）`;
+      }
+      if (violation.kind === 'elite-chain') return `路线连续经过两个精英（${violation.nodeId}）`;
+      if (violation.kind === 'elite-early') return `前 ${config.guards.eliteFrom - 1} 层不允许出现精英（${violation.nodeId}）`;
+      return violation.kind;
+    }
+
+    /**
+     * 汇总需要修正的类型问题。修正方向只做「更安全」的转换：
+     * 精英 → 普通 / 事件，普通 → 休息 / 商店，不会把已满足的约束改坏。
+     */
+    function collectTypeProblems(nodes, config) {
+      const rows = floorRows(nodes, config.depth);
+      const problems = [];
+      const seen = new Set();
+      const push = (problem) => {
+        const key = problem.kind + ':' + problem.nodeId;
+        if (seen.has(key)) return;
+        seen.add(key);
+        problems.push(problem);
+      };
+
+      const route = routeStates(nodes, config);
+      for (const violation of route.violations) {
+        if (violation.kind === 'rest-gap') push({ kind: 'rest-gap', nodeId: violation.nodeId, fix: 'rest' });
+        else if (violation.kind === 'shop-gap') push({ kind: 'shop-gap', nodeId: violation.nodeId, fix: 'shop' });
+        else push({ kind: violation.kind, nodeId: violation.nodeId, fix: 'normal' });
+      }
+
+      for (let floor = 1; floor <= config.depth; floor += 1) {
+        const row = rows.get(floor) ?? [];
+        if (row.length === 0) continue;
+        const fixed = fixedNodeType(floor, config);
+        if (fixed !== null) {
+          for (const node of row) {
+            if (node.type !== fixed) push({ kind: 'fixed-type', nodeId: node.id, fix: fixed });
+          }
+          continue;
+        }
+        const elites = row.filter((node) => node.type === 'elite');
+        if (elites.length === row.length) {
+          const target = elites[elites.length - 1];
+          push({ kind: 'all-elite', nodeId: target.id, fix: 'event' });
+        } else if (elites.length > config.guards.maxElitePerFloor) {
+          for (const node of elites.slice(config.guards.maxElitePerFloor)) {
+            push({ kind: 'elite-cap', nodeId: node.id, fix: 'normal' });
+          }
+        }
+        for (const node of row) {
+          if (node.type === 'elite' && floor < config.guards.eliteFrom) {
+            push({ kind: 'elite-early', nodeId: node.id, fix: 'normal' });
+          }
+        }
+      }
+
+      return problems;
+    }
+
+    // ---- map/types.js ----
+    // 地图类型分配与保底修正。
+    //
+    // 分配顺序：固定层（起点 / 休息 / Boss）→ 按权重抽取 → 初步限制（前几层无精英、
+    // 每层精英上限）→ 迭代修正（针对每条路线的休息 / 商店间隔与连续精英）。
+    // 修正只做更安全的类型转换，且不改写固定层。
+
+    /** 可随机分配的类型；boss 只出现在固定层。 */
+    const ASSIGNABLE_TYPES = Object.freeze(['normal', 'elite', 'rest', 'event', 'shop']);
+
+    /**
+     * 类型分配：
+     * 1. 固定层强制（起点 / 休息 / Boss）；
+     * 2. 锚点整排（restFloors / shopFloors）——保证每条路线都经过休息与商店；
+     * 3. 其余楼层按权重抽取普通 / 精英 / 事件（有锚点时不再抽休息与商店）；
+     * 4. 初步限制：前几层无精英、每层精英上限。
+     */
+    function assignNodeTypes(nodes, rng, config, anchors = null) {
+      const rows = floorRows(nodes, config.depth);
+      const mode = anchors?.mode === 'node' ? 'node' : 'row';
+      const restFloors = anchors?.restFloors ?? new Set();
+      const shopFloors = anchors?.shopFloors ?? new Set();
+      const restColumns = anchors?.restColumns ?? new Map();
+      const shopColumns = anchors?.shopColumns ?? new Map();
+      const randomTypes = mode === 'row'
+        ? ASSIGNABLE_TYPES.filter((id) => id !== 'rest' && id !== 'shop')
+        : ASSIGNABLE_TYPES;
+      for (const node of nodes) {
+        const fixed = fixedNodeType(node.floor, config);
+        if (fixed !== null) {
+          node.type = fixed;
+          continue;
+        }
+        if (restFloors.has(node.floor) && (mode === 'row' || restColumns.get(node.floor) === node.column)) {
+          node.type = 'rest';
+          continue;
+        }
+        if (shopFloors.has(node.floor) && (mode === 'row' || shopColumns.get(node.floor) === node.column)) {
+          node.type = 'shop';
+          continue;
+        }
+        const entries = randomTypes.map((id) => [id, config.weights[id]]);
+        node.type = pickWeighted(rng, entries) ?? 'normal';
+      }
+      for (const row of rows.values()) {
+        let elites = 0;
+        for (const node of row) {
+          if (node.type !== 'elite') continue;
+          elites += 1;
+          if (elites > config.guards.maxElitePerFloor || node.floor < config.guards.eliteFrom) {
+            node.type = 'normal';
+            elites = Math.min(elites, config.guards.maxElitePerFloor);
+          }
+        }
+      }
+      return nodes;
+    }
+
+    /**
+     * 迭代修正类型直到所有路线满足保底。返回是否收敛；
+     * 未收敛时由 generateMap 换一次重试种子或使用保底模板。
+     */
+    function repairNodeTypes(nodes, config) {
+      const byId = new Map(nodes.map((node) => [node.id, node]));
+      for (let pass = 0; pass < config.repairPasses; pass += 1) {
+        const problems = collectTypeProblems(nodes, config);
+        if (problems.length === 0) return true;
+        const applied = new Set();
+        for (const problem of problems) {
+          const node = byId.get(problem.nodeId);
+          if (node === undefined || applied.has(node.id)) continue;
+          if (fixedNodeType(node.floor, config) !== null) continue;
+          node.type = problem.fix;
+          applied.add(node.id);
+        }
+        if (applied.size === 0) return false;
+      }
+      return collectTypeProblems(nodes, config).length === 0;
+    }
+
+    /** 类型分布的简短摘要，供报告与存档诊断使用。 */
+    function typeSummary(nodes) {
+      const counts = {};
+      for (const node of nodes) counts[node.type] = (counts[node.type] ?? 0) + 1;
+      return Object.keys(NODE_TYPES)
+        .filter((id) => counts[id] !== undefined)
+        .map((id) => `${NODE_TYPES[id].label} ${counts[id]}`)
+        .join(' · ');
+    }
+
+    // ---- map/content.js ----
+    // 节点内容：战斗构成、事件选项、商店货架与金币奖励。
+    //
+    // 内容在生成地图时一次性算好并写进 node.content，存档原样保存。
+    // 这样玩家走过的路线、商店操作或战斗随机数调用都不会改变其他节点的内容。
+    // 节点内容种子 = hash(主种子, 节点 ID, "content")，与拓扑重试种子无关。
+
+    /** 事件模板：cost 与 effects 都是数据，结算在 map/run.js。 */
+    const MAP_EVENT_TEMPLATES = Object.freeze([
+      Object.freeze({
+        id: 'broken-mechanism',
+        label: '受损机关',
+        desc: '半塌的机关还在缓慢转动，拆下部件有风险，但也许值得。',
+        options: Object.freeze([
+          Object.freeze({
+            id: 'pay',
+            label: '支付 {gold} 金币拆解',
+            cost: Object.freeze({ gold: 28 }),
+            effects: Object.freeze([Object.freeze({ kind: 'draft', count: 1 })]),
+            text: '你拆出一枚还能用的技能组件。',
+          }),
+          Object.freeze({
+            id: 'bleed',
+            label: '损失 {life} 生命强行拆卸',
+            cost: Object.freeze({ lifeRatio: 0.2 }),
+            effects: Object.freeze([Object.freeze({ kind: 'draft', count: 1 })]),
+            text: '机关反弹了一下，你还是拿到了组件。',
+          }),
+          Object.freeze({
+            id: 'leave',
+            label: '离开',
+            cost: Object.freeze({}),
+            effects: Object.freeze([]),
+            text: '你从旁边绕了过去。',
+          }),
+        ]),
+      }),
+      Object.freeze({
+        id: 'lost-traveler',
+        label: '迷途旅人',
+        desc: '一个旅人缩在石壁旁，愿意用情报换点补给。',
+        options: Object.freeze([
+          Object.freeze({
+            id: 'buy',
+            label: '支付 {gold} 金币换取补给情报',
+            cost: Object.freeze({ gold: 16 }),
+            effects: Object.freeze([
+              Object.freeze({ kind: 'lifeRatio', value: 0.22 }),
+              Object.freeze({ kind: 'gold', amount: 18 }),
+            ]),
+            text: '他指出了附近的补给点，还塞给你一点谢礼。',
+          }),
+          Object.freeze({
+            id: 'share',
+            label: '分出食物（损失 {life} 生命）',
+            cost: Object.freeze({ lifeRatio: 0.1 }),
+            effects: Object.freeze([Object.freeze({ kind: 'attributePoint', count: 1 })]),
+            text: '旅人教了你一套呼吸法。',
+          }),
+          Object.freeze({
+            id: 'leave',
+            label: '离开',
+            cost: Object.freeze({}),
+            effects: Object.freeze([]),
+            text: '你没有停下。',
+          }),
+        ]),
+      }),
+      Object.freeze({
+        id: 'ancient-stele',
+        label: '古代石碑',
+        desc: '碑面刻着看不懂的字，靠近时能感到它在索取。',
+        options: Object.freeze([
+          Object.freeze({
+            id: 'blood',
+            label: '以 {life} 生命献祭',
+            cost: Object.freeze({ lifeRatio: 0.15 }),
+            effects: Object.freeze([Object.freeze({ kind: 'attributePoint', count: 1 })]),
+            text: '石碑吸走一缕血色，留下一点领悟。',
+          }),
+          Object.freeze({
+            id: 'pay',
+            label: '支付 {gold} 金币供奉',
+            cost: Object.freeze({ gold: 36 }),
+            effects: Object.freeze([Object.freeze({ kind: 'attributePoint', count: 1 })]),
+            text: '金币落进凹槽，碑面亮了一下。',
+          }),
+          Object.freeze({
+            id: 'leave',
+            label: '离开',
+            cost: Object.freeze({}),
+            effects: Object.freeze([]),
+            text: '你不打算和石头做交易。',
+          }),
+        ]),
+      }),
+      Object.freeze({
+        id: 'abandoned-depot',
+        label: '遗弃货栈',
+        desc: '货架大多空了，角落还有没被翻过的箱子。',
+        options: Object.freeze([
+          Object.freeze({
+            id: 'salvage',
+            label: '搜刮补给',
+            cost: Object.freeze({}),
+            effects: Object.freeze([Object.freeze({ kind: 'lifeRatio', value: 0.15 })]),
+            text: '你找到几瓶还能用的药剂。',
+          }),
+          Object.freeze({
+            id: 'force',
+            label: '撬开箱子（损失 {life} 生命）',
+            cost: Object.freeze({ lifeRatio: 0.08 }),
+            effects: Object.freeze([Object.freeze({ kind: 'gold', amount: 34 })]),
+            text: '箱子里的金币比预想的多。',
+          }),
+          Object.freeze({
+            id: 'leave',
+            label: '离开',
+            cost: Object.freeze({}),
+            effects: Object.freeze([]),
+            text: '你只拿走了门口的水壶。',
+          }),
+        ]),
+      }),
+      Object.freeze({
+        id: 'foggy-fork',
+        label: '迷雾岔路',
+        desc: '两条路都看不清尽头，只有一条似乎更短。',
+        options: Object.freeze([
+          Object.freeze({
+            id: 'short',
+            label: '走短路（获得 {gold} 金币）',
+            cost: Object.freeze({}),
+            effects: Object.freeze([Object.freeze({ kind: 'gold', amount: 22 })]),
+            text: '你在路边捡到一小袋金币。',
+          }),
+          Object.freeze({
+            id: 'long',
+            label: '绕远路（恢复 {life} 生命）',
+            cost: Object.freeze({}),
+            effects: Object.freeze([Object.freeze({ kind: 'lifeRatio', value: 0.18 })]),
+            text: '远路更平缓，你趁机休息了一会儿。',
+          }),
+          Object.freeze({
+            id: 'leave',
+            label: '原地等待雾散',
+            cost: Object.freeze({}),
+            effects: Object.freeze([]),
+            text: '雾散了，两条路都还在。',
+          }),
+        ]),
+      }),
+    ]);
+
+    /** 商店货架：价格随层数增长，同类商品价格带一点浮动。 */
+    const MAP_SHOP_ITEMS = Object.freeze([
+      Object.freeze({
+        id: 'heal',
+        label: '治疗药剂',
+        desc: '恢复 35% 最大生命',
+        price: 24,
+        scale: 0.5,
+        effect: Object.freeze({ kind: 'lifeRatio', value: 0.35 }),
+      }),
+      Object.freeze({
+        id: 'component',
+        label: '技能组件',
+        desc: '下一次进入战斗时获得一次三选一',
+        price: 62,
+        scale: 1.1,
+        effect: Object.freeze({ kind: 'draft', count: 1 }),
+      }),
+      Object.freeze({
+        id: 'attribute',
+        label: '属性点',
+        desc: '获得 1 点基础属性点',
+        price: 46,
+        scale: 0.85,
+        effect: Object.freeze({ kind: 'attributePoint', count: 1 }),
+      }),
+    ]);
+
+    function resolveEventOption(option, floor, rng) {
+      const goldScale = 1 + floor * 0.04;
+      const cost = {};
+      if (Number.isFinite(option.cost?.gold)) cost.gold = Math.round(option.cost.gold * goldScale);
+      if (Number.isFinite(option.cost?.lifeRatio)) cost.lifeRatio = option.cost.lifeRatio;
+      const effects = option.effects.map((effect) => {
+        if (effect.kind === 'gold') {
+          return { ...effect, amount: Math.round(effect.amount * (0.9 + rng() * 0.3) * goldScale) };
+        }
+        return { ...effect };
+      });
+      const parts = [];
+      if (cost.gold !== undefined) parts.push(cost.gold + ' 金币');
+      if (cost.lifeRatio !== undefined) parts.push(Math.round(cost.lifeRatio * 100) + '% 生命');
+      const label = option.label
+        .replace('{gold}', String(cost.gold ?? 0))
+        .replace('{life}', cost.lifeRatio !== undefined ? Math.round(cost.lifeRatio * 100) + '%' : '');
+      const result = [];
+      for (const effect of effects) {
+        if (effect.kind === 'gold') result.push('+' + effect.amount + ' 金币');
+        else if (effect.kind === 'lifeRatio') result.push('恢复 ' + Math.round(effect.value * 100) + '% 最大生命');
+        else if (effect.kind === 'draft') result.push('一次构筑三选一');
+        else if (effect.kind === 'attributePoint') result.push('+1 属性点');
+      }
+      return {
+        id: option.id,
+        label,
+        costText: parts.length === 0 ? '无代价' : parts.join(' + '),
+        resultText: result.length === 0 ? '没有变化' : result.join(' · '),
+        cost,
+        effects,
+        text: option.text,
+      };
+    }
+
+    function generateShopStock(rng, floor, config) {
+      const items = MAP_SHOP_ITEMS.slice(0, config.shop.items).map((item, index) => {
+        const variance = 0.88 + rng() * 0.24;
+        const price = Math.max(5, Math.round((item.price + floor * item.scale) * variance));
+        return {
+          index,
+          id: item.id,
+          label: item.label,
+          desc: item.desc,
+          price,
+          effect: { ...item.effect },
+        };
+      });
+      return items;
+    }
+
+    function enemyHint(def) {
+      const parts = [];
+      for (const [type, weight] of Object.entries(def.mix)) {
+        const label = ENEMY_TYPES[type]?.label ?? type;
+        parts.push(label + ' ×' + Math.max(1, Math.round((weight / sumMix(def.mix)) * def.count)));
+      }
+      return parts.join(' · ');
+    }
+
+    function sumMix(mix) {
+      let total = 0;
+      for (const value of Object.values(mix)) total += Math.max(0, Number(value) || 0);
+      return total || 1;
+    }
+
+    function rewardGold(type, floor, rng, config) {
+      const base = type === 'boss'
+        ? config.reward.boss
+        : type === 'elite'
+          ? config.reward.elite
+          : config.reward.normal;
+      const spread = config.reward.spread;
+      const variance = 1 - spread + rng() * spread * 2;
+      return Math.max(0, Math.round((base + floor * 0.8) * variance));
+    }
+
+    /** 单个节点的内容。类型必须已经分配完成。 */
+    function generateNodeContent(node, rng, config) {
+      if (node.type === 'normal' || node.type === 'elite' || node.type === 'boss') {
+        const plan = nodeBattlePlan(node);
+        return {
+          kind: 'battle',
+          gold: rewardGold(node.type, node.floor, rng, config),
+          draft: node.type === 'elite' ? config.reward.eliteDraft : node.type === 'boss' ? 2 : 0,
+          enemyHint: enemyHint(plan.def),
+          count: plan.def.count,
+        };
+      }
+      if (node.type === 'rest') {
+        return { kind: 'rest', healRatio: config.rest.healRatio };
+      }
+      if (node.type === 'event') {
+        const template = MAP_EVENT_TEMPLATES[Math.floor(rng() * MAP_EVENT_TEMPLATES.length)]
+          ?? MAP_EVENT_TEMPLATES[0];
+        return {
+          kind: 'event',
+          eventId: template.id,
+          label: template.label,
+          desc: template.desc,
+          options: template.options.map((option) => resolveEventOption(option, node.floor, rng)),
+        };
+      }
+      if (node.type === 'shop') {
+        return { kind: 'shop', items: generateShopStock(rng, node.floor, config) };
+      }
+      return { kind: 'unknown' };
+    }
+
+    /** 给所有节点填充内容。种子派生自主种子与节点 ID，与尝试次数无关。 */
+    function fillNodeContent(nodes, seed, config) {
+      for (const node of nodes) {
+        const rng = createRng(hashSeed(seed, node.id, 'content'));
+        node.content = generateNodeContent(node, rng, config);
+      }
+      return nodes;
+    }
+
+    /**
+     * 战斗节点的战斗构成。普通 / 精英 / Boss 都返回 {def, modifier}，
+     * 非战斗节点返回 null。数值来自 floors.js 的深层配置，精英层减少数量、
+     * 由末位强化敌人承担强度，避免同时叠数量与强度。
+     */
+    function nodeBattlePlan(node) {
+      if (node.type === 'boss') {
+        return {
+          def: {
+            floor: node.floor,
+            count: 8,
+            mix: { brute: 2, skirmisher: 2, swarm: 2 },
+          },
+          modifier: 'boss',
+        };
+      }
+      if (node.type === 'elite') {
+        const base = deepFloorPlan(node.floor);
+        return {
+          def: {
+            floor: node.floor,
+            count: Math.max(6, base.count - 3),
+            mix: { ...base.mix },
+          },
+          modifier: 'elite',
+        };
+      }
+      const base = deepFloorPlan(node.floor);
+      return { def: { floor: node.floor, count: base.count, mix: { ...base.mix } }, modifier: null };
+    }
+
+    /** 节点的一句话摘要：地图列表、详情与自动路线原因都用它。 */
+    function nodeSummary(node) {
+      if (node === null || node === undefined) return '';
+      if (node.type === 'rest') return '二选一：恢复 ' + Math.round((node.content?.healRatio ?? 0.3) * 100) + '% 生命或构筑强化';
+      if (node.type === 'event') return node.content?.label ?? '事件';
+      if (node.type === 'shop') {
+        const items = node.content?.items ?? [];
+        return items.length === 0 ? '商店' : '商店 · ' + items.map((item) => item.label).join(' / ');
+      }
+      const hint = node.content?.enemyHint ?? '';
+      return hint === '' ? '战斗' : '敌人：' + hint;
+    }
+
+    /** 随机取一个事件模板，供测试与调试使用。 */
+    function pickEventTemplate(rng) {
+      return pickWeighted(rng, MAP_EVENT_TEMPLATES.map((template) => [template, 1])) ?? MAP_EVENT_TEMPLATES[0];
+    }
+
+    /** 商店价格区间，供报告与平衡模拟使用。 */
+    function shopPriceRange(floor, config) {
+      const items = MAP_SHOP_ITEMS.slice(0, config.shop.items);
+      const lowest = Math.min(...items.map((item) => item.price + floor * item.scale));
+      const highest = Math.max(...items.map((item) => item.price + floor * item.scale));
+      return { lowest: Math.round(lowest), highest: Math.round(highest) };
+    }
+
+    function eventGoldCostRange(floor) {
+      const scale = 1 + floor * 0.04;
+      return {
+        lowest: Math.round(Math.min(16, 28, 36) * scale),
+        highest: Math.round(Math.max(16, 28, 36) * scale),
+      };
+    }
+
+    // ---- map/generate.js ----
+    // 地图生成：尝试 → 修正 → 验证 → 保底模板。
+    //
+    // 每次新游戏用主种子生成整张地图。相同种子、版本与配置必须得到完全一致的
+    // 结果；不同种子产生不同路线。生成失败时先换确定性重试种子，超过上限后使用
+    // 同样经过验证的保底模板，绝不无限循环。
+
+    /**
+     * 锚点层：整排同类型的休息 / 商店。
+     *
+     * 为什么需要：随机权重无法满足逐路线约束。12% 休息权重下，一条长度为 12 的
+     * 路线仍有约 22% 概率完全没有休息点；靠事后修补会把休息点挤成一串相邻层。
+     * 因此休息与商店改为「整排锚点 + 层间距抖动」：任何路线每层必经过一个节点，
+     * 所以只要锚点层间距不超过保底间隔，逐路线约束就成立，同时保留了层间距的随机性。
+     */
+    function planAnchorFloors(rng, config, byFloor = null) {
+      const mode = config.anchors?.mode === 'node' ? 'node' : 'row';
+      const occupied = new Set([1, config.depth - 1, config.depth]);
+      const restFloors = new Set();
+      const shopFloors = new Set();
+      const restColumns = new Map();
+      const shopColumns = new Map();
+      const separation = Math.max(1, Math.floor(config.anchors?.minSeparation ?? 2));
+      const tooClose = (floor) => {
+        for (let offset = -separation; offset <= separation; offset += 1) {
+          if (occupied.has(floor + offset)) return true;
+        }
+        return false;
+      };
+      const fill = (target, columns, spacing) => {
+        const min = Math.max(1, Math.floor(spacing.min));
+        const max = Math.max(min, Math.floor(spacing.max));
+        let floor = 2 + rngInt(rng, min, max);
+        while (floor <= config.depth - 2) {
+          if (!tooClose(floor)) {
+            target.add(floor);
+            occupied.add(floor);
+            if (mode === 'node') {
+              const width = (byFloor?.get(floor) ?? []).length || config.width.min;
+              columns.set(floor, rngInt(rng, 0, width - 1));
+            }
+            floor += rngInt(rng, min, max);
+          } else {
+            floor += 1;
+          }
+        }
+      };
+      fill(restFloors, restColumns, config.anchors.restSpacing);
+      fill(shopFloors, shopColumns, config.anchors.shopSpacing);
+      return { mode, restFloors, shopFloors, restColumns, shopColumns };
+    }
+
+    /**
+     * 保底模板：确定性的「走廊」图。
+     * 每隔 (restGap-1) 层整层休息、每隔 (shopGap-1) 层整层商店，其余普通怪，
+     * 因此每条有效路线都必然满足间隔约束；精英只在允许的楼层出现。
+     */
+    function buildTemplateNodes(seed, config) {
+      const rng = createRng(hashSeed(seed, 'template'));
+      const { nodes, byFloor } = buildTopology(rng, config);
+      // 比保底间隔更紧的步长，给「休息与商店同时到期」留出回旋余地。
+      const restStep = Math.max(1, config.guards.restGap - 2);
+      const shopStep = Math.max(1, config.guards.shopGap - 3);
+      let lastRest = 1; // 第 1 层是普通战斗
+      let lastShop = 1;
+      let lastAnchor = 'shop';
+      for (let floor = 2; floor <= config.depth - 2; floor += 1) {
+        const restDue = floor - lastRest >= restStep;
+        const shopDue = floor - lastShop >= shopStep;
+        let type = 'normal';
+        if (restDue && shopDue) {
+          // 两者同时到期时交替，避免某一类被长期饿死；间距留了 2–3 层余量。
+          type = lastAnchor === 'rest' ? 'shop' : 'rest';
+        } else if (restDue) {
+          type = 'rest';
+        } else if (shopDue) {
+          type = 'shop';
+        }
+        for (const node of byFloor.get(floor) ?? []) node.type = type;
+        if (type === 'rest') {
+          lastRest = floor;
+          lastAnchor = 'rest';
+        } else if (type === 'shop') {
+          lastShop = floor;
+          lastAnchor = 'shop';
+        }
+      }
+      for (const node of nodes) {
+        if (node.floor === 1) node.type = 'normal';
+        else if (node.floor === config.depth) node.type = 'boss';
+        else if (node.floor === config.depth - 1) node.type = 'rest';
+      }
+      return { nodes, byFloor };
+    }
+
+    function makeMap(seed, cfg, nodes, byFloor, meta) {
+      return {
+        mapVersion: cfg.version,
+        seed,
+        depth: cfg.depth,
+        config: snapshotMapConfig(cfg),
+        nodes,
+        startId: byFloor.get(1)[0].id,
+        bossId: byFloor.get(cfg.depth)[0].id,
+        attempts: meta.attempts,
+        fallback: meta.fallback === true,
+        valid: meta.valid,
+        errors: meta.errors ?? [],
+        stats: meta.stats ?? null,
+        diagnostics: meta.diagnostics ?? [],
+      };
+    }
+
+    function generateMap({ seed = 1, config = {} } = {}) {
+      const cfg = mapConfig(config === null || config === undefined ? {} : config);
+      const diagnostics = [];
+      const attempts = Math.max(1, cfg.attempts);
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const attemptSeed = hashSeed(seed, 'attempt', attempt, cfg.version, cfg.depth);
+        const topologyRng = createRng(hashSeed(attemptSeed, 'topology'));
+        const typeRng = createRng(hashSeed(attemptSeed, 'node-types'));
+        const anchorRng = createRng(hashSeed(attemptSeed, 'anchors'));
+        const built = buildTopology(topologyRng, cfg);
+        const nodes = built.nodes;
+        const anchors = planAnchorFloors(anchorRng, cfg, built.byFloor);
+        assignNodeTypes(nodes, typeRng, cfg, anchors);
+        repairNodeTypes(nodes, cfg);
+        const result = validateMap(nodes, cfg);
+        diagnostics.push({
+          attempt,
+          ok: result.ok,
+          errors: result.errors.slice(0, 3).map((error) => error.code),
+        });
+        if (result.ok) {
+          fillNodeContent(nodes, seed, cfg);
+          return makeMap(seed, cfg, nodes, built.byFloor, {
+            attempts: attempt + 1,
+            fallback: false,
+            valid: true,
+            stats: result.stats,
+            diagnostics,
+          });
+        }
+      }
+
+      // 保底模板：结构与内容都确定，仍然走完整验证。
+      const built = buildTemplateNodes(seed, cfg);
+      repairNodeTypes(built.nodes, cfg);
+      fillNodeContent(built.nodes, seed, cfg);
+      const result = validateMap(built.nodes, cfg);
+      return makeMap(seed, cfg, built.nodes, built.byFloor, {
+        attempts,
+        fallback: true,
+        valid: result.ok,
+        errors: result.errors,
+        stats: result.stats,
+        diagnostics,
+      });
+    }
+
+    /** 生成结果的简短诊断文本，报告和存档提示共用。 */
+    function describeGeneration(map) {
+      if (map === null || map === undefined) return '没有地图';
+      const parts = [`种子 ${map.seed}`, `v${map.mapVersion}`, `${map.depth} 层`];
+      if (map.stats !== null && map.stats !== undefined) parts.push(`${map.stats.nodes} 节点`);
+      parts.push(map.fallback ? '保底模板' : `第 ${map.attempts} 次尝试通过`);
+      return parts.join(' · ');
+    }
+
+    // ---- map/run.js ----
+    // 地图进度：本局状态、节点进入 / 结算、自动路线与存档。
+    //
+    // 地图只负责「下一步去哪、这一站给什么」，战斗仍然由 arena 负责。
+    // 生命与金币跨节点保留，节点奖励只在完成时发放一次；失败重试不重复发奖。
+
+    const RUN_INDEX = new WeakMap();
+
+    function nodeIndex(run) {
+      let map = RUN_INDEX.get(run);
+      if (map === undefined) {
+        map = indexNodeMap(run.nodes);
+        RUN_INDEX.set(run, map);
+      }
+      return map;
+    }
+
+    function mapNode(run, id) {
+      if (run === null || run === undefined) return null;
+      return nodeIndex(run).get(id) ?? null;
+    }
+
+    function currentNode(run) {
+      if (run === null || run === undefined) return null;
+      return mapNode(run, run.currentNodeId);
+    }
+
+    function nodeStatus(run, id) {
+      const state = run.nodeStates[id];
+      return state === undefined ? 'unvisited' : state.status;
+    }
+
+    /** 当前可进入的下一层节点；当前节点还没结算时没有可选项。 */
+    function availableNodeIds(run) {
+      const node = currentNode(run);
+      if (node === null) return [];
+      if (nodeStatus(run, node.id) !== 'done') return [];
+      return node.next.filter((id) => nodeStatus(run, id) === 'unvisited');
+    }
+
+    function availableNodes(run) {
+      const ids = availableNodeIds(run);
+      const out = [];
+      for (const id of ids) {
+        const node = mapNode(run, id);
+        if (node !== null) out.push(node);
+      }
+      return out;
+    }
+
+    function createMapRun({
+      seed = 1,
+      config = {},
+      map = null,
+      gold = 0,
+      life = null,
+      lifeMax = 24,
+      autoMode = 'balanced',
+    } = {}) {
+      const cfg = mapConfig(config === null || config === undefined ? {} : config);
+      const generated = map ?? generateMap({ seed, config: cfg });
+      const startId = generated.startId;
+      const run = {
+        mapVersion: generated.mapVersion,
+        seed: generated.seed,
+        depth: generated.depth,
+        config: generated.config ?? snapshotMapConfig(cfg),
+        nodes: generated.nodes,
+        startId,
+        bossId: generated.bossId,
+        currentNodeId: startId,
+        visited: [startId],
+        nodeStates: { [startId]: { status: 'active' } },
+        gold: Math.max(0, Math.floor(Number(gold) || 0)),
+        lifeMax: Math.max(1, Math.floor(Number(lifeMax) || 24)),
+        life: null,
+        autoMode: AUTO_MODE_IDS.includes(autoMode) ? autoMode : 'balanced',
+        failures: 0,
+        finished: false,
+        notice: '',
+        generation: {
+          attempts: generated.attempts ?? 1,
+          fallback: generated.fallback === true,
+          valid: generated.valid !== false,
+        },
+      };
+      run.life = life === null || life === undefined
+        ? run.lifeMax
+        : Math.max(1, Math.min(run.lifeMax, Math.round(Number(life) || run.lifeMax)));
+      return run;
+    }
+
+    /** 进入一个可选的下一层节点。返回 null 表示当前不可选。 */
+    function beginNode(run, id) {
+      if (nodeStatus(run, id) !== 'unvisited') return null;
+      if (!availableNodeIds(run).includes(id)) return null;
+      const node = mapNode(run, id);
+      if (node === null) return null;
+      run.currentNodeId = id;
+      run.visited.push(id);
+      run.nodeStates[id] = { status: 'active' };
+      return node;
+    }
+
+    /** 非战斗节点的安全离开：不领取奖励，直接标记完成。 */
+    function leaveNode(run, id = run.currentNodeId) {
+      const node = mapNode(run, id);
+      if (node === null || nodeStatus(run, id) !== 'active') return false;
+      run.nodeStates[id] = { ...(run.nodeStates[id] ?? {}), status: 'done' };
+      return true;
+    }
+
+    /**
+     * 完成当前节点：写回生命、发放节点金币与奖励。
+     * 同一节点只会发奖一次（重复调用返回 alreadyDone）。
+     */
+    function completeNode(run, id = run.currentNodeId, { life = null } = {}) {
+      const node = mapNode(run, id);
+      if (node === null) return null;
+      const state = run.nodeStates[id] ?? { status: 'unvisited' };
+      if (Number.isFinite(Number(life))) {
+        run.life = Math.max(1, Math.min(run.lifeMax, Math.round(Number(life))));
+      }
+      if (state.status === 'done') return { node, alreadyDone: true, gold: 0, effects: [] };
+      const reward = Math.max(0, Math.floor(Number(node.content?.gold) || 0));
+      run.gold += reward;
+      run.failures = 0;
+      const effects = [];
+      const draft = Math.max(0, Math.floor(Number(node.content?.draft) || 0));
+      if (draft > 0) effects.push({ kind: 'draft', count: draft });
+      run.nodeStates[id] = { ...state, status: 'done' };
+      if (node.type === 'boss') run.finished = true;
+      return { node, alreadyDone: false, gold: reward, effects };
+    }
+
+    /** 战斗失败：保留节点与构筑，只累计失败次数；奖励不会重复发放。 */
+    function retryNode(run, id = run.currentNodeId) {
+      if (nodeStatus(run, id) !== 'active') return run.failures;
+      run.failures += 1;
+      run.life = run.lifeMax;
+      return run.failures;
+    }
+
+    function canPay(run, cost) {
+      if (cost === null || cost === undefined) return true;
+      if (Number.isFinite(cost.gold) && run.gold < cost.gold) return false;
+      if (Number.isFinite(cost.lifeRatio)) {
+        const price = Math.ceil(run.lifeMax * cost.lifeRatio);
+        if (run.life - price < 1) return false;
+      }
+      return true;
+    }
+
+    function applyEffects(run, effects) {
+      const external = [];
+      for (const effect of effects ?? []) {
+        if (effect === null || typeof effect !== 'object') continue;
+        if (effect.kind === 'gold') {
+          run.gold = Math.max(0, run.gold + Math.floor(Number(effect.amount) || 0));
+        } else if (effect.kind === 'life') {
+          run.life += Math.floor(Number(effect.amount) || 0);
+        } else if (effect.kind === 'lifeRatio') {
+          run.life += Math.round(run.lifeMax * (Number(effect.value) || 0));
+        } else if (effect.kind === 'draft' || effect.kind === 'attributePoint') {
+          external.push({ kind: effect.kind, count: Math.max(1, Math.floor(Number(effect.count) || 1)) });
+        }
+      }
+      run.life = Math.max(1, Math.min(run.lifeMax, Math.round(run.life)));
+      return external;
+    }
+
+    // ---- 休息点 ----
+
+    function restOptions(run, id = run.currentNodeId) {
+      const node = mapNode(run, id);
+      const ratio = Number(node?.content?.healRatio) || 0.3;
+      const heal = Math.max(1, Math.round(run.lifeMax * ratio));
+      const healed = Math.min(run.lifeMax, run.life + heal);
+      return [
+        {
+          id: 'heal',
+          label: '恢复生命',
+          desc: `恢复 ${heal} 点：${run.life} → ${healed}`,
+          available: run.life < run.lifeMax,
+          reason: run.life < run.lifeMax ? '' : '生命已满',
+          effect: { kind: 'life', amount: heal },
+        },
+        {
+          id: 'upgrade',
+          label: '构筑强化',
+          desc: '获得一次三选一，下一次战斗开始时生效',
+          available: true,
+          reason: '',
+          effect: { kind: 'draft', count: 1 },
+        },
+        {
+          id: 'leave',
+          label: '安全离开',
+          desc: '不做选择，继续前进',
+          available: true,
+          reason: '',
+          effect: null,
+        },
+      ];
+    }
+
+    function resolveRest(run, id, choiceId) {
+      const node = mapNode(run, id);
+      if (node === null || node.type !== 'rest' || nodeStatus(run, id) !== 'active') {
+        return { ok: false, reason: 'not-rest' };
+      }
+      const option = restOptions(run, id).find((entry) => entry.id === choiceId);
+      if (option === undefined) return { ok: false, reason: 'unknown-option' };
+      if (!option.available) return { ok: false, reason: option.reason || 'unavailable' };
+      const effects = option.effect === null ? [] : applyEffects(run, [option.effect]);
+      run.nodeStates[id] = { ...(run.nodeStates[id] ?? {}), status: 'done', choice: choiceId };
+      return { ok: true, choice: choiceId, effects, message: option.label };
+    }
+
+    // ---- 事件点 ----
+
+    function eventView(run, id = run.currentNodeId) {
+      const node = mapNode(run, id);
+      if (node === null || node.type !== 'event') return null;
+      const content = node.content ?? {};
+      const options = (content.options ?? []).map((option) => ({
+        id: option.id,
+        label: option.label,
+        costText: option.costText,
+        resultText: option.resultText,
+        text: option.text,
+        available: nodeStatus(run, id) === 'active' && canPay(run, option.cost),
+        reason: canPay(run, option.cost) ? '' : '资源不足',
+      }));
+      return {
+        id: node.id,
+        label: content.label ?? '事件',
+        desc: content.desc ?? '',
+        options,
+      };
+    }
+
+    function resolveEvent(run, id, optionId) {
+      const node = mapNode(run, id);
+      if (node === null || node.type !== 'event' || nodeStatus(run, id) !== 'active') {
+        return { ok: false, reason: 'not-event' };
+      }
+      const option = (node.content?.options ?? []).find((entry) => entry.id === optionId);
+      if (option === undefined) return { ok: false, reason: 'unknown-option' };
+      if (!canPay(run, option.cost)) return { ok: false, reason: 'cannot-pay' };
+      const cost = option.cost ?? {};
+      if (Number.isFinite(cost.gold)) run.gold = Math.max(0, run.gold - cost.gold);
+      if (Number.isFinite(cost.lifeRatio)) {
+        run.life = Math.max(1, run.life - Math.ceil(run.lifeMax * cost.lifeRatio));
+      }
+      const effects = applyEffects(run, option.effects);
+      run.nodeStates[id] = { ...(run.nodeStates[id] ?? {}), status: 'done', choice: optionId };
+      return { ok: true, choice: optionId, effects, text: option.text ?? '', message: option.label };
+    }
+
+    // ---- 商店 ----
+
+    function shopView(run, id = run.currentNodeId) {
+      const node = mapNode(run, id);
+      if (node === null || node.type !== 'shop') return null;
+      const purchases = run.nodeStates[id]?.purchases ?? [];
+      return {
+        id: node.id,
+        items: (node.content?.items ?? []).map((item) => {
+          const sold = purchases.includes(item.index);
+          return {
+            index: item.index,
+            id: item.id,
+            label: item.label,
+            desc: item.desc,
+            price: item.price,
+            sold,
+            available: !sold && nodeStatus(run, id) === 'active' && run.gold >= item.price,
+          };
+        }),
+      };
+    }
+
+    function buyShopItem(run, id, index) {
+      const node = mapNode(run, id);
+      if (node === null || node.type !== 'shop' || nodeStatus(run, id) !== 'active') {
+        return { ok: false, reason: 'not-shop' };
+      }
+      const item = (node.content?.items ?? []).find((entry) => entry.index === index);
+      if (item === undefined) return { ok: false, reason: 'unknown-item' };
+      const state = run.nodeStates[id] ?? { status: 'active' };
+      const purchases = state.purchases ?? [];
+      if (purchases.includes(index)) return { ok: false, reason: 'sold' };
+      if (run.gold < item.price) return { ok: false, reason: 'no-gold' };
+      run.gold -= item.price;
+      const effects = applyEffects(run, [item.effect]);
+      run.nodeStates[id] = { ...state, purchases: [...purchases, index] };
+      return { ok: true, item, effects, message: item.label };
+    }
+
+    function leaveShop(run, id = run.currentNodeId) {
+      return leaveNode(run, id);
+    }
+
+    // ---- 自动路线 ----
+
+    const TYPE_SCORES = {
+      steady: { normal: 3, rest: 6, event: 2, shop: 3, elite: -6, boss: 0 },
+      balanced: { normal: 3, rest: 4, event: 3, shop: 3, elite: 1.5, boss: 0 },
+      risky: { normal: 2, rest: 0, event: 3.5, shop: 2, elite: 5, boss: 0 },
+    };
+
+    function lookaheadTypes(run, node, steps) {
+      const seen = new Set();
+      const found = new Map();
+      let frontier = node.next.map((id) => ({ id, depth: 1 }));
+      while (frontier.length > 0) {
+        const next = [];
+        for (const entry of frontier) {
+          if (entry.depth > steps) continue;
+          if (seen.has(entry.id)) continue;
+          seen.add(entry.id);
+          const target = mapNode(run, entry.id);
+          if (target === null) continue;
+          found.set(target.type, (found.get(target.type) ?? 0) + 1);
+          for (const id of target.next) next.push({ id, depth: entry.depth + 1 });
+        }
+        frontier = next;
+      }
+      return found;
+    }
+
+    function scoreNode(run, node, mode, context) {
+      const table = TYPE_SCORES[mode] ?? TYPE_SCORES.balanced;
+      let score = table[node.type] ?? 0;
+      const learned = lookaheadTypes(run, node, run.config?.auto?.lookahead ?? 3);
+      const hasRestAhead = (learned.get('rest') ?? 0) > 0;
+
+      if (node.type === 'rest' && context.lifeRatio < 0.55) score += 3;
+      if (node.type === 'elite' && context.lifeRatio < 0.45) score -= 4;
+      if (node.type === 'shop' && context.gold >= 70) score += 2;
+      if (node.type === 'event' && context.lifeRatio < 0.3) score -= 1;
+      if (mode !== 'risky' && (learned.get('elite') ?? 0) > 0 && context.lifeRatio < 0.5) score -= 1.5;
+      if (context.lifeRatio < 0.6 && !hasRestAhead && node.type !== 'rest') score -= 1;
+      if (mode === 'risky' && node.type === 'rest' && context.lifeRatio > 0.75) score -= 2;
+      return score;
+    }
+
+    function pauseReason(run, options, context) {
+      const limits = run.config?.auto ?? {};
+      const lowLife = limits.pauseLowLife ?? 0.2;
+      const allEliteLimit = limits.pauseAllElite ?? 0.35;
+      if (options.length === 0) return 'no-options';
+      if (context.lifeRatio <= lowLife && options.every((node) => node.type !== 'rest')) {
+        return 'low-life-no-rest';
+      }
+      if (context.lifeRatio < allEliteLimit && options.every((node) => node.type === 'elite')) {
+        return 'all-elite-low-life';
+      }
+      return null;
+    }
+
+    /**
+     * 自动路线：返回 { nodeId, paused, reason, scores }。
+     * manual 模式永远返回 paused=true（reason='manual'），由玩家自己点。
+     * 自动时至少考虑未来 2–3 层的连线，而不是只看眼前一个节点。
+     */
+    function pickNextNode(run, profile = {}) {
+      const mode = AUTO_MODE_IDS.includes(run.autoMode) ? run.autoMode : 'balanced';
+      if (mode === 'manual') return { nodeId: null, paused: true, reason: 'manual', scores: [] };
+      if (run.finished === true) return { nodeId: null, paused: true, reason: 'finished', scores: [] };
+      const options = availableNodes(run);
+      if (options.length === 0) return { nodeId: null, paused: true, reason: 'no-options', scores: [] };
+      if (options.length === 1) {
+        return { nodeId: options[0].id, paused: false, reason: 'single', scores: [] };
+      }
+      const lifeMax = Math.max(1, Number(profile.lifeMax ?? run.lifeMax) || run.lifeMax);
+      const life = Math.max(0, Number(profile.life ?? run.life) || 0);
+      const context = { lifeRatio: lifeMax > 0 ? life / lifeMax : 1, gold: run.gold };
+      const scored = options.map((node) => ({
+        node,
+        score: scoreNode(run, node, mode, context),
+      }));
+      scored.sort((a, b) => (b.score - a.score) || (a.node.column - b.node.column));
+      const blocked = pauseReason(run, options, context);
+      if (blocked !== null) {
+        return {
+          nodeId: null,
+          paused: true,
+          reason: blocked,
+          scores: scored.map((entry) => ({ nodeId: entry.node.id, score: entry.score })),
+        };
+      }
+      return {
+        nodeId: scored[0].node.id,
+        paused: false,
+        reason: mode,
+        scores: scored.map((entry) => ({ nodeId: entry.node.id, score: entry.score })),
+      };
+    }
+
+    function autoReasonText(reason) {
+      if (reason === 'manual') return '手动路线：等你选择下一站';
+      if (reason === 'no-options') return '当前没有可选节点';
+      if (reason === 'finished') return '本局已经结束';
+      if (reason === 'single') return '唯一路线，自动前进';
+      if (reason === 'steady') return '稳健：优先恢复，避开精英';
+      if (reason === 'balanced') return '均衡：兼顾恢复、商店与成长';
+      if (reason === 'risky') return '冒险：优先精英与高风险事件';
+      if (reason === 'low-life-no-rest') return '自动暂停：生命偏低且下一站没有休息点';
+      if (reason === 'all-elite-low-life') return '自动暂停：可选节点全是精英且生命偏低';
+      return '';
+    }
+
+    // ---- 存档 ----
+
+    function serializeMapRun(run) {
+      if (run === null || run === undefined) return null;
+      return {
+        mapVersion: run.mapVersion,
+        seed: run.seed,
+        depth: run.depth,
+        config: run.config,
+        nodes: run.nodes,
+        startId: run.startId,
+        bossId: run.bossId,
+        currentNodeId: run.currentNodeId,
+        visited: [...run.visited],
+        nodeStates: run.nodeStates,
+        gold: run.gold,
+        life: run.life,
+        lifeMax: run.lifeMax,
+        autoMode: run.autoMode,
+        failures: run.failures,
+        finished: run.finished,
+      };
+    }
+
+    /** 读档：结构不合法（版本不符、缺节点、指针指向不存在的节点）返回 null。 */
+    function restoreMapRun(raw) {
+      if (raw === null || raw === undefined || typeof raw !== 'object') return null;
+      if (raw.mapVersion !== MAP_VERSION) return null;
+      if (!Array.isArray(raw.nodes) || raw.nodes.length === 0) return null;
+      const cfg = mapConfig({ ...(raw.config ?? {}), depth: raw.depth ?? raw.config?.depth });
+      const byId = indexNodeMap(raw.nodes);
+      if (!byId.has(raw.startId) || !byId.has(raw.bossId)) return null;
+      const currentNodeId = byId.has(raw.currentNodeId) ? raw.currentNodeId : raw.startId;
+      const validation = validateMap(raw.nodes, cfg);
+      if (!validation.ok) return null;
+      const nodeStates = {};
+      for (const [id, state] of Object.entries(raw.nodeStates ?? {})) {
+        if (!byId.has(id) || state === null || typeof state !== 'object') continue;
+        nodeStates[id] = { ...state };
+      }
+      const run = {
+        mapVersion: raw.mapVersion,
+        seed: raw.seed,
+        depth: raw.depth,
+        config: snapshotMapConfig(cfg),
+        nodes: raw.nodes,
+        startId: raw.startId,
+        bossId: raw.bossId,
+        currentNodeId,
+        visited: Array.isArray(raw.visited) ? raw.visited.filter((id) => byId.has(id)) : [raw.startId],
+        nodeStates,
+        gold: Math.max(0, Math.floor(Number(raw.gold) || 0)),
+        lifeMax: Math.max(1, Math.floor(Number(raw.lifeMax) || 24)),
+        life: null,
+        autoMode: AUTO_MODE_IDS.includes(raw.autoMode) ? raw.autoMode : 'balanced',
+        failures: Math.max(0, Math.floor(Number(raw.failures) || 0)),
+        finished: raw.finished === true,
+        notice: '',
+        generation: { attempts: 1, fallback: false, valid: true },
+      };
+      run.life = Math.max(1, Math.min(run.lifeMax, Math.round(Number(raw.life) || run.lifeMax)));
+      return run;
+    }
+
+    /** 进度摘要：UI 顶部、存档卡片与报告共用。 */
+    function mapRunSummary(run) {
+      if (run === null || run === undefined) return null;
+      const node = currentNode(run);
+      return {
+        seed: run.seed,
+        depth: run.depth,
+        floor: node === null ? 1 : node.floor,
+        percent: Math.round(((node === null ? 1 : node.floor) / run.depth) * 100),
+        currentId: run.currentNodeId,
+        currentType: node === null ? null : node.type,
+        currentLabel: node === null ? '' : NODE_TYPES[node.type]?.label ?? '',
+        currentSummary: nodeSummary(node),
+        status: nodeStatus(run, run.currentNodeId),
+        gold: run.gold,
+        life: run.life,
+        lifeMax: run.lifeMax,
+        autoMode: run.autoMode,
+        autoLabel: AUTO_MODES[run.autoMode]?.label ?? '',
+        failures: run.failures,
+        finished: run.finished,
+        visited: [...run.visited],
+        generation: { ...(run.generation ?? {}) },
+      };
+    }
+
+    /** 战斗节点的战斗构成；非战斗节点返回 null。 */
+    function nodePlan(node) {
+      return nodeBattlePlan(node);
+    }
+
+    function setAutoMode(run, mode) {
+      if (!AUTO_MODE_IDS.includes(mode)) return false;
+      run.autoMode = mode;
+      return true;
+    }
+
     // ---- arena.js ----
     // 战斗世界：位置、刷怪、走位、经验、抽选与胜负。
     //
@@ -4129,13 +6424,16 @@ window.__ModuleLoader__.load({
     const MAX_EXTRA = 18;
     const MAX_SKILLS = 2;
 
-    const PLAYER_BASE_CELLS = 24;
     const PLAYER_SPEED = 52;
     const PLAYER_RADIUS = 3;
     const CONTACT_PAD = 1.5;
     const ENEMY_ATTACK_INTERVAL = 1.6;
     const ENEMY_SPEED_PER_FLOOR = 0.6;
     const XP_PER_KILL_CAP = 6;
+
+    // 暴击使用独立 RNG 流：刷怪与抽选继续走 battle.rng，加入暴击不会改变已有种子
+    // 的刷怪顺序与三选一候选。
+    const COMBAT_RNG_SALT = 0x9e3779b9;
 
     const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
     const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -4196,18 +6494,33 @@ window.__ModuleLoader__.load({
       draftCount = 0,
       movementStrategy = 'auto',
       styleId = null,
+      attributes = {},
+      attributePoints = 0,
+      bonuses = {},
+      // 地图节点给出的战斗构成：{ def, modifier }。传入时不再查 15 层表。
+      plan = null,
+      // 地图跨节点保留的生命；不传则满生命开始。
+      life = null,
     } = {}) {
-      const def = floorDef(floor);
+      const def = plan !== null && plan !== undefined && plan.def !== undefined ? plan.def : floorDef(floor);
       const compiled = normalizeCompile(build);
-      const modifier = floorModifier(floor);
+      const modifier = plan !== null && plan !== undefined
+        ? (plan.modifier ?? null)
+        : floorModifier(floor);
+      const allocated = normalizeAttributes(attributes);
+      const combat = createCombatStats(allocated, bonuses);
+      const carried = life === null || life === undefined ? Number.NaN : Number(life);
+      const startCells = Number.isFinite(carried)
+        ? Math.max(1, Math.min(combat.maxLife, Math.round(carried)))
+        : combat.maxLife;
       const player = {
         id: 'player',
         kind: 'player',
         x: ARENA.w / 2,
         y: ARENA.h / 2,
         radius: PLAYER_RADIUS,
-        cells: PLAYER_BASE_CELLS,
-        maxCells: PLAYER_BASE_CELLS,
+        cells: startCells,
+        maxCells: combat.maxLife,
         speed: PLAYER_SPEED,
       };
       const battle = {
@@ -4219,8 +6532,12 @@ window.__ModuleLoader__.load({
         plans: compiled.plans,
         compileErrors: compiled.errors,
         compileWarnings: compiled.warnings,
-        skills: createSkillInstances(compiled.plans),
+        skills: createSkillInstances(compiled.plans, combat),
         player,
+        attributes: allocated,
+        attributePoints: Math.max(0, Math.floor(Number(attributePoints) || 0)),
+        bonuses: bonuses === null || typeof bonuses !== 'object' ? {} : { ...bonuses },
+        combat,
         enemies: [],
         entities: [],
         projectiles: [],
@@ -4243,6 +6560,7 @@ window.__ModuleLoader__.load({
         state: 'fighting',
         rng: mulberry32(seed),
         seed,
+        combatRng: mulberry32((seed ^ COMBAT_RNG_SALT) >>> 0),
         nextId: 1,
         nextEventId: 1,
         bounds: ARENA,
@@ -4255,6 +6573,9 @@ window.__ModuleLoader__.load({
           overflow: 0,
           kills: 0,
           killsByType: {},
+          crits: 0,
+          critExtra: 0,
+          mitigated: 0,
         },
         movement: createMovementState(compiled.plans, movementStrategy),
         total: 0,
@@ -4288,12 +6609,15 @@ window.__ModuleLoader__.load({
         const index = battle.spawned;
         const type = bag.length === 0 ? 'swarm' : bag[index % bag.length];
         const typeDef = enemyType(type);
-        const isElite = battle.modifier === 'elite' && index === total - 1;
+        const finalSpawn = index === total - 1;
+        const isElite = finalSpawn && (battle.modifier === 'elite' || battle.modifier === 'boss');
+        const isBoss = finalSpawn && battle.modifier === 'boss';
         let cells = enemyCellsAt(battle.floor, type);
         if (battle.modifier === 'crowded') cells = Math.round(cells * 0.7);
-        if (isElite) cells = Math.round(cells * 2.5);
+        if (isBoss) cells = Math.round(cells * 3.4);
+        else if (isElite) cells = Math.round(cells * 2.5);
         const at = spawnPoint(battle.rng);
-        const radius = typeDef.radius + (isElite ? 1 : 0);
+        const radius = typeDef.radius + (isBoss ? 2 : isElite ? 1 : 0);
         const enemy = {
           id: battle.nextId++,
           kind: 'enemy',
@@ -4304,8 +6628,8 @@ window.__ModuleLoader__.load({
           maxCells: cells,
           radius,
           r: radius,
-          speed: typeDef.speed * (1 + battle.floor * ENEMY_SPEED_PER_FLOOR * 0.02) * (battle.modifier === 'frenzy' ? 1.3 : 1),
-          damage: enemyDamageAt(battle.floor, type) + (battle.modifier === 'frenzy' ? 1 : 0) + (isElite ? 1 : 0),
+          speed: typeDef.speed * (1 + battle.floor * ENEMY_SPEED_PER_FLOOR * 0.02) * (battle.modifier === 'frenzy' ? 1.3 : 1) * (isBoss ? 1.12 : 1),
+          damage: enemyDamageAt(battle.floor, type) + (battle.modifier === 'frenzy' ? 1 : 0) + (isBoss ? 2 : isElite ? 1 : 0),
           behavior: typeDef.behavior,
           preferredRange: typeDef.preferredRange ?? 0,
           shot: typeDef.shot ?? null,
@@ -4314,11 +6638,13 @@ window.__ModuleLoader__.load({
           dead: false,
           deathHandled: false,
           flash: 0,
-          elite: isElite,
+          elite: isElite && !isBoss,
+          boss: isBoss,
         };
         battle.enemies.push(enemy);
         battle.spawned += 1;
-        if (battle.spawned === total && isElite) battle.events.push({ type: 'elite', x: enemy.x, y: enemy.y });
+        if (battle.spawned === total && isBoss) battle.events.push({ type: 'boss', x: enemy.x, y: enemy.y });
+        else if (battle.spawned === total && isElite) battle.events.push({ type: 'elite', x: enemy.x, y: enemy.y });
       }
     }
 
@@ -4364,8 +6690,19 @@ window.__ModuleLoader__.load({
 
     function hurtPlayer(battle, amount) {
       if (!(amount > 0) || battle.state !== 'fighting') return;
-      battle.player.cells -= amount;
-      battle.events.push({ type: 'hurt', x: battle.player.x, y: battle.player.y, cells: amount });
+      // 护甲对当前所有敌人伤害统一生效；内部保留小数，界面显示时再取整。
+      const taken = mitigateDamage(amount, battle.combat);
+      if (!(taken > 0)) return;
+      if (!battle.stats) battle.stats = {};
+      battle.stats.mitigated = (battle.stats.mitigated ?? 0) + Math.max(0, amount - taken);
+      battle.player.cells -= taken;
+      battle.events.push({
+        type: 'hurt',
+        x: battle.player.x,
+        y: battle.player.y,
+        cells: taken,
+        raw: amount,
+      });
       if (battle.player.cells <= 0) {
         battle.player.cells = 0;
         battle.state = 'dead';
@@ -4424,8 +6761,10 @@ window.__ModuleLoader__.load({
         battle.xp -= battle.xpNext;
         battle.level += 1;
         battle.xpNext = 6 + battle.level * 2;
+        // 每次升级 +1 基础属性点；与技能三选一互相独立，同一次升级可以各拿一份。
+        battle.attributePoints = (battle.attributePoints ?? 0) + 1;
         if (battle.level % 2 === 0) battle.pending += 1;
-        battle.events.push({ type: 'levelUp', level: battle.level });
+        battle.events.push({ type: 'levelUp', level: battle.level, points: battle.attributePoints });
       }
       rollOffer(battle);
     }
@@ -4449,11 +6788,14 @@ window.__ModuleLoader__.load({
         battle.stats.killsByType[enemy.type] = (battle.stats.killsByType[enemy.type] ?? 0) + 1;
         battle.events.push({ type: 'kill', x: enemy.x, y: enemy.y, id: enemy.id, enemyType: enemy.type });
         queueDeathReactions(battle, enemy);
-        if (enemy.elite) {
+        if (enemy.boss) {
+          battle.pending += 2;
+          battle.events.push({ type: 'bossDown', x: enemy.x, y: enemy.y });
+        } else if (enemy.elite) {
           battle.pending += 1;
           battle.events.push({ type: 'eliteDown', x: enemy.x, y: enemy.y });
         }
-        const xp = enemy.elite ? enemyType(enemy.type).xp * 3 : enemyType(enemy.type).xp;
+        const xp = enemy.boss ? enemyType(enemy.type).xp * 5 : enemy.elite ? enemyType(enemy.type).xp * 3 : enemyType(enemy.type).xp;
         awardXp(battle, Math.min(XP_PER_KILL_CAP, xp));
       }
       battle.enemies = battle.enemies.filter((enemy) => !enemy.deathHandled);
@@ -4480,7 +6822,8 @@ window.__ModuleLoader__.load({
           skillInstanceId: tick.skillInstanceId,
           rootEventId: tick.rootEventId ?? undefined,
           tags: ['status', tick.statusId],
-          payload: { damage: tick.damage, statusId: tick.statusId },
+          // 持续伤害吃通用与条件加成，但不暴击。
+          payload: { damage: tick.damage, statusId: tick.statusId, channel: 'dot', element: tick.element },
         });
       }
     }
@@ -4568,6 +6911,57 @@ window.__ModuleLoader__.load({
     function setMovementStrategy(battle, strategy) {
       battle.movement = createMovementState(battle.plans, strategy);
       return battle.movement.strategy;
+    }
+
+    /**
+     * 重算战斗属性。属性点分配、装备变化后调用；
+     * 已经飞出去的实体与延迟命令在命中结算时才读取，不做额外快照。
+     */
+    function recomputeCombat(battle) {
+      const combat = createCombatStats(battle.attributes, battle.bonuses ?? {});
+      battle.combat = combat;
+      battle.player.maxCells = combat.maxLife;
+      if (battle.player.cells > combat.maxLife) battle.player.cells = combat.maxLife;
+      return combat;
+    }
+
+    /**
+     * 自由分配基础属性点。
+     * 最大生命提升时，当前生命同步增加相同数值（docs/character-attributes-design.md）。
+     * 返回 false 表示属性未知或点数不足。
+     */
+    function allocateAttribute(battle, id, points = 1) {
+      if (!ATTRIBUTE_IDS.includes(id)) return false;
+      const spend = Math.max(1, Math.floor(Number(points) || 1));
+      const available = Math.max(0, Math.floor(Number(battle.attributePoints) || 0));
+      if (available < spend) return false;
+      const attributes = normalizeAttributes(battle.attributes);
+      attributes[id] += spend;
+      battle.attributes = attributes;
+      battle.attributePoints = available - spend;
+      const beforeMax = battle.player.maxCells;
+      const combat = recomputeCombat(battle);
+      const gain = combat.maxLife - beforeMax;
+      // 阵亡状态不再补血：本层已经结束，重试会从满生命开始。
+      if (gain > 0 && battle.state !== 'dead') {
+        battle.player.cells = Math.min(combat.maxLife, battle.player.cells + gain);
+      }
+      battle.events.push({ type: 'attribute', id, points: spend, value: attributes[id], combat });
+      return true;
+    }
+
+    /** 属性与战斗属性的可读快照，供 UI、报告与测试读取。 */
+    function attributeSummary(battle) {
+      const attributes = normalizeAttributes(battle.attributes);
+      const combat = battle.combat ?? createCombatStats(attributes, battle.bonuses ?? {});
+      return {
+        attributes: { ...attributes },
+        spent: Object.values(attributes).reduce((sum, value) => sum + value, 0),
+        points: Math.max(0, Math.floor(Number(battle.attributePoints) || 0)),
+        combat,
+        previews: ATTRIBUTE_IDS.map((id) => previewAttribute(attributes, id, battle.bonuses ?? {})),
+        text: describeCombatStats(combat),
+      };
     }
 
     /** 选中一张升级：装入组件、重编译、保留飞行中的计划快照。 */
@@ -4677,6 +7071,30 @@ window.__ModuleLoader__.load({
       '.dsh-pet-cells{height:4px;background:#18212b;border-radius:2px;overflow:hidden}',
       '.dsh-pet-body-rest{display:flex;flex-direction:column;gap:6px}',
       '.dsh-pet-cells i{display:block;height:100%;background:#6ee7a8;transition:width .12s linear}',
+      '.dsh-pet-fold{display:flex;flex-direction:column;gap:2px}',
+      '.dsh-pet-fold-head{display:flex;align-items:center;gap:4px;width:100%;font:inherit;font-size:10px;',
+      'color:#7f93a3;background:transparent;border:1px solid #1d2935;border-radius:4px;padding:2px 5px;',
+      'cursor:pointer;text-align:left}',
+      '.dsh-pet-fold-head:hover{background:#111a24;border-color:#2a3a4a}',
+      '.dsh-pet-fold-head.open{border-color:#2a3a4a;background:#0e151d}',
+      '.dsh-pet-fold-caret{width:9px;flex:none;color:#6c8091}',
+      '.dsh-pet-fold-title{color:#cfe3ef}',
+      '.dsh-pet-fold-summary{margin-left:auto;font-size:9px;color:#7f93a3;white-space:nowrap;overflow:hidden;',
+      'text-overflow:ellipsis}',
+      '.dsh-pet-fold-body{display:flex;flex-direction:column;gap:3px;padding:4px 5px;background:#0e151d;',
+      'border:1px solid #1d2935;border-radius:4px}',
+      '.dsh-pet-attrs{display:flex;flex-direction:column;gap:2px}',
+      '.dsh-pet-attrs-hint{font-size:8px;color:#6c8091;line-height:1.4}',
+      '.dsh-pet-attr-row{display:flex;align-items:center;gap:4px;font-size:9px;line-height:1.3}',
+      '.dsh-pet-attr-name{color:#cfe3ef;width:26px;flex:none}',
+      '.dsh-pet-attr-points{color:#ffd166;font-weight:700;width:16px;text-align:right;flex:none}',
+      '.dsh-pet-attr-btn{font:inherit;font-size:9px;line-height:1;color:#0a0d12;background:#6ee7a8;',
+      'border:1px solid #6ee7a8;border-radius:3px;padding:2px 4px;cursor:pointer;flex:none}',
+      '.dsh-pet-attr-btn:hover:not(:disabled){background:#8ff0bd}',
+      '.dsh-pet-attr-btn:disabled{background:#1a2733;border-color:#24313d;color:#5f7282;cursor:default}',
+      '.dsh-pet-attr-effect{color:#7f93a3;margin-left:auto;text-align:right}',
+      '.dsh-pet-attrs-points{color:#ffd166;font-size:9px;flex:none}',
+      '.dsh-pet-combat{font-size:9px;color:#a0e7c8;line-height:1.4}',
       '.dsh-pet-bottom{display:flex;gap:8px;color:#6c8091;font-size:10px;flex-wrap:wrap}',
       '.dsh-pet-hot{color:#e35d5d}',
       '.dsh-pet-banner{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;',
@@ -4702,8 +7120,7 @@ window.__ModuleLoader__.load({
       '.dsh-pet-slotpick button{font:inherit;font-size:9px;color:#cfe3ef;background:#1a2733;',
       'border:1px solid #31465a;border-radius:3px;padding:2px 5px;cursor:pointer}',
       '.dsh-pet-slotpick button:hover{background:#233748}',
-      '.dsh-pet-build{display:flex;flex-direction:column;gap:4px}',
-      '.dsh-pet-build-head{display:flex;justify-content:space-between;font-size:10px;color:#7f93a3}',
+      '.dsh-pet-build{display:flex;flex-direction:column;gap:2px}',
       '.dsh-pet-skill{background:#0e151d;border:1px solid #1d2935;border-radius:4px;padding:3px 5px;',
       'display:flex;flex-direction:column;gap:2px}',
       '.dsh-pet-skill-head{display:flex;justify-content:space-between;gap:6px;align-items:center}',
@@ -4720,7 +7137,6 @@ window.__ModuleLoader__.load({
       '.dsh-pet-chip:disabled{opacity:.4;cursor:default}',
       '.dsh-pet-notice{font-size:9px;color:#ffd166;background:#161f16;border:1px solid #2f4a2f;',
       'border-radius:4px;padding:2px 5px;cursor:pointer;line-height:1.4}',
-      '.dsh-pet-styles{display:flex;flex-direction:column;gap:3px}',
       '.dsh-pet-style-row{display:flex;flex-wrap:wrap;gap:3px;align-items:center}',
       '.dsh-pet-style{font:inherit;font-size:9px;color:#cfe3ef;background:#111a24;border:1px solid #24313d;',
       'border-radius:3px;padding:1px 5px;cursor:pointer}',
@@ -4747,8 +7163,6 @@ window.__ModuleLoader__.load({
       'display:flex;flex-direction:column;gap:3px}',
       '.dsh-pet-menu-debug-row{display:flex;align-items:center;gap:5px;justify-content:space-between}',
       '.dsh-pet-menu-hint{font-size:8px;color:#7f93a3;line-height:1.4}',
-      '.dsh-pet-dev{font-size:8px;color:#0a0d12;background:#ffd166;border-radius:3px;padding:0 3px;',
-      'letter-spacing:.06em;margin-left:auto}',
       '.dsh-pet-menu-slot{background:#0e151d;border:1px solid #1d2935;border-radius:4px;padding:4px 5px;',
       'display:flex;flex-direction:column;gap:3px}',
       '.dsh-pet-menu-slot.on{border-color:#3f5a36;background:#111b16}',
@@ -4769,6 +7183,45 @@ window.__ModuleLoader__.load({
       '.dsh-pet-menu-slotpick.on{color:#ffd166;border-color:#ffd166;background:#1a1d16}',
       '.dsh-pet-menu-slotpick:disabled{opacity:.35;cursor:default}',
       '.dsh-pet-menu-foot{font-size:8px;color:#5f7282;line-height:1.45;margin-top:auto;padding-top:2px}',
+      '.dsh-pet-map{display:flex;flex-direction:column;gap:3px}',
+      '.dsh-pet-map-body{display:flex;flex-direction:column;gap:1px;max-height:168px;overflow-y:auto;',
+      'padding:3px 4px;background:#0b1219;border:1px solid #1d2935;border-radius:4px}',
+      '.dsh-pet-map-floor{display:flex;align-items:center;gap:2px;font-size:8px;color:#4f6272;',
+      'line-height:1.3;min-height:14px}',
+      '.dsh-pet-map-floor.cur{color:#ffd166}',
+      '.dsh-pet-map-floor-n{width:14px;flex:none;text-align:right}',
+      '.dsh-pet-node{font:inherit;font-size:8px;line-height:1.2;color:#8296a8;background:#0e151d;',
+      'border:1px solid #1b2733;border-radius:3px;padding:0 3px;cursor:pointer;white-space:nowrap}',
+      '.dsh-pet-node:hover{border-color:#3a5470}',
+      '.dsh-pet-node.visited{color:#cfe3ef;border-color:#2a3a4a;background:#111a24}',
+      '.dsh-pet-node.cur{color:#0a0d12;background:#ffd166;border-color:#ffd166;font-weight:700}',
+      '.dsh-pet-node.pick{color:#0a0d12;background:#6ee7a8;border-color:#6ee7a8;font-weight:700}',
+      '.dsh-pet-node.pick:hover{background:#8ff0bd}',
+      '.dsh-pet-node.dim{opacity:.4}',
+      '.dsh-pet-node.inspected{outline:1px dashed #8fd8ff;outline-offset:1px}',
+      '.dsh-pet-map-detail{font-size:8px;color:#9fb2c2;line-height:1.5;background:#0e151d;',
+      'border:1px solid #1d2935;border-radius:4px;padding:3px 5px}',
+      '.dsh-pet-map-notice{font-size:9px;color:#ffd166;line-height:1.4}',
+      '.dsh-pet-choices{display:flex;flex-wrap:wrap;gap:3px;align-items:center;font-size:9px;color:#7f93a3}',
+      '.dsh-pet-choice{font:inherit;font-size:9px;color:#0a0d12;background:#6ee7a8;border:1px solid #6ee7a8;',
+      'border-radius:3px;padding:1px 5px;cursor:pointer}',
+      '.dsh-pet-choice:hover{background:#8ff0bd}',
+      '.dsh-pet-mode{display:flex;gap:2px;flex-wrap:wrap;align-items:center;font-size:8px;color:#7f93a3}',
+      '.dsh-pet-mode button{font:inherit;font-size:8px;color:#9fb2c2;background:#111a24;',
+      'border:1px solid #24313d;border-radius:3px;padding:1px 4px;cursor:pointer}',
+      '.dsh-pet-mode button:hover{background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-mode button.on{color:#0a0d12;background:#8fd8ff;border-color:#8fd8ff;font-weight:700}',
+      '.dsh-pet-node-panel{position:absolute;left:5px;right:5px;bottom:5px;display:flex;flex-direction:column;',
+      'gap:3px;background:rgba(10,14,20,.96);border:1px solid #2a3a4a;border-radius:5px;padding:5px;',
+      'max-height:94%;overflow-y:auto}',
+      '.dsh-pet-node-head{font-size:10px;color:#ffd166;display:flex;gap:5px;align-items:center;flex-wrap:wrap}',
+      '.dsh-pet-node-desc{font-size:9px;color:#8fa4b5;line-height:1.45}',
+      '.dsh-pet-node-option{display:flex;flex-direction:column;gap:1px;text-align:left;font:inherit;font-size:9px;',
+      'color:#dbe7f0;background:#111a24;border:1px solid #1f2a36;border-radius:4px;padding:3px 5px;cursor:pointer}',
+      '.dsh-pet-node-option:hover:not(:disabled){background:#16222e;border-color:#3a5470}',
+      '.dsh-pet-node-option:disabled{opacity:.45;cursor:default}',
+      '.dsh-pet-node-option b{color:#ffd166;font-size:10px;font-weight:700}',
+      '.dsh-pet-node-option span{color:#7f93a3;font-size:9px;line-height:1.4}',
     ].join('')
 
     // ---- 存档 ----
@@ -4821,7 +7274,10 @@ window.__ModuleLoader__.load({
         xpNext: 8,
         pending: 0,
         draftCount: 0,
+        attributes: emptyAttributes(),
+        attributePoints: 0,
         notice: '',
+        map: null,
       }
     }
 
@@ -4928,6 +7384,51 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 属性存档迁移：没有属性字段的旧档，已投入按 0 算，可分配点数按等级准确推算
+     * （1 级 0 点，每升 1 级 +1）。旧档没有花过点，所以这不是补发，而是还原。
+     */
+    function readAttributes(saved, level) {
+      const attributes = normalizeAttributes(saved.attributes)
+      const fallback = unspentPointsFor(level, attributes)
+      const stored = saved.attributePoints === undefined || saved.attributePoints === null
+        ? fallback
+        : toInt(saved.attributePoints, 0, fallback)
+      return { attributes, attributePoints: Math.max(0, stored) }
+    }
+
+    /**
+     * 旧存档迁移：把玩家放到存档记录的那一层。
+     * 地图本身由种子重新生成（旧档没有地图数据），进度从该层继续。
+     */
+    function migrateMapRun(floor, seed, lifeMax = 24) {
+      const run = createMapRun({ seed, lifeMax, autoMode: 'balanced' })
+      const targetFloor = Math.max(1, Math.min(run.depth - 1, Math.floor(Number(floor) || 1)))
+      const row = run.nodes
+        .filter((node) => node.floor === targetFloor)
+        .sort((a, b) => a.column - b.column)
+      const node = row[0] ?? run.nodes.find((entry) => entry.id === run.startId)
+      if (node === undefined) return run
+      run.currentNodeId = node.id
+      run.visited = [node.id]
+      run.nodeStates = { [node.id]: { status: 'active' } }
+      run.life = run.lifeMax
+      return run
+    }
+
+    /** 读档里的地图；版本或结构不符时按存档层数重新生成，而不是让整份存档失效。 */
+    function readMapState(saved) {
+      const restored = restoreMapRun(saved.map)
+      if (restored !== null) return { map: restored, notice: '' }
+      const floor = Math.max(1, Math.min(MAP_DEPTH - 1, toInt(saved.floor, 1, 1)))
+      const seed = hashSeed('dsh-pet-map', Number(saved.savedAt) || 0, floor)
+      const hadMap = saved.map !== undefined && saved.map !== null
+      return {
+        map: migrateMapRun(floor, seed),
+        notice: hadMap ? '地图存档无法读取，已按存档层数重新生成' : '',
+      }
+    }
+
     function loadAccount(key, slot = 0, options = {}) {
       const index = normalizeSlot(slot)
       const backup = options === null || options === undefined || options.backup !== false
@@ -4946,7 +7447,18 @@ window.__ModuleLoader__.load({
         account.xpNext = Math.max(1, toInt(saved.xpNext, 1, 8))
         account.pending = toInt(saved.pending, 0, 0)
         account.draftCount = toInt(saved.draftCount, 0, 0)
+        const growth = readAttributes(saved, account.level)
+        account.attributes = growth.attributes
+        account.attributePoints = growth.attributePoints
         applyOwnedBuild(key, index, account, saved, style, { backup })
+        const mapState = readMapState(saved)
+        account.map = mapState.map
+        if (mapState.notice !== '') {
+          account.notice = account.notice === '' ? mapState.notice : account.notice + ' ' + mapState.notice
+        }
+        const summary = mapRunSummary(account.map)
+        account.floor = summary.floor
+        account.best = Math.max(account.best, summary.floor)
         return account
       }
 
@@ -4968,7 +7480,12 @@ window.__ModuleLoader__.load({
         account.xpNext = Math.max(1, toInt(previous.xpNext, 1, 8))
         account.pending = toInt(previous.pending, 0, 0)
         account.draftCount = toInt(previous.draftCount, 0, 0)
+        const growth = readAttributes(previous, account.level)
+        account.attributes = growth.attributes
+        account.attributePoints = growth.attributePoints
         applyOwnedBuild(key, index, account, previous, style, { backup: false })
+        account.map = readMapState(previous).map
+        account.floor = mapRunSummary(account.map).floor
         const pruneNotice = account.notice
         account.notice =
           'v4 存档已迁移到 v5：构筑与进度保留，新增风格/移动策略使用默认值。' +
@@ -4981,6 +7498,8 @@ window.__ModuleLoader__.load({
         // 旧卡牌/属性/核心不硬映射为新组件：只保留与旧系统无冲突的累计战绩。
         account.stats = normalizeStats(legacy.stats)
         account.best = account.stats.bestFloor
+        account.map = migrateMapRun(1, hashSeed('dsh-pet-map', 'legacy', account.best))
+        account.floor = 1
         account.notice = '旧版存档已迁移：旧构筑与属性不再适用，只保留累计战绩。'
       }
       return account
@@ -4995,7 +7514,7 @@ window.__ModuleLoader__.load({
         store.setItem(
           saveKey(entry.key, slot),
           JSON.stringify({
-            version: 5,
+            version: 7,
             slot,
             savedAt: Date.now(),
             style: entry.style,
@@ -5009,6 +7528,9 @@ window.__ModuleLoader__.load({
             xpNext: entry.xpNext,
             pending: entry.pending,
             draftCount: entry.draftCount,
+            attributes: normalizeAttributes(entry.attributes),
+            attributePoints: Math.max(0, Math.floor(Number(entry.attributePoints) || 0)),
+            map: serializeMapRun(entry.map),
           }),
         )
         store.setItem(activeSlotKey(entry.key), String(slot))
@@ -5027,6 +7549,12 @@ window.__ModuleLoader__.load({
         entry.xpNext = battle.xpNext
         entry.pending = battle.pending
         entry.draftCount = battle.draftCount
+        entry.attributes = { ...battle.attributes }
+        entry.attributePoints = battle.attributePoints
+        if (entry.map !== null) {
+          entry.map.lifeMax = battle.combat.maxLife
+          entry.map.life = Math.max(1, Math.min(entry.map.lifeMax, Math.ceil(battle.player.cells)))
+        }
       }
       saveAccount(entry)
     }
@@ -5041,8 +7569,13 @@ window.__ModuleLoader__.load({
     function makeSaveInfo(key, slot, saved, legacyLabel) {
       const stats = normalizeStats(saved.stats)
       const style = resolveAccountStyle(saved.style, stats)
-      const floor = Math.min(MAX_FLOOR, toInt(saved.floor, 1, 1))
+      const floor = Math.min(MAP_DEPTH, toInt(saved.floor, 1, 1))
       const best = Math.max(floor, toInt(saved.best, 1, Math.max(1, stats.bestFloor)))
+      const level = toInt(saved.level, 1, 1)
+      const growth = readAttributes(saved, level)
+      const map = saved.map !== null && typeof saved.map === 'object' ? saved.map : null
+      const depth = map !== null && Number.isFinite(map.depth) ? map.depth : MAP_DEPTH
+      const gold = map !== null && Number.isFinite(map.gold) ? Math.max(0, Math.floor(map.gold)) : 0
       return {
         slot,
         empty: false,
@@ -5051,10 +7584,13 @@ window.__ModuleLoader__.load({
         style: style.id,
         styleLabel: style.label,
         floor,
+        depth,
+        gold,
         best,
-        level: toInt(saved.level, 1, 1),
+        level,
         kills: stats.kills,
         drafts: stats.drafts,
+        attributePoints: growth.attributePoints,
         skills: saved.build !== null && typeof saved.build === 'object' && Array.isArray(saved.build.skills)
           ? saved.build.skills.length
           : 0,
@@ -5188,7 +7724,14 @@ window.__ModuleLoader__.load({
       entry.xpNext = battle.xpNext
       entry.pending = battle.pending
       entry.draftCount = battle.draftCount
+      entry.attributes = { ...battle.attributes }
+      entry.attributePoints = battle.attributePoints
       entry.stats.bestFloor = Math.max(entry.stats.bestFloor, entry.best)
+      if (entry.map !== null) {
+        // 生命跨节点保留：战败时先记 1，再由 retryNode 恢复到满生命。
+        entry.map.lifeMax = battle.combat.maxLife
+        entry.map.life = Math.max(1, Math.min(entry.map.lifeMax, Math.ceil(battle.player.cells)))
+      }
       saveAccount(entry)
     }
 
@@ -5208,21 +7751,29 @@ window.__ModuleLoader__.load({
       entry.acc = 0
     }
 
-    function startFloor(entry, floor) {
+    /**
+     * 开一场战斗。plan 来自地图节点（普通 / 精英 / Boss），
+     * 不传时退回旧的 15 层表（测试、无头模拟与预览脚本仍然可用）。
+     */
+    function beginBattle(entry, { floor, plan = null, label = '' }) {
+      const run = entry.map
       entry.floor = floor
       entry.phase = 'fight'
       entry.lastResult = null
       entry.resultTimer = 0
       entry.choosing = null
+      entry.mapNotice = ''
+      entry.retryHold = false
       resetVisuals(entry)
-      const modifier = floorModifier(floor)
+      const modifier = plan === null ? floorModifier(floor) : plan.modifier
       entry.banner = {
         text: '第 ' + floor + ' 层',
-        sub: modifier !== null ? MODIFIERS[modifier].name : '',
+        sub: [label, modifier !== null ? MODIFIERS[modifier]?.name ?? '' : ''].filter((part) => part !== '').join(' · '),
         t: 1.3,
       }
       const battle = createBattle({
         floor,
+        plan,
         build: entry.build,
         seed: entry.seed++,
         level: entry.level,
@@ -5232,6 +7783,9 @@ window.__ModuleLoader__.load({
         draftCount: entry.draftCount,
         movementStrategy: entry.movement,
         styleId: entry.style,
+        attributes: entry.attributes,
+        attributePoints: entry.attributePoints,
+        life: run === null ? null : run.life,
       })
       entry.battle = battle
       const issue = battle.compileErrors[0] ?? battle.compileWarnings[0]
@@ -5239,8 +7793,239 @@ window.__ModuleLoader__.load({
       entry.build = battle.build
       entry.pending = battle.pending
       entry.draftCount = battle.draftCount
+      entry.attributes = { ...battle.attributes }
+      entry.attributePoints = battle.attributePoints
+      // 生命上限随属性成长；跨节点保留的当前生命不超过上限。
+      if (run !== null) {
+        run.lifeMax = battle.combat.maxLife
+        run.life = Math.max(1, Math.min(run.lifeMax, Math.ceil(battle.player.cells)))
+      }
       drainTokens(entry)
       saveAccount(entry)
+    }
+
+    /** 旧的按层开战入口：地图之外的脚本与测试仍走这里。 */
+    function startFloor(entry, floor) {
+      beginBattle(entry, { floor })
+    }
+
+    function isBattleNode(node) {
+      return node !== null && (node.type === 'normal' || node.type === 'elite' || node.type === 'boss')
+    }
+
+    function startNodeBattle(entry, node) {
+      beginBattle(entry, {
+        floor: node.floor,
+        plan: nodePlan(node),
+        label: NODE_TYPES[node.type]?.label ?? '',
+      })
+    }
+
+    /**
+     * 进入地图的当前节点：战斗节点开打，其余节点进入交互面板。
+     * 非战斗节点不会创建战斗世界，tick 在 'node' 阶段等待选择。
+     */
+    function startMapNode(entry) {
+      const run = entry.map
+      const node = currentNode(run)
+      if (run === null || node === null) {
+        startFloor(entry, entry.floor)
+        return
+      }
+      entry.floor = node.floor
+      entry.best = Math.max(entry.best, node.floor)
+      entry.stats.bestFloor = Math.max(entry.stats.bestFloor, node.floor)
+      entry.mapInspect = null
+      if (isBattleNode(node)) {
+        startNodeBattle(entry, node)
+        return
+      }
+      entry.battle = null
+      entry.phase = 'node'
+      entry.lastResult = null
+      entry.resultTimer = 0
+      entry.choosing = null
+      entry.mapNotice = ''
+      entry.autoHold = null
+      entry.nodeTimer = run.autoMode === 'manual' ? 0 : 1.2
+      entry.banner = {
+        text: '第 ' + node.floor + ' 层',
+        sub: NODE_TYPES[node.type]?.label ?? '',
+        t: 1.1,
+      }
+      saveAccount(entry)
+    }
+
+    /** 选择一个可选节点并进入。返回 false 表示该节点当前不可选。 */
+    function chooseMapNode(entry, nodeId) {
+      const run = entry.map
+      if (run === null) return false
+      const node = beginNode(run, nodeId)
+      if (node === null) return false
+      startMapNode(entry)
+      return true
+    }
+
+    /** 自动 / 手动推进到下一站；自动路线暂停时停在 'map' 阶段等玩家。 */
+    function advanceMap(entry) {
+      const run = entry.map
+      if (run === null) return false
+      if (run.finished === true) {
+        finishRun(entry)
+        return true
+      }
+      const pick = pickNextNode(run)
+      if (pick.paused || pick.nodeId === null) {
+        entry.battle = null
+        entry.phase = 'map'
+        entry.choosing = null
+        entry.mapNotice = autoReasonText(pick.reason)
+        return false
+      }
+      return chooseMapNode(entry, pick.nodeId)
+    }
+
+    function finishRun(entry) {
+      const depth = entry.map === null ? MAX_FLOOR : entry.map.depth
+      entry.best = Math.max(entry.best, depth)
+      entry.stats.bestFloor = Math.max(entry.stats.bestFloor, depth)
+      entry.notice = '通关：第 ' + depth + ' 层最终怪物已击破，开始新的一局'
+      resetRun(entry)
+    }
+
+    /** 连续失败后玩家手动重试当前节点。奖励早已结算过，不会重复发放。 */
+    function retryCurrentBattle(entry) {
+      const run = entry.map
+      const node = run === null ? null : currentNode(run)
+      if (node === null || !isBattleNode(node)) return false
+      if (nodeStatus(run, node.id) !== 'active') return false
+      entry.retryHold = false
+      entry.mapNotice = ''
+      startNodeBattle(entry, node)
+      return true
+    }
+
+    /** 把地图效果（三选一、属性点）写进账户字段，下一次战斗生效。返回可读摘要。 */
+    function applyMapEffects(entry, effects) {
+      const notes = []
+      for (const effect of effects ?? []) {
+        if (effect.kind === 'draft') {
+          const count = Math.max(1, Math.floor(Number(effect.count) || 1))
+          entry.pending += count
+          notes.push('获得 ' + count + ' 次三选一')
+        } else if (effect.kind === 'attributePoint') {
+          const count = Math.max(1, Math.floor(Number(effect.count) || 1))
+          entry.attributePoints += count
+          notes.push('获得 ' + count + ' 点属性点')
+        }
+      }
+      if (entry.map !== null) entry.map.life = Math.max(1, Math.min(entry.map.lifeMax, entry.map.life))
+      return notes.join(' · ')
+    }
+
+    function mapNodeAction(entry, action) {
+      const run = entry.map
+      if (run === null) return false
+      const node = currentNode(run)
+      if (node === null) return false
+      const result = action(run, node.id)
+      if (result === null || result.ok !== true) {
+        const reason = result === null ? '' : result.reason ?? ''
+        entry.mapNotice =
+          reason === 'no-gold' ? '金币不足'
+            : reason === 'cannot-pay' ? '资源不足，选不了这一项'
+              : reason === 'sold' ? '这件已经买过了'
+                : reason === '' ? '' : '无法执行：' + reason
+        return false
+      }
+      const gains = applyMapEffects(entry, result.effects)
+      entry.autoHold = null
+      const label = NODE_TYPES[node.type]?.label ?? '节点'
+      const parts = [label + '：' + (result.message ?? '已结算')]
+      if (result.text !== undefined && result.text !== '') parts.push(result.text)
+      if (gains !== '') parts.push(gains)
+      entry.notice = parts.join(' · ')
+      entry.mapNotice = result.message ?? ''
+      saveAccount(entry)
+      return true
+    }
+
+    function restChoice(entry, id) {
+      const ok = mapNodeAction(entry, (run, nodeId) => resolveRest(run, nodeId, id))
+      if (ok) advanceMap(entry)
+      return ok
+    }
+
+    function eventChoice(entry, optionId) {
+      const ok = mapNodeAction(entry, (run, nodeId) => resolveEvent(run, nodeId, optionId))
+      if (ok) advanceMap(entry)
+      return ok
+    }
+
+    function shopBuy(entry, index) {
+      const ok = mapNodeAction(entry, (run, nodeId) => buyShopItem(run, nodeId, index))
+      if (ok && entry.battle === null) entry.phase = 'node'
+      return ok
+    }
+
+    function shopLeave(entry) {
+      const run = entry.map
+      if (run === null) return false
+      if (!leaveShop(run, run.currentNodeId)) return false
+      entry.mapNotice = ''
+      advanceMap(entry)
+      return true
+    }
+
+    /** 自动路线在非战斗节点的选择：休息回血、事件只选无代价项、商店只买治疗。 */
+    function autoResolveNode(entry) {
+      const run = entry.map
+      const node = currentNode(run)
+      if (run === null || node === null) return false
+      if (entry.autoHold === node.id) return false
+      if (node.type === 'rest') {
+        const options = restOptions(run, node.id)
+        const heal = options.find((option) => option.id === 'heal' && option.available)
+        const upgrade = options.find((option) => option.id === 'upgrade' && option.available)
+        const choice = run.life < run.lifeMax * 0.7 && heal !== undefined
+          ? 'heal'
+          : upgrade !== undefined ? 'upgrade' : 'leave'
+        return restChoice(entry, choice)
+      }
+      if (node.type === 'event') {
+        const view = eventView(run, node.id)
+        const safe = view === null ? undefined : view.options.find((option) => (
+          option.available && option.costText === '无代价'
+        ))
+        if (safe === undefined) {
+          entry.autoHold = node.id
+          entry.mapNotice = '事件没有可直接选择的安全选项，已暂停自动推进'
+          return false
+        }
+        return eventChoice(entry, safe.id)
+      }
+      if (node.type === 'shop') {
+        const view = shopView(run, node.id)
+        const heal = view === null ? undefined : view.items.find((item) => item.id === 'heal' && item.available)
+        if (heal !== undefined && run.life < run.lifeMax * 0.6) {
+          shopBuy(entry, heal.index)
+        }
+        return shopLeave(entry)
+      }
+      return false
+    }
+
+    function setMapAutoMode(entry, mode) {
+      const run = entry.map
+      if (run === null || setAutoMode(run, mode) !== true) return false
+      entry.autoHold = null
+      entry.phase = run.autoMode === 'manual' ? entry.phase : entry.phase
+      entry.mapNotice = autoReasonText(run.autoMode)
+      if (entry.phase === 'map' || entry.phase === 'node') {
+        entry.nodeTimer = entry.phase === 'node' ? 1.2 : 0
+      }
+      saveAccount(entry)
+      return true
     }
 
     function createEntry(key, seed, options = {}) {
@@ -5265,7 +8050,20 @@ window.__ModuleLoader__.load({
         xpNext: account.xpNext,
         pending: account.pending,
         draftCount: account.draftCount,
+        attributes: { ...account.attributes },
+        attributePoints: account.attributePoints,
         notice: account.notice,
+        map: account.map,
+        // 地图栏默认折叠：只显示当前节点与下一站，展开后可滚动查看完整地图。
+        mapOpen: false,
+        mapShowAll: false,
+        mapInspect: null,
+        mapNotice: '',
+        autoHold: null,
+        // 连续失败 3 次后暂停自动重试，等玩家调整构筑后手动重试。
+        retryHold: false,
+        nodeTimer: 0,
+        mapTimer: 0,
         tokenQueue: 0,
         tokenSeen: new Map(),
         surgeMeter: 0,
@@ -5274,6 +8072,10 @@ window.__ModuleLoader__.load({
         lastResult: null,
         resultTimer: 0,
         choosing: null,
+        // 属性栏默认折叠，只保留一行标题；点击展开后再分配点数。
+        attributesOpen: false,
+        // 构筑栏同样默认折叠，展开后才显示技能详情与备用栏。
+        buildOpen: false,
         fx: [],
         swingFx: [],
         particles: [],
@@ -5292,6 +8094,7 @@ window.__ModuleLoader__.load({
         moving: false,
         acc: 0,
         seed: seed === undefined ? (Date.now() % 100000) + 1 : seed,
+        mapSeed: seed === undefined ? (Date.now() % 100000) + 1 : seed,
         running: false,
         online: true,
         consumed: 0,
@@ -5299,7 +8102,12 @@ window.__ModuleLoader__.load({
         last: 0,
         subs: 0,
       }
-      if (autostart) startFloor(entry, entry.floor)
+      // 没有存档或存档没有地图时，用当前 seed 生成一张新地图再开局。
+      if (entry.map === null && autostart) {
+        entry.map = createMapRun({ seed: entry.mapSeed, autoMode: 'balanced' })
+        entry.floor = 1
+      }
+      if (autostart) startMapNode(entry)
       return entry
     }
 
@@ -5312,9 +8120,25 @@ window.__ModuleLoader__.load({
       entry.xpNext = 8
       entry.pending = 0
       entry.draftCount = 0
+      // 通关重开 / 切换风格会重置本轮成长；阵亡重试不走这里，属性点保留。
+      entry.attributes = emptyAttributes()
+      entry.attributePoints = 0
       entry.choosing = null
       entry.battle = null
-      startFloor(entry, 1)
+      // 新游戏重新生成地图：种子递增，路线与遭遇都换一套。
+      const autoMode = entry.map === null ? 'balanced' : entry.map.autoMode
+      entry.mapSeed = (entry.mapSeed ?? entry.seed ?? 1) + 1
+      entry.map = createMapRun({ seed: entry.mapSeed, autoMode })
+      entry.floor = 1
+      entry.mapOpen = false
+      entry.mapShowAll = false
+      entry.mapInspect = null
+      entry.mapNotice = ''
+      entry.autoHold = null
+      entry.retryHold = false
+      entry.nodeTimer = 0
+      entry.mapTimer = 0
+      startMapNode(entry)
     }
 
     function applyAccount(entry, account) {
@@ -5329,7 +8153,16 @@ window.__ModuleLoader__.load({
       entry.xpNext = account.xpNext
       entry.pending = account.pending
       entry.draftCount = account.draftCount
+      entry.attributes = { ...account.attributes }
+      entry.attributePoints = account.attributePoints
       entry.notice = account.notice
+      entry.map = account.map
+      entry.autoHold = null
+      entry.retryHold = false
+      entry.mapInspect = null
+      entry.mapNotice = ''
+      entry.nodeTimer = 0
+      entry.mapTimer = 0
     }
 
     /** 新游戏继承当前与目标存档的累计战绩，只重置本轮进度。 */
@@ -5376,7 +8209,7 @@ window.__ModuleLoader__.load({
       entry.surgeMeter = 0
       applyAccount(entry, account)
       const notice = account.notice
-      startFloor(entry, entry.floor)
+      startMapNode(entry)
       if (notice !== '') entry.notice = notice
       return true
     }
@@ -5385,6 +8218,11 @@ window.__ModuleLoader__.load({
       if (entry.battle !== null) {
         entry.menu = null
         if (entry.phase === 'menu') entry.phase = 'fight'
+        return true
+      }
+      if (entry.map !== null && entry.phase !== 'menu') {
+        entry.menu = null
+        startMapNode(entry)
         return true
       }
       const slot = preferredSlot(entry.key)
@@ -5465,10 +8303,37 @@ window.__ModuleLoader__.load({
       return true
     }
 
+    /**
+     * 结算上一场战斗并决定下一站。
+     * 有地图时：胜利 → 完成节点、发一次奖 → 自动 / 手动选下一站；
+     * 失败 → 保留当前节点与构筑，补一次三选一后重试，不重复发奖。
+     */
     function advance(entry) {
       const result = entry.lastResult
       settleBattle(entry)
+      const run = entry.map
+      const node = run === null ? null : currentNode(run)
       if (result !== null && result.kind === 'cleared') {
+        if (run !== null && node !== null) {
+          const battle = entry.battle
+          const life = battle === null ? run.life : battle.player.cells
+          const done = completeNode(run, node.id, { life })
+          if (done !== null && done.alreadyDone !== true) {
+            const gains = applyMapEffects(entry, done.effects)
+            entry.gold = run.gold
+            entry.notice = (NODE_TYPES[node.type]?.label ?? '节点') + '完成 · +' + done.gold + ' 金币' +
+              (gains === '' ? '' : ' · ' + gains)
+            entry.stats.bestFloor = Math.max(entry.stats.bestFloor, node.floor)
+            entry.best = Math.max(entry.best, node.floor)
+          }
+          entry.battle = null
+          if (run.finished === true) {
+            finishRun(entry)
+            return
+          }
+          advanceMap(entry)
+          return
+        }
         const next = entry.floor + 1
         entry.battle = null
         if (next > MAX_FLOOR) {
@@ -5476,6 +8341,22 @@ window.__ModuleLoader__.load({
           return
         }
         startFloor(entry, next)
+        return
+      }
+      if (run !== null && node !== null) {
+        entry.battle = null
+        entry.pending = Math.max(1, entry.pending + 1)
+        const failures = retryNode(run, node.id)
+        if (failures >= 3) {
+          // 连续失败时暂停自动重试，避免后台无限重复；玩家可以调整构筑后手动重试。
+          entry.retryHold = true
+          entry.phase = 'map'
+          entry.choosing = null
+          entry.mapNotice = '连续失败 ' + failures + ' 次：已暂停自动重试，调整构筑后点「重试当前节点」'
+          saveAccount(entry)
+          return
+        }
+        startNodeBattle(entry, node)
         return
       }
       entry.battle = null
@@ -5516,6 +8397,20 @@ window.__ModuleLoader__.load({
       return true
     }
 
+    /** 把 1 点基础属性投进指定属性；与技能三选一互不竞争。 */
+    function spendAttributePoint(entry, id) {
+      const battle = entry.battle
+      if (battle === null) return false
+      if (!allocateAttribute(battle, id)) {
+        entry.notice = '没有可分配的属性点'
+        return false
+      }
+      entry.attributes = { ...battle.attributes }
+      entry.attributePoints = battle.attributePoints
+      saveAccount(entry)
+      return true
+    }
+
     const MAX_PARTICLES = 220
 
     function addParticles(entry, x, y, count, color, speed, life, gravity = 0) {
@@ -5549,6 +8444,12 @@ window.__ModuleLoader__.load({
         case 'hit':
           addParticles(entry, ev.x, ev.y, ev.cells >= 3 ? 5 : 3, color ?? '#ffe9b0', 44, 0.28, 30)
           if (ev.cells >= 3) entry.shake = Math.max(entry.shake, 1.4)
+          if (ev.crit === true) {
+            // 暴击：额外亮色碎片与轻微顿帧感，让"这一次更疼"读得出来。
+            addParticles(entry, ev.x, ev.y, 4, '#ffffff', 58, 0.26, 20)
+            ring(entry, ev.x, ev.y, 3, 0.22, '#ffe066')
+            entry.shake = Math.max(entry.shake, 2)
+          }
           break
         case 'status':
           addParticles(entry, ev.x, ev.y, 1, contentById(ev.status)?.color ?? '#ff9f45', 16, 0.4, -18)
@@ -5699,6 +8600,29 @@ window.__ModuleLoader__.load({
       if (entry.phase === 'result') {
         entry.resultTimer -= dt
         if (entry.resultTimer <= 0) advance(entry)
+        return
+      }
+
+      // 地图阶段：自动路线自己往前走，手动路线等玩家点节点。
+      if (entry.phase === 'map') {
+        if (entry.retryHold === true) return
+        entry.mapTimer -= dt
+        if (entry.mapTimer > 0) return
+        entry.mapTimer = 0.5
+        advanceMap(entry)
+        return
+      }
+
+      // 非战斗节点：自动路线 1.2 秒后替玩家做安全选择；无法判断时暂停。
+      if (entry.phase === 'node') {
+        const run = entry.map
+        const node = run === null ? null : currentNode(run)
+        if (run === null || node === null) return
+        if (run.autoMode === 'manual') return
+        if (entry.autoHold === node.id) return
+        entry.nodeTimer -= dt
+        if (entry.nodeTimer > 0) return
+        autoResolveNode(entry)
         return
       }
 
@@ -6148,7 +9072,11 @@ window.__ModuleLoader__.load({
         })
         .join(' / ')
       const overflow = battle.stats.overflow ?? 0
-      return overflow > 0 ? shares + ' · 溢出 ' + Math.round(overflow) : shares
+      const crits = battle.stats.crits ?? 0
+      const extras = []
+      if (crits > 0) extras.push('暴击 ' + crits)
+      if (overflow > 0) extras.push('溢出 ' + Math.round(overflow))
+      return extras.length === 0 ? shares : shares + ' · ' + extras.join(' · ')
     }
 
     function reactionReport(entry) {
@@ -6173,8 +9101,26 @@ window.__ModuleLoader__.load({
     function diagnoseRun(entry) {
       const result = entry.lastResult
       if (result === null) return ''
-      if (result.kind === 'cleared') return '进入第 ' + Math.min(MAX_FLOOR, entry.floor + 1) + ' 层'
-      if (result.kind === 'dead') return '生命耗尽 · 重试本层，并补一次升级选择'
+      const run = entry.map
+      if (result.kind === 'cleared') {
+        if (run === null) return '进入第 ' + Math.min(MAX_FLOOR, entry.floor + 1) + ' 层'
+        const next = availableNodes(run)
+        if (next.length === 0) return '正在选择下一站'
+        return '下一站：' + next.map((node) => NODE_TYPES[node.type].label).join(' / ')
+      }
+      if (result.kind === 'dead') {
+        return run === null
+          ? '生命耗尽 · 重试本层，并补一次升级选择'
+          : '生命耗尽 · 重试当前节点，并补一次升级选择'
+      }
+      if (run !== null) {
+        const node = currentNode(run)
+        const modifier = node === null ? null : nodePlan(node)?.modifier ?? null
+        if (modifier !== null && MODIFIERS[modifier] !== undefined) {
+          return TIME_LIMIT + ' 秒内没清完：' + MODIFIERS[modifier].desc
+        }
+        return TIME_LIMIT + ' 秒内没清完：输出不够。'
+      }
       const modifier = floorModifier(result.floor)
       if (modifier !== null) return TIME_LIMIT + ' 秒内没清完：' + MODIFIERS[modifier].desc
       return TIME_LIMIT + ' 秒内没清完：输出不够。'
@@ -6201,59 +9147,38 @@ window.__ModuleLoader__.load({
       }, KIND_LABELS[kind] + ' · ' + label)
     }
 
-    const MOVEMENT_LABELS = { approach: '接近', keepDistance: '保持距离', auto: '自动' }
-
-    function stylePanel(entry, bump) {
-      const debug = debugEnabled()
-      const styleButtons = listStyles().map((style) => {
-        const naturallyUnlocked = isStyleUnlocked(style, entry.stats)
-        const unlocked = debug || naturallyUnlocked
-        return h('button', {
-          key: style.id,
-          type: 'button',
-          className: 'dsh-pet-style' + (entry.style === style.id ? ' on' : ''),
-          disabled: !unlocked,
-          title: unlocked
-            ? style.desc + (debug && !naturallyUnlocked ? '（开发者模式已解锁）' : '') + '（切换会重开本轮）'
-            : '未解锁：最高层达到 ' + style.unlockedBy.bestFloor,
-          onClick: () => {
-            if (setStyle(entry, style.id)) bump()
-          },
-        }, style.label)
-      })
-      const movementButtons = MOVEMENT_STRATEGIES.map((strategy) =>
-        h('button', {
-          key: strategy,
-          type: 'button',
-          className: 'dsh-pet-style' + (entry.movement === strategy ? ' on' : ''),
-          title: strategy === 'approach'
-            ? '偏向进入近战技能范围'
-            : strategy === 'keepDistance'
-              ? '优先利用远程技能射程'
-              : '按已装备技能的距离折中选择',
-          onClick: () => {
-            if (setMovement(entry, strategy)) bump()
-          },
-        }, MOVEMENT_LABELS[strategy] ?? strategy),
-      )
-      return h('div', { className: 'dsh-pet-styles' },
-        h('div', { className: 'dsh-pet-style-row' },
-          h('span', { className: 'dsh-pet-muted' }, '风格'),
-          ...styleButtons,
-          debug ? h('span', { className: 'dsh-pet-dev', title: '开发者调试已开启' }, 'DEV') : null,
-        ),
-        h('div', { className: 'dsh-pet-style-row' },
-          h('span', { className: 'dsh-pet-muted' }, '移动'),
-          ...movementButtons,
-        ),
-      )
+    /**
+     * 构筑栏：默认折叠成一行（技能数 / 备用数），点标题展开技能详情与备用栏。
+     * 风格与移动策略不再占用战场面板，见下方 statusPanel 的说明。
+     */
+    function toggleBuild(entry) {
+      entry.buildOpen = entry.buildOpen !== true
+      return entry.buildOpen
     }
 
     function buildPanel(entry, bump) {
       const battle = entry.battle
       const build = battle === null ? entry.build : battle.build
       const plans = battle === null ? [] : battle.plans
+      const open = entry.buildOpen === true
       const planById = new Map(plans.map((plan) => [plan.id, plan]))
+      const head = h('button', {
+        type: 'button',
+        className: 'dsh-pet-fold-head' + (open ? ' open' : ''),
+        'aria-expanded': open,
+        title: open ? '收起构筑' : '展开构筑：查看技能槽位与备用栏',
+        onClick: () => {
+          toggleBuild(entry)
+          bump()
+        },
+      },
+        h('span', { className: 'dsh-pet-fold-caret' }, open ? '▾' : '▸'),
+        h('span', { className: 'dsh-pet-fold-title' }, '构筑'),
+        h('span', { className: 'dsh-pet-fold-summary' },
+          build.skills.length + '/' + MAX_SKILLS + ' 技能 · 备用 ' + build.reserve.length),
+      )
+      if (!open) return h('div', { className: 'dsh-pet-fold dsh-pet-build' }, head)
+
       const skills = build.skills.map((skill, index) => {
         const plan = planById.get(skill.id)
         return h('div', { className: 'dsh-pet-skill', key: skill.id },
@@ -6291,15 +9216,88 @@ window.__ModuleLoader__.load({
               },
             }, def === undefined ? id : def.label)
           })
-      return h('div', { className: 'dsh-pet-build' },
-        h('div', { className: 'dsh-pet-build-head' },
-          h('span', null, '构筑'),
-          h('span', null, build.skills.length + '/' + MAX_SKILLS + ' 技能 · 备用 ' + build.reserve.length),
+      return h('div', { className: 'dsh-pet-fold dsh-pet-build' },
+        head,
+        h('div', { className: 'dsh-pet-fold-body' },
+          ...skills,
+          h('div', { className: 'dsh-pet-reserve' },
+            h('span', { className: 'dsh-pet-muted' }, '备用：'),
+            ...reserve,
+          ),
         ),
-        ...skills,
-        h('div', { className: 'dsh-pet-reserve' },
-          h('span', { className: 'dsh-pet-muted' }, '备用：'),
-          ...reserve,
+      )
+    }
+
+    /** 折叠状态存在 entry 上：关闭/展开不会因为 200ms 重绘或 bump 丢失。 */
+    function toggleAttributes(entry) {
+      entry.attributesOpen = entry.attributesOpen !== true
+      return entry.attributesOpen
+    }
+
+    /** 折叠时的摘要：只留最能说明当前强度的两项，避免又占满一行。 */
+    function collapsedAttributeSummary(combat) {
+      return '护甲 ' + formatCombatValue('armor', combat.armor) +
+        ' · 暴击 ' + formatCombatValue('critChance', combat.critChance)
+    }
+
+    /**
+     * 属性面板：默认折叠，只占一行；点标题展开四项基础属性、各自点数、
+     * 投入 1 点后的实际变化与战斗属性摘要。
+     */
+    function attributePanel(entry, bump) {
+      const battle = entry.battle
+      const attributes = normalizeAttributes(battle === null ? entry.attributes : battle.attributes)
+      const points = battle === null ? entry.attributePoints : battle.attributePoints
+      const combat = battle === null ? createCombatStats(attributes) : battle.combat
+      const open = entry.attributesOpen === true
+      const head = h('button', {
+        type: 'button',
+        className: 'dsh-pet-fold-head' + (open ? ' open' : ''),
+        'aria-expanded': open,
+        title: open ? '收起属性' : '展开属性：查看四项属性并分配点数',
+        onClick: () => {
+          toggleAttributes(entry)
+          bump()
+        },
+      },
+        h('span', { className: 'dsh-pet-fold-caret' }, open ? '▾' : '▸'),
+        h('span', { className: 'dsh-pet-fold-title' }, '属性'),
+        points > 0
+          ? h('span', { className: 'dsh-pet-points ready dsh-pet-attrs-points' }, '可用 ' + points + ' 点')
+          : h('span', { className: 'dsh-pet-attrs-points dsh-pet-muted' }, ''),
+        h('span', { className: 'dsh-pet-fold-summary' }, collapsedAttributeSummary(combat)),
+      )
+
+      if (!open) return h('div', { className: 'dsh-pet-fold dsh-pet-attrs' }, head)
+
+      const rows = ATTRIBUTE_IDS.map((id) => {
+        const preview = previewAttribute(attributes, id)
+        const canSpend = battle !== null && points > 0
+        return h('div', { className: 'dsh-pet-attr-row', key: id },
+          h('span', { className: 'dsh-pet-attr-name' }, ATTRIBUTES[id].label),
+          h('span', { className: 'dsh-pet-attr-points' }, String(attributes[id])),
+          h('button', {
+            type: 'button',
+            className: 'dsh-pet-attr-btn',
+            disabled: !canSpend,
+            title: canSpend
+              ? '投入 1 点 · ' + preview.text
+              : points > 0 ? '战斗开始后可分配' : '升级后再来',
+            onClick: () => {
+              if (spendAttributePoint(entry, id)) bump()
+            },
+          }, '+1'),
+          h('span', { className: 'dsh-pet-attr-effect' }, preview.text),
+        )
+      })
+      return h('div', { className: 'dsh-pet-fold dsh-pet-attrs' },
+        head,
+        h('div', { className: 'dsh-pet-fold-body' },
+          points > 0
+            ? h('div', { className: 'dsh-pet-attrs-hint' }, '可用 ' + points + ' 点 · 点击 +1 投入，每级 +1')
+            : h('div', { className: 'dsh-pet-attrs-hint' }, '没有可用属性点 · 升级后每级 +1'),
+          ...rows,
+          h('div', { className: 'dsh-pet-combat' }, describeCombatStats(combat)),
         ),
       )
     }
@@ -6370,6 +9368,279 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ---- 地图界面 ----
+
+    /** 折叠时的摘要：当前节点与下一站类型，不需要展开就能看懂。 */
+    function mapSummaryLine(entry) {
+      const run = entry.map
+      if (run === null) return '没有地图'
+      const summary = mapRunSummary(run)
+      if (summary.finished === true) return '本局已结束'
+      const mode = AUTO_MODES[summary.autoMode]?.label ?? ''
+      const next = availableNodes(run)
+      if (next.length === 0) {
+        return (mode === '' ? '' : mode + ' · ') + '当前：' + summary.currentLabel +
+          ' · ' + summary.currentSummary
+      }
+      const labels = next.map((node) => NODE_TYPES[node.type].icon + NODE_TYPES[node.type].label)
+      return (mode === '' ? '' : mode + ' · ') + '下一站：' + labels.join(' / ')
+    }
+
+    function autoModeRow(entry, bump) {
+      const run = entry.map
+      return h('div', { className: 'dsh-pet-mode' },
+        h('span', null, '自动'),
+        ...AUTO_MODE_IDS.map((id) => h('button', {
+          key: id,
+          type: 'button',
+          className: run !== null && run.autoMode === id ? 'on' : '',
+          title: AUTO_MODES[id].desc,
+          onClick: () => {
+            if (setMapAutoMode(entry, id)) bump()
+          },
+        }, AUTO_MODES[id].label)),
+      )
+    }
+
+    /** 节点小方块：图标 + 类型文字，完全靠颜色之外的信息区分。 */
+    function nodeChip(entry, node, bump, { selectable = false, compact = false } = {}) {
+      const run = entry.map
+      const def = NODE_TYPES[node.type]
+      const status = run === null ? 'unvisited' : nodeStatus(run, node.id)
+      const current = run !== null && run.currentNodeId === node.id
+      const classes = ['dsh-pet-node']
+      if (current) classes.push('cur')
+      else if (status === 'done' || status === 'active') classes.push('visited')
+      else if (selectable) classes.push('pick')
+      else classes.push('dim')
+      if (entry.mapInspect === node.id) classes.push('inspected')
+      const label = compact ? def.icon : def.icon + ' ' + def.label
+      return h('button', {
+        key: node.id,
+        type: 'button',
+        className: classes.join(' '),
+        title: def.label + ' · 第 ' + node.floor + ' 层 · ' + nodeSummary(node),
+        onClick: () => {
+          if (selectable) {
+            if (chooseMapNode(entry, node.id)) bump()
+            return
+          }
+          entry.mapInspect = entry.mapInspect === node.id ? null : node.id
+          bump()
+        },
+      }, label)
+    }
+
+    /**
+     * 地图栏：默认折叠成一行（当前进度 + 下一站），展开后是按层排列的节点。
+     * 已走路线保留高亮，未选择路线淡化，可选节点用绿色实心按钮描出来。
+     */
+    function mapPanel(entry, bump) {
+      const run = entry.map
+      if (run === null) return null
+      const summary = mapRunSummary(run)
+      const open = entry.mapOpen === true
+      const selectable = new Set(availableNodeIds(run))
+      const head = h('button', {
+        type: 'button',
+        className: 'dsh-pet-fold-head' + (open ? ' open' : ''),
+        'aria-expanded': open,
+        title: open ? '收起地图' : '展开地图：查看完整路线并选择下一站',
+        onClick: () => {
+          entry.mapOpen = open !== true
+          if (open === true) entry.mapShowAll = false
+          bump()
+        },
+      },
+        h('span', { className: 'dsh-pet-fold-caret' }, open ? '▾' : '▸'),
+        h('span', { className: 'dsh-pet-fold-title' }, '地图'),
+        h('span', { className: 'dsh-pet-muted' }, summary.floor + '/' + summary.depth),
+        h('span', { className: 'dsh-pet-fold-summary' }, summary.currentLabel),
+      )
+
+      if (!open) {
+        return h('div', { className: 'dsh-pet-fold dsh-pet-map' },
+          head,
+          h('div', { className: 'dsh-pet-map-notice' }, mapSummaryLine(entry)),
+        )
+      }
+
+      const byFloor = new Map()
+      for (const node of run.nodes) {
+        if (!byFloor.has(node.floor)) byFloor.set(node.floor, [])
+        byFloor.get(node.floor).push(node)
+      }
+      const rows = []
+      const from = entry.mapShowAll === true ? 1 : Math.max(1, summary.floor - 3)
+      const to = entry.mapShowAll === true ? run.depth : Math.min(run.depth, summary.floor + 4)
+      for (let floor = from; floor <= to; floor += 1) {
+        const row = (byFloor.get(floor) ?? []).slice().sort((a, b) => a.column - b.column)
+        rows.push(h('div', {
+          key: 'floor-' + floor,
+          className: 'dsh-pet-map-floor' + (floor === summary.floor ? ' cur' : ''),
+        },
+          h('span', { className: 'dsh-pet-map-floor-n' }, String(floor)),
+          ...row.map((node) => nodeChip(entry, node, bump, { selectable: selectable.has(node.id) })),
+        ))
+      }
+      const inspected = entry.mapInspect === null
+        ? null
+        : run.nodes.find((node) => node.id === entry.mapInspect) ?? null
+
+      return h('div', { className: 'dsh-pet-fold dsh-pet-map' },
+        head,
+        autoModeRow(entry, bump),
+        h('div', { className: 'dsh-pet-map-body' }, ...rows),
+        h('div', { className: 'dsh-pet-map-detail' },
+          '种子 ' + summary.seed + ' · 金币 ' + summary.gold +
+          ' · 生命 ' + summary.life + '/' + summary.lifeMax +
+          ' · ' + (summary.generation.fallback === true ? '保底模板' : '第 ' + summary.generation.attempts + ' 次通过'),
+        ),
+        inspected === null ? null : h('div', { className: 'dsh-pet-map-detail' },
+          h('div', null, NODE_TYPES[inspected.type].icon + ' ' + NODE_TYPES[inspected.type].label +
+            ' · 第 ' + inspected.floor + ' 层'),
+          h('div', null, NODE_TYPES[inspected.type].desc),
+          h('div', null, nodeSummary(inspected)),
+        ),
+        h('div', { className: 'dsh-pet-mode' },
+          h('button', {
+            type: 'button',
+            onClick: () => {
+              entry.mapShowAll = entry.mapShowAll !== true
+              bump()
+            },
+          }, entry.mapShowAll === true ? '只看附近' : '查看完整地图'),
+        ),
+        entry.mapNotice !== '' ? h('div', { className: 'dsh-pet-map-notice' }, entry.mapNotice) : null,
+      )
+    }
+
+    /** 分叉时的下一站按钮；自动模式暂停时也靠它接管。 */
+    function mapChoicesRow(entry, bump) {
+      const run = entry.map
+      if (run === null || entry.phase !== 'map') return null
+      // 连续失败后的暂停：给一个显式重试入口，而不是默默反复开打。
+      if (entry.retryHold === true) {
+        return h('div', { className: 'dsh-pet-choices' },
+          h('span', null, entry.mapNotice !== '' ? entry.mapNotice : '已暂停自动重试'),
+          h('span', { className: 'dsh-pet-spacer' }),
+          h('button', {
+            type: 'button',
+            className: 'dsh-pet-choice',
+            title: '带着当前构筑重新挑战当前节点；不会重复发放奖励',
+            onClick: () => {
+              if (retryCurrentBattle(entry)) bump()
+            },
+          }, '重试当前节点'),
+        )
+      }
+      const nodes = availableNodes(run)
+      return h('div', { className: 'dsh-pet-choices' },
+        h('span', null, nodes.length === 0
+          ? '没有可选路线'
+          : '下一站（第 ' + nodes[0].floor + ' 层）'),
+        ...nodes.map((node) => h('button', {
+          key: node.id,
+          type: 'button',
+          className: 'dsh-pet-choice',
+          title: NODE_TYPES[node.type].desc + ' · ' + nodeSummary(node),
+          onClick: () => {
+            if (chooseMapNode(entry, node.id)) bump()
+          },
+        }, NODE_TYPES[node.type].icon + ' ' + NODE_TYPES[node.type].label)),
+        h('span', { className: 'dsh-pet-spacer' }),
+        entry.mapNotice !== '' ? h('span', { className: 'dsh-pet-muted' }, entry.mapNotice) : null,
+      )
+    }
+
+    /** 休息 / 事件 / 商店：选项直接写出代价与结果，付不起的置灰。 */
+    function nodePanel(entry, bump) {
+      const run = entry.map
+      if (run === null || entry.phase !== 'node') return null
+      const node = currentNode(run)
+      if (node === null) return null
+      const def = NODE_TYPES[node.type]
+      const head = h('div', { className: 'dsh-pet-node-head' },
+        h('span', null, def.icon + ' ' + def.label),
+        h('span', { className: 'dsh-pet-muted' }, '第 ' + node.floor + ' 层'),
+        h('span', { className: 'dsh-pet-spacer' }),
+        h('span', { className: 'dsh-pet-muted' },
+          '生命 ' + Math.round(run.life) + '/' + run.lifeMax + ' · 金币 ' + run.gold),
+      )
+
+      if (node.type === 'rest') {
+        const options = restOptions(run, node.id)
+        return h('div', { className: 'dsh-pet-node-panel' },
+          head,
+          ...options.map((option) => h('button', {
+            key: option.id,
+            type: 'button',
+            className: 'dsh-pet-node-option',
+            disabled: option.available !== true,
+            onClick: () => {
+              if (restChoice(entry, option.id)) bump()
+            },
+          },
+            h('b', null, option.label),
+            h('span', null, option.available === true ? option.desc : (option.reason || option.desc)),
+          )),
+        )
+      }
+
+      if (node.type === 'event') {
+        const view = eventView(run, node.id)
+        return h('div', { className: 'dsh-pet-node-panel' },
+          head,
+          h('div', { className: 'dsh-pet-node-desc' }, view === null ? '' : view.desc),
+          ...(view === null ? [] : view.options.map((option) => h('button', {
+            key: option.id,
+            type: 'button',
+            className: 'dsh-pet-node-option',
+            disabled: option.available !== true,
+            onClick: () => {
+              if (eventChoice(entry, option.id)) bump()
+            },
+          },
+            h('b', null, option.label),
+            h('span', null, (option.available === true ? '代价：' : '无法支付：') +
+              option.costText + ' · 结果：' + option.resultText),
+          ))),
+        )
+      }
+
+      if (node.type === 'shop') {
+        const view = shopView(run, node.id)
+        const items = view === null ? [] : view.items
+        return h('div', { className: 'dsh-pet-node-panel' },
+          head,
+          ...items.map((item) => h('button', {
+            key: 'item-' + item.index,
+            type: 'button',
+            className: 'dsh-pet-node-option',
+            disabled: item.available !== true,
+            onClick: () => {
+              if (shopBuy(entry, item.index)) bump()
+            },
+          },
+            h('b', null, item.label + ' · ' + item.price + ' 金币'),
+            h('span', null, item.sold === true ? '已售出' : item.desc),
+          )),
+          h('button', {
+            type: 'button',
+            className: 'dsh-pet-node-option',
+            onClick: () => {
+              if (shopLeave(entry)) bump()
+            },
+          },
+            h('b', null, '离开商店'),
+            h('span', null, '可以只看不买'),
+          ),
+        )
+      }
+
+      return h('div', { className: 'dsh-pet-node-panel' }, head)
+    }
+
     // ---- 存档大厅 ----
 
     function formatSaveTime(ms) {
@@ -6381,13 +9652,16 @@ window.__ModuleLoader__.load({
 
     function saveSummary(info) {
       if (info.empty) return '空存档'
+      const depth = Number.isFinite(info.depth) ? info.depth : MAP_DEPTH
       if (info.legacy) return '旧版 ' + info.legacyLabel + ' 存档 · 第 ' + info.floor + ' 层'
-      return info.styleLabel + ' · 第 ' + info.floor + ' 层 · Lv.' + info.level + ' · 最佳 ' + info.best
+      return info.styleLabel + ' · 第 ' + info.floor + '/' + depth + ' 层 · Lv.' + info.level + ' · 最佳 ' + info.best
     }
 
     function saveDetail(info) {
       if (info.empty) return '还没有进度，可在这里新建'
-      return '击杀 ' + info.kills + ' · 抽卡 ' + info.drafts + ' · 技能 ' + info.skills
+      const points = info.attributePoints > 0 ? ' · 属性点 ' + info.attributePoints : ''
+      const gold = Number.isFinite(info.gold) && info.gold > 0 ? ' · 金币 ' + info.gold : ''
+      return '击杀 ' + info.kills + ' · 抽卡 ' + info.drafts + ' · 技能 ' + info.skills + points + gold
     }
 
     function menuButton(label, onClick, options = {}) {
@@ -6610,6 +9884,35 @@ window.__ModuleLoader__.load({
       return menu.screen === 'new' ? menuNewGame(entry, bump) : menuHome(entry, bump)
     }
 
+    /**
+     * 战场下方的面板：生命条、折叠属性栏、折叠构筑栏与底部数字。
+     * 风格栏与移动栏不在这里显示：风格在「新游戏」界面选择，移动策略跟随
+     * 风格默认值，不再占用战场高度。
+     */
+    function statusPanel(entry, bump) {
+      const battle = entry.battle
+      const run = entry.map
+      // 非战斗节点没有战斗世界，生命条改读地图上跨节点保留的生命。
+      const cells = battle === null ? (run === null ? 0 : run.life) : battle.player.cells
+      const maxCells = battle === null ? (run === null ? 1 : run.lifeMax) : battle.player.maxCells
+      const pct = Math.max(0, Math.min(100, (cells / maxCells) * 100))
+      const hpColor = pct > 50 ? '#6ee7a8' : pct > 25 ? '#ffd166' : '#e35d5d'
+      return h('div', { className: 'dsh-pet-body-rest' },
+        h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%', background: hpColor } })),
+        attributePanel(entry, bump),
+        buildPanel(entry, bump),
+        h('div', { className: 'dsh-pet-bottom' },
+          h('span', null, '生命 ' + Math.max(0, Math.ceil(cells)) + '/' + maxCells),
+          h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
+          h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
+          h('span', null, '压力 +' + (battle === null ? 0 : battle.extra)),
+          battle !== null && battle.surge ? h('span', { className: 'dsh-pet-hot' }, '过载') : null,
+          h('span', { className: 'dsh-pet-spacer' }),
+          h('span', null, formatTokens(entry.consumed) + ' token'),
+        ),
+      )
+    }
+
     function PetBody(props) {
       const sessionId = props !== null && props !== undefined && props.sessionId !== undefined
         ? String(props.sessionId)
@@ -6723,12 +10026,14 @@ window.__ModuleLoader__.load({
       }
 
       const battle = entry.battle
-      const cells = battle === null ? 0 : battle.player.cells
-      const maxCells = battle === null ? 1 : battle.player.maxCells
-      const pct = Math.max(0, Math.min(100, (cells / maxCells) * 100))
-      const hpColor = pct > 50 ? '#6ee7a8' : pct > 25 ? '#ffd166' : '#e35d5d'
       const result = entry.phase === 'result' ? entry.lastResult : null
-      const modifier = battle !== null ? battle.modifier : floorModifier(entry.floor)
+      const run = entry.map
+      const mapNodeNow = run === null ? null : currentNode(run)
+      const modifier = battle !== null
+        ? battle.modifier
+        : mapNodeNow === null ? floorModifier(entry.floor) : nodePlan(mapNodeNow)?.modifier ?? null
+      const depth = run === null ? MAX_FLOOR : run.depth
+      const gold = run === null ? 0 : run.gold
       const reactions = reactionReport(entry)
       const notice = entry.notice
       const offerIds = battle !== null && Array.isArray(battle.offer) ? battle.offer : []
@@ -6738,10 +10043,13 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'dsh-pet' },
         h('style', { key: 'style' }, CSS),
         h('div', { className: 'dsh-pet-top' },
-          h('span', { className: 'dsh-pet-floor' }, '第 ' + entry.floor + ' 层'),
+          h('span', { className: 'dsh-pet-floor' }, '第 ' + entry.floor + '/' + depth + ' 层'),
           h('span', { className: 'dsh-pet-muted' }, 'Lv.' + (battle === null ? entry.level : battle.level)),
           h('span', { className: 'dsh-pet-muted' }, '最佳 ' + entry.best),
-          modifier !== null ? h('span', { className: 'dsh-pet-hot' }, MODIFIERS[modifier].name) : null,
+          h('span', { className: 'dsh-pet-muted' }, '金币 ' + gold),
+          modifier !== null && MODIFIERS[modifier] !== undefined
+            ? h('span', { className: 'dsh-pet-hot' }, MODIFIERS[modifier].name)
+            : null,
           h('span', { className: 'dsh-pet-spacer' }),
           h('span', { className: 'dsh-pet-muted' }, '技能 ' + (battle === null ? entry.build.skills.length : battle.build.skills.length) + '/' + MAX_SKILLS),
           entry.menu === null ? h('button', {
@@ -6763,6 +10071,8 @@ window.__ModuleLoader__.load({
             bump()
           },
         }, notice) : null,
+        mapPanel(entry, bump),
+        mapChoicesRow(entry, bump),
         h('div', { className: 'dsh-pet-stage' },
           h('canvas', { ref: canvasRef, width: VIEW_W * 2, height: VIEW_H * 2, className: 'dsh-pet-canvas' }),
           entry.banner !== null
@@ -6782,24 +10092,20 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'dsh-pet-overlay-sub' }, damageReport(entry)),
                 reactions !== '' ? h('div', { className: 'dsh-pet-reactions' }, reactions) : null,
               )
-            : offerPanel(entry, activeChoosing, setChoosing, bump),
+            : entry.phase === 'node'
+              ? nodePanel(entry, bump)
+              : entry.phase === 'map'
+                ? h('div', { className: 'dsh-pet-overlay' },
+                    h('div', { className: 'dsh-pet-overlay-title' }, '分叉'),
+                    h('div', { className: 'dsh-pet-overlay-sub' },
+                      run !== null && run.autoMode === 'manual' ? '选择下一站' : '自动路线已暂停'),
+                    entry.mapNotice !== ''
+                      ? h('div', { className: 'dsh-pet-map-notice' }, entry.mapNotice)
+                      : null,
+                  )
+                : offerPanel(entry, activeChoosing, setChoosing, bump),
         ),
-        entry.menu === null
-          ? h('div', { className: 'dsh-pet-body-rest' },
-              h('div', { className: 'dsh-pet-cells' }, h('i', { style: { width: pct + '%', background: hpColor } })),
-              stylePanel(entry, bump),
-              buildPanel(entry, bump),
-              h('div', { className: 'dsh-pet-bottom' },
-                h('span', null, '生命 ' + Math.max(0, Math.ceil(cells)) + '/' + maxCells),
-                h('span', null, '击杀 ' + (battle === null ? 0 : battle.kills)),
-                h('span', null, '敌 ' + (battle === null ? 0 : battle.enemies.length)),
-                h('span', null, '压力 +' + (battle === null ? 0 : battle.extra)),
-                battle !== null && battle.surge ? h('span', { className: 'dsh-pet-hot' }, '过载') : null,
-                h('span', { className: 'dsh-pet-spacer' }),
-                h('span', null, formatTokens(entry.consumed) + ' token'),
-              ),
-            )
-          : null,
+        entry.menu === null ? statusPanel(entry, bump) : null,
       )
     }
 
@@ -6867,6 +10173,14 @@ window.__ModuleLoader__.load({
         draw,
         pickUpgrade,
         equipFromReserve,
+        spendAttributePoint,
+        attributePanel,
+        toggleAttributes,
+        buildPanel,
+        toggleBuild,
+        statusPanel,
+        allocateAttribute,
+        attributeSummary,
         advance,
         awardXp,
         pushTokens,
@@ -6896,6 +10210,44 @@ window.__ModuleLoader__.load({
         debugEnabled,
         setDebugEnabled,
         styleAvailable,
+        // 地图系统：进度、界面与存档
+        startMapNode,
+        startNodeBattle,
+        chooseMapNode,
+        advanceMap,
+        retryCurrentBattle,
+        mapPanel,
+        mapChoicesRow,
+        nodePanel,
+        mapSummaryLine,
+        restChoice,
+        eventChoice,
+        shopBuy,
+        shopLeave,
+        autoResolveNode,
+        setMapAutoMode,
+        applyMapEffects,
+        mapRunSummary,
+        serializeMapRun,
+        restoreMapRun,
+        createMapRun,
+        availableNodes,
+        availableNodeIds,
+        beginNode,
+        completeNode,
+        retryNode,
+        leaveNode,
+        pickNextNode,
+        autoReasonText,
+        currentNode,
+        nodeStatus,
+        nodePlan,
+        nodeBattlePlan,
+        isBattleNode,
+        migrateMapRun,
+        AUTO_MODES,
+        AUTO_MODE_IDS,
+        NODE_TYPES,
       },
     }
   },

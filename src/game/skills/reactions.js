@@ -76,6 +76,8 @@ function conductive(world, event, def) {
       damageScale: 1,
       element: null,
       heavy: false,
+      // 反应伤害吃通用与条件加成，不暴击。
+      channel: 'reaction',
       sourceTag: 'reaction:conductive',
     },
   }));
@@ -101,6 +103,8 @@ function shatter(world, event, def) {
       damageScale: 1,
       element: null,
       heavy: false,
+      // 反应伤害吃通用与条件加成，不暴击。
+      channel: 'reaction',
       sourceTag: 'reaction:shatter',
     },
   }));

@@ -50,15 +50,28 @@ export function enemyType(id) {
   return def;
 }
 
-/** 按层成长；同一层的不同敌人共享倍率，保持相对关系。 */
+/**
+ * 按层成长；同一层的不同敌人共享倍率，保持相对关系。
+ * 第 1–15 层沿用原系数；深层改走更缓的曲线，否则体魄与技能成长追不上
+ * 指数式的生命膨胀，99 层会变成纯数值墙。
+ */
 export function enemyCellsAt(floor, type) {
   const def = enemyType(type);
-  return Math.max(1, Math.round(def.cells * (1 + 0.13 * (floor - 1))));
+  const depth = Math.max(1, Math.floor(Number(floor) || 1));
+  const growth = depth <= 15
+    ? 0.13 * (depth - 1)
+    : 0.13 * 14 + 0.045 * (depth - 15);
+  return Math.max(1, Math.round(def.cells * (1 + growth)));
 }
 
 export function enemyDamageAt(floor, type) {
   const def = enemyType(type);
-  return def.damage + (floor >= 10 ? 1 : 0);
+  const depth = Math.max(1, Math.floor(Number(floor) || 1));
+  let bonus = depth >= 10 ? 1 : 0;
+  if (depth >= 30) bonus += 1;
+  if (depth >= 55) bonus += 1;
+  if (depth >= 80) bonus += 1;
+  return def.damage + bonus;
 }
 
 /** 层定义给出权重表，刷新时按权重循环取类型，保证同层混合稳定可复现。 */

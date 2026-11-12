@@ -14,18 +14,29 @@ import { updateEntities } from './skills/entities/index.js';
 import { createMovementState, movePlayer, refreshMovementState, resolveDisplacements } from './movement.js';
 import { FLOOR_SECONDS, TIME_LIMIT, floorDef, floorModifier, enemyTotal } from './floors.js';
 import { bagOf, enemyCellsAt, enemyDamageAt, enemyType } from './enemies.js';
+import {
+  ATTRIBUTE_IDS,
+  createCombatStats,
+  describeCombatStats,
+  mitigateDamage,
+  normalizeAttributes,
+  previewAttribute,
+} from './attributes.js';
 
 export { ARENA, TIME_LIMIT };
 export const MAX_EXTRA = 18;
 export const MAX_SKILLS = 2;
 
-const PLAYER_BASE_CELLS = 24;
 const PLAYER_SPEED = 52;
 const PLAYER_RADIUS = 3;
 const CONTACT_PAD = 1.5;
 const ENEMY_ATTACK_INTERVAL = 1.6;
 const ENEMY_SPEED_PER_FLOOR = 0.6;
 const XP_PER_KILL_CAP = 6;
+
+// 暴击使用独立 RNG 流：刷怪与抽选继续走 battle.rng，加入暴击不会改变已有种子
+// 的刷怪顺序与三选一候选。
+const COMBAT_RNG_SALT = 0x9e3779b9;
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -86,18 +97,33 @@ export function createBattle({
   draftCount = 0,
   movementStrategy = 'auto',
   styleId = null,
+  attributes = {},
+  attributePoints = 0,
+  bonuses = {},
+  // 地图节点给出的战斗构成：{ def, modifier }。传入时不再查 15 层表。
+  plan = null,
+  // 地图跨节点保留的生命；不传则满生命开始。
+  life = null,
 } = {}) {
-  const def = floorDef(floor);
+  const def = plan !== null && plan !== undefined && plan.def !== undefined ? plan.def : floorDef(floor);
   const compiled = normalizeCompile(build);
-  const modifier = floorModifier(floor);
+  const modifier = plan !== null && plan !== undefined
+    ? (plan.modifier ?? null)
+    : floorModifier(floor);
+  const allocated = normalizeAttributes(attributes);
+  const combat = createCombatStats(allocated, bonuses);
+  const carried = life === null || life === undefined ? Number.NaN : Number(life);
+  const startCells = Number.isFinite(carried)
+    ? Math.max(1, Math.min(combat.maxLife, Math.round(carried)))
+    : combat.maxLife;
   const player = {
     id: 'player',
     kind: 'player',
     x: ARENA.w / 2,
     y: ARENA.h / 2,
     radius: PLAYER_RADIUS,
-    cells: PLAYER_BASE_CELLS,
-    maxCells: PLAYER_BASE_CELLS,
+    cells: startCells,
+    maxCells: combat.maxLife,
     speed: PLAYER_SPEED,
   };
   const battle = {
@@ -109,8 +135,12 @@ export function createBattle({
     plans: compiled.plans,
     compileErrors: compiled.errors,
     compileWarnings: compiled.warnings,
-    skills: createSkillInstances(compiled.plans),
+    skills: createSkillInstances(compiled.plans, combat),
     player,
+    attributes: allocated,
+    attributePoints: Math.max(0, Math.floor(Number(attributePoints) || 0)),
+    bonuses: bonuses === null || typeof bonuses !== 'object' ? {} : { ...bonuses },
+    combat,
     enemies: [],
     entities: [],
     projectiles: [],
@@ -133,6 +163,7 @@ export function createBattle({
     state: 'fighting',
     rng: mulberry32(seed),
     seed,
+    combatRng: mulberry32((seed ^ COMBAT_RNG_SALT) >>> 0),
     nextId: 1,
     nextEventId: 1,
     bounds: ARENA,
@@ -145,6 +176,9 @@ export function createBattle({
       overflow: 0,
       kills: 0,
       killsByType: {},
+      crits: 0,
+      critExtra: 0,
+      mitigated: 0,
     },
     movement: createMovementState(compiled.plans, movementStrategy),
     total: 0,
@@ -178,12 +212,15 @@ function spawnTick(battle) {
     const index = battle.spawned;
     const type = bag.length === 0 ? 'swarm' : bag[index % bag.length];
     const typeDef = enemyType(type);
-    const isElite = battle.modifier === 'elite' && index === total - 1;
+    const finalSpawn = index === total - 1;
+    const isElite = finalSpawn && (battle.modifier === 'elite' || battle.modifier === 'boss');
+    const isBoss = finalSpawn && battle.modifier === 'boss';
     let cells = enemyCellsAt(battle.floor, type);
     if (battle.modifier === 'crowded') cells = Math.round(cells * 0.7);
-    if (isElite) cells = Math.round(cells * 2.5);
+    if (isBoss) cells = Math.round(cells * 3.4);
+    else if (isElite) cells = Math.round(cells * 2.5);
     const at = spawnPoint(battle.rng);
-    const radius = typeDef.radius + (isElite ? 1 : 0);
+    const radius = typeDef.radius + (isBoss ? 2 : isElite ? 1 : 0);
     const enemy = {
       id: battle.nextId++,
       kind: 'enemy',
@@ -194,8 +231,8 @@ function spawnTick(battle) {
       maxCells: cells,
       radius,
       r: radius,
-      speed: typeDef.speed * (1 + battle.floor * ENEMY_SPEED_PER_FLOOR * 0.02) * (battle.modifier === 'frenzy' ? 1.3 : 1),
-      damage: enemyDamageAt(battle.floor, type) + (battle.modifier === 'frenzy' ? 1 : 0) + (isElite ? 1 : 0),
+      speed: typeDef.speed * (1 + battle.floor * ENEMY_SPEED_PER_FLOOR * 0.02) * (battle.modifier === 'frenzy' ? 1.3 : 1) * (isBoss ? 1.12 : 1),
+      damage: enemyDamageAt(battle.floor, type) + (battle.modifier === 'frenzy' ? 1 : 0) + (isBoss ? 2 : isElite ? 1 : 0),
       behavior: typeDef.behavior,
       preferredRange: typeDef.preferredRange ?? 0,
       shot: typeDef.shot ?? null,
@@ -204,11 +241,13 @@ function spawnTick(battle) {
       dead: false,
       deathHandled: false,
       flash: 0,
-      elite: isElite,
+      elite: isElite && !isBoss,
+      boss: isBoss,
     };
     battle.enemies.push(enemy);
     battle.spawned += 1;
-    if (battle.spawned === total && isElite) battle.events.push({ type: 'elite', x: enemy.x, y: enemy.y });
+    if (battle.spawned === total && isBoss) battle.events.push({ type: 'boss', x: enemy.x, y: enemy.y });
+    else if (battle.spawned === total && isElite) battle.events.push({ type: 'elite', x: enemy.x, y: enemy.y });
   }
 }
 
@@ -254,8 +293,19 @@ function enemiesMove(battle, dt) {
 
 function hurtPlayer(battle, amount) {
   if (!(amount > 0) || battle.state !== 'fighting') return;
-  battle.player.cells -= amount;
-  battle.events.push({ type: 'hurt', x: battle.player.x, y: battle.player.y, cells: amount });
+  // 护甲对当前所有敌人伤害统一生效；内部保留小数，界面显示时再取整。
+  const taken = mitigateDamage(amount, battle.combat);
+  if (!(taken > 0)) return;
+  if (!battle.stats) battle.stats = {};
+  battle.stats.mitigated = (battle.stats.mitigated ?? 0) + Math.max(0, amount - taken);
+  battle.player.cells -= taken;
+  battle.events.push({
+    type: 'hurt',
+    x: battle.player.x,
+    y: battle.player.y,
+    cells: taken,
+    raw: amount,
+  });
   if (battle.player.cells <= 0) {
     battle.player.cells = 0;
     battle.state = 'dead';
@@ -314,8 +364,10 @@ export function awardXp(battle, amount) {
     battle.xp -= battle.xpNext;
     battle.level += 1;
     battle.xpNext = 6 + battle.level * 2;
+    // 每次升级 +1 基础属性点；与技能三选一互相独立，同一次升级可以各拿一份。
+    battle.attributePoints = (battle.attributePoints ?? 0) + 1;
     if (battle.level % 2 === 0) battle.pending += 1;
-    battle.events.push({ type: 'levelUp', level: battle.level });
+    battle.events.push({ type: 'levelUp', level: battle.level, points: battle.attributePoints });
   }
   rollOffer(battle);
 }
@@ -339,11 +391,14 @@ function deathRound(battle) {
     battle.stats.killsByType[enemy.type] = (battle.stats.killsByType[enemy.type] ?? 0) + 1;
     battle.events.push({ type: 'kill', x: enemy.x, y: enemy.y, id: enemy.id, enemyType: enemy.type });
     queueDeathReactions(battle, enemy);
-    if (enemy.elite) {
+    if (enemy.boss) {
+      battle.pending += 2;
+      battle.events.push({ type: 'bossDown', x: enemy.x, y: enemy.y });
+    } else if (enemy.elite) {
       battle.pending += 1;
       battle.events.push({ type: 'eliteDown', x: enemy.x, y: enemy.y });
     }
-    const xp = enemy.elite ? enemyType(enemy.type).xp * 3 : enemyType(enemy.type).xp;
+    const xp = enemy.boss ? enemyType(enemy.type).xp * 5 : enemy.elite ? enemyType(enemy.type).xp * 3 : enemyType(enemy.type).xp;
     awardXp(battle, Math.min(XP_PER_KILL_CAP, xp));
   }
   battle.enemies = battle.enemies.filter((enemy) => !enemy.deathHandled);
@@ -370,7 +425,8 @@ function statusTicks(battle, dt) {
       skillInstanceId: tick.skillInstanceId,
       rootEventId: tick.rootEventId ?? undefined,
       tags: ['status', tick.statusId],
-      payload: { damage: tick.damage, statusId: tick.statusId },
+      // 持续伤害吃通用与条件加成，但不暴击。
+      payload: { damage: tick.damage, statusId: tick.statusId, channel: 'dot', element: tick.element },
     });
   }
 }
@@ -458,6 +514,57 @@ export function triggerSurge(battle, extra = 6) {
 export function setMovementStrategy(battle, strategy) {
   battle.movement = createMovementState(battle.plans, strategy);
   return battle.movement.strategy;
+}
+
+/**
+ * 重算战斗属性。属性点分配、装备变化后调用；
+ * 已经飞出去的实体与延迟命令在命中结算时才读取，不做额外快照。
+ */
+export function recomputeCombat(battle) {
+  const combat = createCombatStats(battle.attributes, battle.bonuses ?? {});
+  battle.combat = combat;
+  battle.player.maxCells = combat.maxLife;
+  if (battle.player.cells > combat.maxLife) battle.player.cells = combat.maxLife;
+  return combat;
+}
+
+/**
+ * 自由分配基础属性点。
+ * 最大生命提升时，当前生命同步增加相同数值（docs/character-attributes-design.md）。
+ * 返回 false 表示属性未知或点数不足。
+ */
+export function allocateAttribute(battle, id, points = 1) {
+  if (!ATTRIBUTE_IDS.includes(id)) return false;
+  const spend = Math.max(1, Math.floor(Number(points) || 1));
+  const available = Math.max(0, Math.floor(Number(battle.attributePoints) || 0));
+  if (available < spend) return false;
+  const attributes = normalizeAttributes(battle.attributes);
+  attributes[id] += spend;
+  battle.attributes = attributes;
+  battle.attributePoints = available - spend;
+  const beforeMax = battle.player.maxCells;
+  const combat = recomputeCombat(battle);
+  const gain = combat.maxLife - beforeMax;
+  // 阵亡状态不再补血：本层已经结束，重试会从满生命开始。
+  if (gain > 0 && battle.state !== 'dead') {
+    battle.player.cells = Math.min(combat.maxLife, battle.player.cells + gain);
+  }
+  battle.events.push({ type: 'attribute', id, points: spend, value: attributes[id], combat });
+  return true;
+}
+
+/** 属性与战斗属性的可读快照，供 UI、报告与测试读取。 */
+export function attributeSummary(battle) {
+  const attributes = normalizeAttributes(battle.attributes);
+  const combat = battle.combat ?? createCombatStats(attributes, battle.bonuses ?? {});
+  return {
+    attributes: { ...attributes },
+    spent: Object.values(attributes).reduce((sum, value) => sum + value, 0),
+    points: Math.max(0, Math.floor(Number(battle.attributePoints) || 0)),
+    combat,
+    previews: ATTRIBUTE_IDS.map((id) => previewAttribute(attributes, id, battle.bonuses ?? {})),
+    text: describeCombatStats(combat),
+  };
 }
 
 /** 选中一张升级：装入组件、重编译、保留飞行中的计划快照。 */

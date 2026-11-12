@@ -358,18 +358,20 @@ test('绘制在多帧之后仍然稳定', () => {
 });
 
 test('失败后停在原层重试，并补一次升级选择', () => {
-  const { createEntry, startFloor, advance } = loadModule().__debug;
+  const { createEntry, advance, currentNode } = loadModule().__debug;
   const entry = createEntry('retry-key', 7);
-  entry.floor = 6;
-  startFloor(entry, 6);
+  const node = currentNode(entry.map);
+  assert.ok(node !== null, '开局应有当前节点');
   entry.pending = 0;
-  entry.lastResult = { kind: 'dead', floor: 6 };
+  entry.lastResult = { kind: 'dead', floor: node.floor };
   entry.phase = 'result';
   advance(entry);
-  assert.equal(entry.floor, 6);
-  assert.equal(entry.battle.floor, 6);
-  assert.equal(entry.pending, 1);
+  assert.equal(entry.floor, node.floor, '失败后停留在同一层');
+  assert.equal(entry.battle.floor, node.floor);
+  assert.equal(entry.pending, 1, '失败补一次三选一');
   assert.ok(entry.battle.offer !== null);
+  assert.equal(entry.map.failures, 1, '失败次数记在地图上');
+  assert.equal(entry.battle.attributes.strength, 0);
 });
 
 test('风格与移动策略：默认远程，切换近战会按新风格重开本轮', () => {
@@ -555,19 +557,28 @@ test('大厅：没有存档时不开战也不写盘，继续游戏不可用', ()
 test('继续游戏：从最近存档开打，不清空构筑与进度', () => {
   const store = new Map();
   const firstMod = loadModule(store);
-  const first = firstMod.__debug.createEntry('lobby-save', 7);
-  first.floor = 4;
-  first.best = 4;
-  first.stats.bestFloor = 4;
-  firstMod.__debug.startFloor(first, 4);
+  const dbg = firstMod.__debug;
+  const first = dbg.createEntry('lobby-save', 7);
+  // 在地图上真正走一步，再重开面板继续
+  dbg.completeNode(first.map, dbg.currentNode(first.map).id, { life: 18 });
+  const targets = dbg.availableNodes(first.map);
+  const target = targets.find((node) => dbg.isBattleNode(node)) ?? targets[0];
+  assert.equal(dbg.chooseMapNode(first, target.id), true);
+  const floor = first.floor;
+  assert.equal(floor, target.floor);
 
   const mod = loadModule(store);
   const second = mod.__debug.createEntry('lobby-save', 7, { autostart: false });
   assert.equal(second.battle, null);
-  assert.equal(second.floor, 4);
+  assert.equal(second.floor, floor, '大厅读出存档所在层');
   assert.equal(mod.__debug.continueGame(second), true);
-  assert.equal(second.battle.floor, 4);
-  assert.equal(second.phase, 'fight');
+  assert.equal(second.floor, floor);
+  if (mod.__debug.isBattleNode(target)) {
+    assert.equal(second.phase, 'fight');
+    assert.equal(second.battle.floor, floor);
+  } else {
+    assert.equal(second.phase, 'node');
+  }
 });
 
 test('存档槽位：新游戏写进指定槽位，读取后恢复该槽构筑', () => {
@@ -710,3 +721,358 @@ test('菜单渲染：大厅与新建页面都能生成元素', () => {
   assert.equal(entry.menu.screen, 'new');
   assert.equal(mod.__debug.menuPanel(entry, () => {}).type, 'div');
 });
+
+function flatText(node, out = []) {
+  if (node === null || node === undefined || node === false) return out;
+  if (typeof node === 'string' || typeof node === 'number') {
+    out.push(String(node));
+    return out;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) flatText(item, out);
+    return out;
+  }
+  for (const child of node.children ?? []) flatText(child, out)
+  return out;
+}
+
+test('属性点：升级得到点数，分配后写进存档，重进角色仍在', () => {
+  const store = new Map();
+  const mod = loadModule(store);
+  const entry = mod.__debug.createEntry('attr-key', 7);
+  assert.equal(entry.battle.player.maxCells, 24);
+  assert.equal(entry.battle.attributePoints, 0);
+
+  mod.__debug.awardXp(entry.battle, 8);
+  assert.equal(entry.battle.attributePoints, 1);
+  assert.equal(mod.__debug.spendAttributePoint(entry, 'vitality'), true);
+  assert.equal(entry.battle.player.maxCells, 25);
+  assert.equal(entry.battle.player.cells, 25, '最大生命提升时当前生命同步增加');
+  assert.equal(entry.battle.attributePoints, 0);
+  assert.equal(mod.__debug.spendAttributePoint(entry, 'strength'), false);
+
+  const saved = JSON.parse(store.get('dsh.pet.v5.attr-key'));
+  assert.deepEqual(saved.attributes, { strength: 0, agility: 0, intellect: 0, vitality: 1 });
+  assert.equal(saved.attributePoints, 0);
+
+  const second = loadModule(store).__debug.createEntry('attr-key', 7);
+  assert.equal(second.battle.attributes.vitality, 1);
+  assert.equal(second.battle.player.maxCells, 25);
+  assert.equal(second.battle.combat.maxLife, 25);
+});
+
+test('属性点：阵亡重试保留，通关新层保留，新游戏重置', () => {
+  const mod = loadModule();
+  const entry = mod.__debug.createEntry('attr-run', 7);
+  mod.__debug.awardXp(entry.battle, 8);
+  assert.equal(mod.__debug.spendAttributePoint(entry, 'strength'), true);
+  assert.equal(entry.battle.combat.armor, 2);
+
+  entry.pending = 0;
+  entry.lastResult = { kind: 'dead', floor: 1 };
+  entry.phase = 'result';
+  mod.__debug.advance(entry);
+  assert.equal(entry.battle.attributes.strength, 1, '阵亡重试保留本轮已分配的属性点');
+
+  assert.equal(mod.__debug.startNewGame(entry, 0, 'ranged'), true);
+  assert.equal(entry.battle.attributes.strength, 0, '新游戏重置本轮成长');
+  assert.equal(entry.battle.attributePoints, 0);
+  assert.equal(entry.battle.player.maxCells, 24);
+});
+
+test('构筑栏：默认折叠成一行，点标题展开技能详情与备用栏', () => {
+  const mod = loadModule();
+  const entry = mod.__debug.createEntry('build-ui', 7);
+  assert.equal(entry.buildOpen, false, '普通状态默认折叠');
+
+  const collapsed = mod.__debug.buildPanel(entry, () => {});
+  const collapsedText = flatText(collapsed).join('|');
+  assert.ok(collapsedText.includes('构筑'), collapsedText);
+  assert.ok(collapsedText.includes('1/2 技能'), collapsedText);
+  assert.ok(!collapsedText.includes('飞弹'), '折叠时不展示技能详情');
+
+  collapsed.children[0].props.onClick();
+  assert.equal(entry.buildOpen, true, '点击标题展开');
+  const expanded = mod.__debug.buildPanel(entry, () => {});
+  const text = flatText(expanded).join('|');
+  assert.ok(text.includes('飞弹'), text);
+  assert.ok(text.includes('动作 · 飞弹'), text);
+  assert.ok(text.includes('备用'), text);
+  assert.equal(mod.__debug.toggleBuild(entry), false, '再点一次收起');
+});
+
+test('战场面板：不再显示风格栏与移动栏', () => {
+  const mod = loadModule();
+  const entry = mod.__debug.createEntry('status-ui', 7);
+  const text = flatText(mod.__debug.statusPanel(entry, () => {})).join('|');
+  assert.ok(text.includes('属性'), text);
+  assert.ok(text.includes('构筑'), text);
+  assert.ok(text.includes('生命 24/24'), text);
+  assert.ok(!text.includes('风格'), text);
+  assert.ok(!text.includes('移动'), text);
+});
+
+test('属性栏：默认折叠只占一行，点击后展开四项属性与投入预览', () => {
+  const mod = loadModule();
+  const entry = mod.__debug.createEntry('attr-ui', 7);
+  mod.__debug.awardXp(entry.battle, 8);
+
+  assert.equal(entry.attributesOpen, false, '普通状态默认折叠');
+  const collapsedText = flatText(mod.__debug.attributePanel(entry, () => {})).join('|');
+  assert.ok(collapsedText.includes('属性'), collapsedText);
+  assert.ok(collapsedText.includes('可用 1 点'), collapsedText);
+  assert.ok(collapsedText.includes('护甲 0'), collapsedText);
+  assert.ok(!collapsedText.includes('体魄'), '折叠时不展示四项属性');
+
+  assert.equal(mod.__debug.toggleAttributes(entry), true);
+  assert.equal(entry.attributesOpen, true);
+  const panel = mod.__debug.attributePanel(entry, () => {});
+  const text = flatText(panel).join('|');
+  for (const label of ['力量', '敏捷', '智力', '体魄']) {
+    assert.ok(text.includes(label), label + ' missing');
+  }
+  assert.ok(text.includes('可用 1 点'), text);
+  assert.ok(text.includes('护甲 0 → 2'), text);
+  assert.ok(text.includes('生命 24 → 25'), text);
+  assert.ok(text.includes('暴击 5% ×1.5'), text);
+  assert.equal(collectButtons(panel).length, 5, '折叠标题 + 四个加点按钮');
+
+  mod.__debug.spendAttributePoint(entry, 'strength');
+  const after = flatText(mod.__debug.attributePanel(entry, () => {})).join('|');
+  assert.ok(after.includes('没有可用属性点'), after);
+  assert.ok(after.includes('护甲 2 → 4'), after);
+  assert.equal(entry.attributesOpen, true, '加点后保持展开');
+});
+
+// ---- 地图接入 ----
+
+function mapChipButtons(node) {
+  return collectButtons(node).filter((button) => String(button.props.className ?? '').startsWith('dsh-pet-node'))
+}
+
+test('地图：面板默认折叠，展开后按层列出节点，可点击查看说明', () => {
+  const mod = loadModule();
+  const entry = mod.__debug.createEntry('map-ui', 7);
+  assert.equal(entry.mapOpen, false);
+  const collapsed = flatText(mod.__debug.mapPanel(entry, () => {})).join('|');
+  assert.ok(collapsed.includes('地图'), collapsed);
+  assert.ok(collapsed.includes('1/99'), collapsed);
+  assert.ok(collapsed.includes('当前'), collapsed);
+  assert.ok(!collapsed.includes('查看完整地图'), '折叠时不展开楼层列表');
+
+  entry.mapOpen = true;
+  const panel = mod.__debug.mapPanel(entry, () => {});
+  const text = flatText(panel).join('|');
+  for (const label of ['自动', '手动', '稳健', '均衡', '冒险', '种子']) {
+    assert.ok(text.includes(label), label + ' 缺失');
+  }
+  const chips = mapChipButtons(panel);
+  assert.ok(chips.length >= 5, '应列出当前层与后续几层的节点');
+  assert.ok(chips.some((chip) => String(chip.props.className).includes('cur')), '当前节点应高亮');
+
+  // 未到达的节点点击后显示类型说明，而不是直接进入
+  const dim = chips.find((chip) => String(chip.props.className).includes('dim'));
+  assert.ok(dim !== undefined);
+  dim.props.onClick();
+  assert.ok(entry.mapInspect !== null, '点击节点应展示说明');
+  const detail = flatText(mod.__debug.mapPanel(entry, () => {})).join('|');
+  assert.ok(detail.includes('层'), detail);
+});
+
+test('地图：完成当前节点后出现下一站按钮，点击进入下一层', () => {
+  const mod = loadModule();
+  const d = mod.__debug;
+  const entry = d.createEntry('map-step', 7);
+  const node = d.currentNode(entry.map);
+  d.completeNode(entry.map, node.id, { life: 20 });
+  entry.battle = null;
+  entry.phase = 'map';
+  const row = d.mapChoicesRow(entry, () => {});
+  const buttons = collectButtons(row).filter((button) => button.props.className === 'dsh-pet-choice');
+  assert.ok(buttons.length >= 1, '分叉时应显示下一站');
+  buttons[0].props.onClick();
+  assert.notEqual(entry.map.currentNodeId, node.id);
+  assert.ok(entry.map.visited.length >= 2);
+  assert.ok(entry.floor >= 2);
+  assert.ok(d.nodeStatus(entry.map, node.id) === 'done');
+});
+
+test('地图：自动路线能连续跨过战斗与非战斗节点', () => {
+  const mod = loadModule();
+  const d = mod.__debug;
+  const entry = d.createEntry('map-auto', 7);
+  let guard = 0;
+  while (guard < 40) {
+    guard += 1;
+    const node = d.currentNode(entry.map);
+    if (node === null) break;
+    if (d.isBattleNode(node)) {
+      d.completeNode(entry.map, node.id, { life: entry.map.lifeMax });
+      d.applyMapEffects(entry, []);
+      entry.battle = null;
+      d.advanceMap(entry);
+    } else {
+      entry.phase = 'node';
+      d.autoResolveNode(entry);
+    }
+    if (entry.phase === 'result') break;
+  }
+  assert.ok(entry.map.visited.length > 20, '自动路线应连续推进：' + entry.map.visited.length);
+  assert.ok(entry.map.gold > 0, '经过节点应积累金币');
+  assert.ok(entry.map.failures === 0);
+  assert.ok(entry.map.life >= 1);
+});
+
+test('地图：手动路线在分叉处停下，等待玩家选择', () => {
+  const mod = loadModule();
+  const d = mod.__debug;
+  const entry = d.createEntry('map-manual', 7);
+  d.setMapAutoMode(entry, 'manual');
+  const node = d.currentNode(entry.map);
+  d.completeNode(entry.map, node.id, { life: 20 });
+  entry.battle = null;
+  d.advanceMap(entry);
+  assert.equal(entry.phase, 'map');
+  assert.ok(entry.mapNotice.includes('手动'), entry.mapNotice);
+  const choices = collectButtons(d.mapChoicesRow(entry, () => {}))
+    .filter((button) => button.props.className === 'dsh-pet-choice');
+  assert.ok(choices.length >= 1);
+});
+
+test('地图：休息 / 事件 / 商店面板能生成选项并结算', () => {
+  const mod = loadModule();
+  const d = mod.__debug;
+  const setup = (type) => {
+    const entry = d.createEntry('map-node-' + type, 7);
+    let guard = 0;
+    while (guard < 60) {
+      guard += 1;
+      const node = d.currentNode(entry.map);
+      if (node === null) break;
+      if (node.type === type) {
+        entry.phase = 'node';
+        return entry;
+      }
+      if (d.isBattleNode(node)) {
+        d.completeNode(entry.map, node.id, { life: entry.map.lifeMax });
+        entry.battle = null;
+        d.advanceMap(entry);
+      } else {
+        entry.phase = 'node';
+        d.autoResolveNode(entry);
+      }
+    }
+    return entry;
+  };
+
+  const rest = setup('rest');
+  const restPanel = d.nodePanel(rest, () => {});
+  assert.equal(restPanel.type, 'div');
+  const restText = flatText(restPanel).join('|');
+  assert.ok(restText.includes('休息点'), restText);
+  assert.ok(restText.includes('恢复'), restText);
+  // 满血时治疗置灰，但可以选强化或离开
+  const restButtons = collectButtons(restPanel).filter((button) =>
+    String(button.props.className).includes('dsh-pet-node-option'));
+  assert.ok(restButtons.length >= 2);
+  assert.equal(d.restChoice(rest, 'upgrade'), true);
+  assert.ok(rest.pending >= 1, '强化应给一次三选一');
+
+  const shop = setup('shop');
+  const shopPanel = d.nodePanel(shop, () => {});
+  const shopText = flatText(shopPanel).join('|');
+  assert.ok(shopText.includes('商店') || shopText.includes('金币'), shopText);
+  const items = collectButtons(shopPanel).filter((button) =>
+    String(button.props.className).includes('dsh-pet-node-option'));
+  assert.ok(items.length >= 2, '商店应有商品与离开按钮');
+
+  const event = setup('event');
+  const eventPanel = d.nodePanel(event, () => {});
+  const eventText = flatText(eventPanel).join('|');
+  assert.ok(eventText.includes('代价'), eventText);
+});
+
+test('存档：地图进度写进 v7，重新载入得到同一张地图', () => {
+  const store = new Map();
+  const mod = loadModule(store);
+  const d = mod.__debug;
+  const entry = d.createEntry('map-persist', 7);
+  d.completeNode(entry.map, d.currentNode(entry.map).id, { life: 19 });
+  d.advanceMap(entry);
+  const saved = JSON.parse(store.get('dsh.pet.v5.map-persist'));
+  assert.equal(saved.version, 7);
+  assert.equal(saved.map.depth, 99);
+  assert.ok(Array.isArray(saved.map.nodes) && saved.map.nodes.length > 300);
+  assert.equal(saved.map.currentNodeId, entry.map.currentNodeId);
+
+  const second = loadModule(store).__debug.createEntry('map-persist', 7, { autostart: false });
+  assert.equal(second.map.seed, entry.map.seed);
+  assert.equal(second.map.currentNodeId, entry.map.currentNodeId);
+  assert.equal(second.map.gold, entry.map.gold);
+  assert.deepEqual([...second.map.visited], [...entry.map.visited]);
+  assert.equal(second.floor, entry.floor);
+});
+
+test('迁移：没有地图字段的旧存档按存档层数补生成地图', () => {
+  const store = new Map();
+  store.set(
+    'dsh.pet.v5.old-map-key',
+    JSON.stringify({
+      version: 5,
+      style: 'ranged',
+      movement: 'keepDistance',
+      build: { version: 3, skills: [{ id: 'skill-1', action: 'projectile', element: null, modifier: null }], reserve: [] },
+      stats: { kills: 3, bestFloor: 12, maxFloorKills: 2, drafts: 1 },
+      floor: 12,
+      best: 12,
+      level: 6,
+      xp: 1,
+      xpNext: 18,
+      pending: 0,
+      draftCount: 1,
+    }),
+  );
+  const entry = loadModule(store).__debug.createEntry('old-map-key', 7);
+  assert.ok(entry.map !== null, '旧存档应补出一张地图');
+  assert.equal(entry.floor, 12);
+  assert.ok(String(entry.map.currentNodeId).startsWith('12-'), entry.map.currentNodeId);
+  // 该层节点可能是战斗，也可能是休息 / 事件 / 商店：两种入口都要接住
+  if (entry.battle === null) {
+    assert.equal(entry.phase, 'node');
+  } else {
+    assert.equal(entry.battle.floor, 12);
+  }
+});
+
+test('地图：连续失败 3 次后暂停自动重试，手动点「重试当前节点」恢复', () => {
+  const mod = loadModule();
+  const d = mod.__debug;
+  const entry = d.createEntry('retry-hold', 7);
+  const node = d.currentNode(entry.map);
+  for (let i = 0; i < 3; i += 1) {
+    entry.lastResult = { kind: 'dead', floor: node.floor };
+    entry.phase = 'result';
+    d.advance(entry);
+  }
+  assert.equal(entry.retryHold, true, '连续失败应暂停自动重试');
+  assert.equal(entry.phase, 'map');
+  assert.equal(entry.battle, null);
+  assert.ok(entry.mapNotice.includes('连续失败'), entry.mapNotice);
+  assert.equal(entry.map.failures, 3);
+
+  // 暂停期间 tick 不会偷偷重开
+  for (let i = 0; i < 200; i += 1) d.tick(entry, 1 / 60);
+  assert.equal(entry.battle, null, '暂停期间不应自动重开战斗');
+  assert.equal(entry.phase, 'map');
+
+  const row = d.mapChoicesRow(entry, () => {});
+  const retry = collectButtons(row).find((button) =>
+    String(button.props.className).includes('dsh-pet-choice'));
+  assert.ok(retry !== undefined, '应有重试按钮');
+  retry.props.onClick();
+  assert.equal(entry.retryHold, false);
+  assert.equal(entry.phase, 'fight');
+  assert.equal(entry.battle.floor, node.floor);
+  assert.ok(entry.battle.offer !== null, '失败后补的三选一仍在');
+});
+

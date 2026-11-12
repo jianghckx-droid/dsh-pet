@@ -139,6 +139,8 @@ export function enqueueHit(world, plan, opts) {
       modifierTransform: plan.transform,
       castId: opts.castId ?? null,
       action: plan.action.handler,
+      // 技能直接命中：吃通用与条件加成，可以暴击。
+      channel: 'direct',
       centerX: opts.center?.x ?? 0,
       centerY: opts.center?.y ?? 0,
       radius: plan.radius,

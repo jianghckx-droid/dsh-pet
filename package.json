@@ -26,6 +26,8 @@
     "sim": "node tools/balance-sim.mjs --sweep",
     "arena": "node tools/arena-report.mjs",
     "synergy": "node tools/synergy-report.mjs",
+    "map": "node tools/map-report.mjs",
+    "map:proto": "node tools/map-report.mjs --prototype",
     "preview": "node tools/render-frame.mjs 25 docs/preview.png 6 --demo",
     "preview:strip": "node tools/render-frame.mjs 25 docs/preview-strip.png 6 --demo --strip"
   },

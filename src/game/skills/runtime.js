@@ -7,6 +7,7 @@ import { ARENA } from './constants.js';
 import { ensureResolutionState, diagnose } from './resolve.js';
 import { actionImplementation } from './actions/index.js';
 import { createActionContext } from './world.js';
+import { effectiveCooldown } from '../attributes.js';
 
 export { ARENA };
 
@@ -28,17 +29,18 @@ export function castDueSkills(world, dt) {
     if (!implementation.handler.canCast(context)) continue;
     if (!implementation.handler.cast(context)) continue;
     skill.castCount += 1;
-    skill.timer = plan.cooldown;
+    // 攻击速度只缩短施放冷却，实体内部计时（灼烧跳伤、飞剑接触间隔）不受影响。
+    skill.timer = effectiveCooldown(plan.cooldown, world.combat);
     world.stats.casts[plan.id] = (world.stats.casts[plan.id] ?? 0) + 1;
   }
 }
 
 /** 新建技能实例：开局给一小段预热，避免同时开火。 */
-export function createSkillInstances(plans) {
+export function createSkillInstances(plans, combat = null) {
   return plans.map((plan) => ({
     id: plan.id,
     plan,
-    timer: plan.cooldown * 0.35,
+    timer: effectiveCooldown(plan.cooldown * 0.35, combat),
     castCount: 0,
   }));
 }
@@ -51,10 +53,11 @@ export function replaceSkillInstances(world, plans) {
   const previous = new Map(world.skills.map((skill) => [skill.plan.id, skill]));
   world.skills = plans.map((plan) => {
     const old = previous.get(plan.id);
+    const cooldown = effectiveCooldown(plan.cooldown, world.combat);
     return {
       id: plan.id,
       plan,
-      timer: old === undefined ? plan.cooldown * 0.35 : Math.min(old.timer, plan.cooldown),
+      timer: old === undefined ? effectiveCooldown(plan.cooldown * 0.35, world.combat) : Math.min(old.timer, cooldown),
       castCount: old === undefined ? 0 : old.castCount,
     };
   });

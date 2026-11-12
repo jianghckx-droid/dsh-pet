@@ -25,6 +25,8 @@ function buildFor(action, { element = null, modifier = null, movementStrategy = 
   battle.player.x = 80;
   battle.player.y = 72;
   battle.enemies = [];
+  // 精确伤害断言不引入暴击随机；暴击在 test/attributes.test.mjs 单独验证。
+  battle.combat.critChance = 0;
   return battle;
 }
 

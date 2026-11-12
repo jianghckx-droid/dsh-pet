@@ -13,6 +13,9 @@ export function makeBattle(build, { floor = 1, seed = 3 } = {}) {
   battle.player.x = 80;
   battle.player.y = 72;
   battle.enemies = [];
+  // 夹具默认关掉暴击：这些用例只验证结算规则，精确伤害不应受暴击 RNG 影响。
+  // 暴击本身在 test/attributes.test.mjs 里用显式战斗验证。
+  battle.combat.critChance = 0;
   return battle;
 }
 

@@ -63,6 +63,8 @@ export const MODIFIER_HANDLERS = Object.freeze({
             damageScale: (ctx.payload.damageScale ?? 1) * transform.damageScale,
             noSplit: true,
             noEcho: true,
+            // 分裂是派生命中：从基础伤害出发单独结算属性，可以暴击。
+            channel: 'derived',
             centerX: center.x,
             centerY: center.y,
           },
@@ -93,6 +95,8 @@ export const MODIFIER_HANDLERS = Object.freeze({
         damageScale: (ctx.payload.damageScale ?? 1) * transform.damageScale,
         noEcho: true,
         noSplit: true,
+        // 回响同样是派生命中：单独结算属性，可以暴击。
+        channel: 'derived',
       };
       // 单目标飞剑沿用弹体的同目标延迟命中语义；不复制飞剑实体。
       if (ctx.payload.action === 'projectile' || ctx.payload.action === 'arcSword') {
@@ -230,6 +234,8 @@ export const MODIFIER_HANDLERS = Object.freeze({
             noDetonate: true,
             noSplit: true,
             noEcho: true,
+            // 引爆伤害是修饰产生的独立命中，与分裂/回响同属派生通道。
+            channel: 'derived',
             centerX: center.x,
             centerY: center.y,
           },

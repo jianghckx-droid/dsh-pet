@@ -15,8 +15,27 @@ import { RUNTIME_LIMITS } from './schema.js';
 import { applyStatus, consumeStatus, getStatusInstance, stacksOf } from './status.js';
 import { evaluateReactions } from './reactions.js';
 import { applyModifierOnHit } from './modifiers/index.js';
+import { resolveDamage } from '../attributes.js';
 
 const DEFAULT_BOUNDS = Object.freeze({ w: 160, h: 144 });
+
+/**
+ * 伤害通道：命中命令可以显式标注，缺省时按命令类型与标签推断。
+ * 直接命中与派生命中（分裂、回响）可以暴击；持续伤害与反应伤害不暴击。
+ */
+export function damageChannelOf(command) {
+  const explicit = command?.payload?.channel;
+  if (typeof explicit === 'string') return explicit;
+  if (command.type === 'statusDamage') return 'dot';
+  if (Array.isArray(command.tags) && command.tags.includes('reaction')) return 'reaction';
+  return 'direct';
+}
+
+function combatRngOf(world) {
+  if (typeof world.combatRng === 'function') return world.combatRng;
+  if (typeof world.rng === 'function') return world.rng;
+  return null;
+}
 
 function boundsOf(world) {
   return world.bounds ?? DEFAULT_BOUNDS;
@@ -37,6 +56,9 @@ export function ensureResolutionState(world) {
   if (!world.stats.casts) world.stats.casts = {};
   if (!world.stats.modifiers) world.stats.modifiers = {};
   if (typeof world.stats.overflow !== 'number') world.stats.overflow = 0;
+  if (typeof world.stats.crits !== 'number') world.stats.crits = 0;
+  if (typeof world.stats.critExtra !== 'number') world.stats.critExtra = 0;
+  if (typeof world.stats.mitigated !== 'number') world.stats.mitigated = 0;
   if (!Array.isArray(world.events)) world.events = [];
 }
 
@@ -116,14 +138,24 @@ function recordDamage(world, command, amount) {
   }
 }
 
-function applyDamage(world, enemy, amount, command) {
+/**
+ * 扣血只做有符号结算；伤害数值已经由 resolveDamage 折算过属性与暴击。
+ * 统计同时记录有效伤害、溢出、暴击次数与被暴击多打出的部分。
+ */
+function applyDamage(world, enemy, resolved, command) {
+  const amount = resolved.amount ?? resolved;
   if (!(amount > 0)) return 0;
   const before = Math.max(0, enemy.cells);
   const effective = Math.min(before, amount);
   const overflow = amount - effective;
   enemy.cells -= amount;
   enemy.flash = 0.12;
+  if (!world.stats) world.stats = {};
   world.stats.overflow = (world.stats.overflow ?? 0) + overflow;
+  if (resolved.crit === true) {
+    world.stats.crits = (world.stats.crits ?? 0) + 1;
+    world.stats.critExtra = (world.stats.critExtra ?? 0) + effective * (1 - 1 / resolved.critMultiplier);
+  }
   recordDamage(world, command, effective);
   return effective;
 }
@@ -169,8 +201,16 @@ function executeHit(world, command) {
     ? null
     : contentById(payload.element);
   const beforeCharge = stacksOf(target, 'charge');
-  const damage = (payload.damage ?? 0) * (payload.damageScale ?? 1);
-  const dealt = applyDamage(world, target, damage, command);
+  // 属性在公共伤害入口统一应用：通用加成、条件加成与暴击都由这里折算。
+  const resolved = resolveDamage(world.combat, {
+    amount: (payload.damage ?? 0) * (payload.damageScale ?? 1),
+    channel: damageChannelOf(command),
+    element: element === null ? null : element.id,
+    tags: command.tags,
+    target,
+    rng: combatRngOf(world),
+  });
+  const dealt = applyDamage(world, target, resolved, command);
 
   // 死亡目标仍完成本次状态施加：先结算效果，再标记待死亡。
   if (element !== null) {
@@ -215,6 +255,8 @@ function executeHit(world, command) {
     skillId: command.skillInstanceId,
     depth: command.depth,
     reaction: command.reactionId,
+    channel: resolved.channel,
+    crit: resolved.crit,
   });
 
   const reactions = evaluateReactions(world, {
@@ -302,13 +344,23 @@ function executeAreaHit(world, command) {
 function executeStatusDamage(world, command) {
   const target = findEnemy(world, command.targetId);
   if (target === undefined || target.dead || target.cells <= 0) return;
-  const dealt = applyDamage(world, target, command.payload.damage ?? 0, command);
+  // 持续伤害吃通用与条件加成，不暴击；通道显式标注为 dot。
+  const resolved = resolveDamage(world.combat, {
+    amount: command.payload.damage ?? 0,
+    channel: damageChannelOf(command),
+    element: command.payload.element ?? null,
+    tags: command.tags,
+    target,
+    rng: combatRngOf(world),
+  });
+  const dealt = applyDamage(world, target, resolved, command);
   world.events.push({
     type: 'burn',
     status: command.payload.statusId,
     x: target.x,
     y: target.y,
     cells: dealt,
+    channel: resolved.channel,
   });
   if (target.cells <= 0) target.dead = true;
 }

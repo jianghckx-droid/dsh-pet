@@ -24,6 +24,7 @@ const FILES = [
   'skills/schema.js',
   'skills/constants.js',
   'skills/format.js',
+  'attributes.js',
   'skills/content/statuses.js',
   'skills/content/actions.js',
   'skills/content/elements.js',
@@ -61,6 +62,14 @@ const FILES = [
   'movement.js',
   'enemies.js',
   'floors.js',
+  'map/rng.js',
+  'map/config.js',
+  'map/topology.js',
+  'map/validate.js',
+  'map/types.js',
+  'map/content.js',
+  'map/generate.js',
+  'map/run.js',
   'arena.js',
 ];
 const START = '// <core>';

@@ -234,6 +234,8 @@ test('命令深度与每根事件命令数有硬上限并留下诊断', () => {
 test('伤害统计：只记录有效伤害，溢出伤害单独计量', () => {
   const battle = createBattle({ floor: 1, build: emptyBuild(), seed: 3 });
   battle.spawned = 999;
+  // 关掉暴击，保证溢出计量只反映本条命令的伤害。
+  battle.combat.critChance = 0;
   const target = makeEnemy(1, 80, 72, { cells: 1 });
   battle.enemies = [target];
   fireHit(battle, 1, { damage: 10 });
